@@ -416,6 +416,70 @@ def periodic_general(box: Box,
   return displacement_fn, shift_fn
 
 
+def lees_edwards(side: Box, shear_rate: float, wrapped: bool = True) -> Space:
+  """Lees-Edwards shear periodic boundary conditions.
+
+  Implements sliding periodic boundaries with shear in the x direction and
+  gradient in the z direction. The system size should be specified by a vector
+  ``side = [Lx, Ly, Lz]``. The displacement and shift functions accept a
+  keyword argument ``t`` denoting the current simulation time.
+
+  Args:
+    side: A vector specifying the size of the simulation box in each
+      dimension. Only three dimensional systems are currently supported.
+    shear_rate: The shear rate :math:`\dot{\gamma}`.
+    wrapped: If ``True`` particles are wrapped back into the box after
+      applying a shift.
+
+  Returns:
+    ``(displacement_fn, shift_fn)`` implementing Lees-Edwards boundaries.
+  """
+  side = jnp.asarray(side)
+  if side.shape[-1] != 3:
+    raise ValueError('lees_edwards only supports 3D boxes.')
+
+  Lx, Ly, Lz = side
+
+  def displacement_fn(Ra: Array, Rb: Array, t: float = 0.0,
+                      **unused_kwargs) -> Array:
+    dR = pairwise_displacement(Ra, Rb)
+    dx = dR[..., 0]
+    dy = dR[..., 1]
+    dz = dR[..., 2]
+
+    n = jnp.round(dz / Lz)
+    dz = dz - Lz * n
+    dx = dx - shear_rate * t * Lz * n
+
+    dx = jnp.mod(dx + Lx * f32(0.5), Lx) - Lx * f32(0.5)
+    dy = jnp.mod(dy + Ly * f32(0.5), Ly) - Ly * f32(0.5)
+
+    return jnp.stack((dx, dy, dz), axis=-1)
+
+  if wrapped:
+    def shift_fn(R: Array, dR: Array, t: float = 0.0,
+                 **unused_kwargs) -> Array:
+      R = R + dR
+      x = R[..., 0]
+      y = R[..., 1]
+      z = R[..., 2]
+
+      n = jnp.floor(z / Lz)
+      z = z - Lz * n
+      x = x - shear_rate * t * Lz * n
+
+      x = jnp.mod(x, Lx)
+      y = jnp.mod(y, Ly)
+
+      return jnp.stack((x, y, z), axis=-1)
+  else:
+    def shift_fn(R: Array, dR: Array, t: float = 0.0,
+                 **unused_kwargs) -> Array:
+      return R + dR
+
+  return displacement_fn, shift_fn
+
+
 def metric(displacement: DisplacementFn) -> MetricFn:
   """Takes a displacement function and creates a metric."""
   return lambda Ra, Rb, **kwargs: distance(displacement(Ra, Rb, **kwargs))

@@ -626,6 +626,7 @@ class NeighborList:
   update_fn: Callable[[Array, 'NeighborList'],
                       'NeighborList'] = dataclasses.static_field()
 
+
   def update(self, position: Array, **kwargs) -> 'NeighborList':
     return self.update_fn(position, self, **kwargs)
 
@@ -641,6 +642,29 @@ class NeighborList:
   @property
   def malformed_box(self) -> bool:
     return self.error.code & PEC.MALFORMED_BOX
+
+
+@dataclasses.dataclass
+class LeesEdwardsNeighborList:
+  """Wrapper carrying shear offset for Lees-Edwards neighbor lists."""
+  inner: NeighborList
+  shear_shift: float
+
+  @property
+  def idx(self):
+    return self.inner.idx
+
+  @property
+  def reference_position(self):
+    return self.inner.reference_position
+
+  @property
+  def did_buffer_overflow(self) -> bool:
+    return self.inner.did_buffer_overflow
+
+  @property
+  def cell_size(self):
+    return self.inner.cell_size
 
 
 @dataclasses.dataclass
@@ -987,6 +1011,36 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
   return NeighborListFns(allocate_fn, update_fn)  # pytype: disable=wrong-arg-count
 
+
+def lees_edwards_neighbor_list(displacement: DisplacementOrMetricFn,
+                               box: Box,
+                               shear_rate: float,
+                               r_cutoff: float,
+                               dr_threshold: float = 0.0,
+                               format: NeighborListFormat =
+                               NeighborListFormat.Dense,
+                               **static_kwargs) -> NeighborListFns:
+  """Neighbor list that triggers rebuilds from cumulative shear offset."""
+  nl_fn = neighbor_list(displacement, box, r_cutoff, dr_threshold,
+                         format=format, **static_kwargs)
+  Lz = float(box[2])
+
+  def allocate(position: Array, t: float = 0.0, **kwargs):
+    nbrs = nl_fn.allocate(position, t=t, **kwargs)
+    shear_shift = 0.5 * shear_rate * Lz * float(t)
+    return LeesEdwardsNeighborList(nbrs, shear_shift)
+
+  def update(position: Array, nbrs: LeesEdwardsNeighborList,
+             t: float = 0.0, **kwargs):
+    shear_shift = 0.5 * shear_rate * Lz * float(t)
+    if abs(shear_shift - nbrs.shear_shift) >= float(nbrs.cell_size):
+      new_nbrs = nl_fn.allocate(position, t=t, **kwargs)
+      return LeesEdwardsNeighborList(new_nbrs, shear_shift)
+    else:
+      new_nbrs = nl_fn.update(position, nbrs.inner, t=t, **kwargs)
+      return LeesEdwardsNeighborList(new_nbrs, nbrs.shear_shift)
+
+  return NeighborListFns(allocate, update)
 
 def neighbor_list_mask(neighbor: NeighborList, mask_self: bool = False
                        ) -> Array:
