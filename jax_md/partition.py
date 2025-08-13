@@ -585,7 +585,7 @@ def is_box_valid(box: Array) -> bool:
   if jnp.isscalar(box) or box.ndim == 0 or box.ndim == 1:
     return True
   if box.ndim == 2:
-    return jnp.triu(box) == box
+    return jnp.all(jnp.triu(box) == box)
   return False
 
 
@@ -599,6 +599,7 @@ class NeighborList:
     reference_position: The positions of particles when the neighbor list was
       constructed. This is used to decide whether the neighbor list ought to be
       updated.
+    box_at_build: The physical box used at the most recent build of the neighbor list.
     error: An error code that is used to identify errors that occured during
       neighbor list construction. See `PartitionError` and `PartitionErrorCode`
       for details.
@@ -615,6 +616,7 @@ class NeighborList:
   """
   idx: Array
   reference_position: Array
+  box_at_build: Optional[Array]
   error: PartitionError
   cell_list_capacity: Optional[int] = dataclasses.static_field()
   max_occupancy: int = dataclasses.static_field()
@@ -783,6 +785,11 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
   dr_threshold = lax.stop_gradient(dr_threshold)
 
   box = f32(box)
+  # Disallow passing a full matrix `box` when using real coordinates; callers should
+  # thread the physical box to the displacement via kwargs and keep neighbor_list's
+  # `box` as a scalar/vector for real-space cell lists.
+  if (not fractional_coordinates) and util.is_array(box) and (hasattr(box, 'ndim') and box.ndim == 2):
+    raise ValueError('neighbor_list: matrix `box` only supported with fractional_coordinates=True.')
 
   cutoff = r_cutoff + dr_threshold
   cutoff_sq = cutoff ** 2
@@ -883,6 +890,10 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       position, err = position_and_error
       N = position.shape[0]
 
+      # Remember the physical box used for this build/reference.
+      # For fractional coordinates, callers can pass a triclinic matrix via kwargs['box'].
+      box_for_ref = kwargs.get('box', box)
+
       cl_fn = None
       cl = None
       cell_size = None
@@ -891,7 +902,7 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
           _box = kwargs.get('box', box)
           cell_size = cutoff
           if fractional_coordinates:
-            err = err.update(PEC.MALFORMED_BOX, is_box_valid(_box))
+            err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(_box)))
             cell_size = _fractional_cell_size(_box, cutoff)
             _box = 1.0
           if jnp.all(cell_size < _box / 3.):
@@ -941,6 +952,7 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       return NeighborList(
           idx,
           position,
+          box_for_ref,
           err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
           cl_capacity,
           max_occupancy,
@@ -967,13 +979,44 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
                                  _fractional_cell_size(kwargs['box'], cutoff))
       err = nbrs.error.update(PEC.CELL_SIZE_TOO_SMALL,
                               new_cell_size > cur_cell_size)
-      err = err.update(PEC.MALFORMED_BOX, is_box_valid(kwargs['box']))
+      # Set MALFORMED_BOX only when the provided box is NOT upper triangular.
+      err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(kwargs['box'])))
       nbrs = dataclasses.replace(nbrs, error=err)
 
     d = partial(metric_sq, **kwargs)
     d = vmap(d)
+    # Standard motion trigger: rebuild if any particle has drifted by > dr_threshold/2.
+    motion_trigger = jnp.any(d(position, nbrs.reference_position) > threshold_sq)
+
+    # Box-change trigger: conservative bound on maximum change in any minimum-image
+    # displacement due to an affine box update H -> H'. For fractional coordinates,
+    # displacements are H * wrap(Δf). The worst-case change is ≤ 0.5 * ||ΔH||_F.
+    def _as_matrix(b, dim):
+      if util.is_array(b):
+        if b.ndim == 0:
+          return jnp.diag(jnp.ones((dim,), dtype=b.dtype)) * b
+        if b.ndim == 1:
+          return jnp.diag(b)
+        return b
+      # Python scalar
+      return jnp.diag(jnp.ones((dim,), dtype=f32(b))) * f32(b)
+
+    if 'box' in kwargs and fractional_coordinates:
+      dim = position.shape[1]
+      H_now = _as_matrix(kwargs['box'], dim)
+      H_ref = _as_matrix(nbrs.box_at_build if hasattr(nbrs, 'box_at_build') else box, dim)
+      dH = H_now - H_ref
+      # 0.5 * Frobenius norm bound
+      box_delta = 0.5 * jnp.sqrt(jnp.sum(dH * dH))
+      # Safe condition: rebuild when the worst-case change exceeds the skin (dr_threshold).
+      box_trigger = box_delta > dr_threshold
+    else:
+      box_trigger = jnp.array(False)
+
+    do_rebuild = jnp.logical_or(motion_trigger, box_trigger)
+
     return lax.cond(
-        jnp.any(d(position, nbrs.reference_position) > threshold_sq),
+        do_rebuild,
         (position, nbrs.error), neighbor_fn,
         nbrs, lambda x: x)
 

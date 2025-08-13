@@ -415,6 +415,100 @@ def periodic_general(box: Box,
 
   return displacement_fn, shift_fn
 
+def shearing(box: Box,
+             shear_rate: float = 0.0,
+             fractional_coordinates: bool = True,
+             remap: bool = False,
+             keep_base_xy: bool = True):
+  """
+  Constant shear in x with gradient along y.
+  gamma(t) = shear_rate * t; instantaneous xy tilt = (base_xy + gamma) * Ly.
+
+  kwargs accepted by the returned functions:
+    - t: time (float), default 0.0
+    - shear_rate: override rate
+    - gamma: override instantaneous strain; if provided, it overrides rate*t
+    - box: override the *base* box for that call (vector or upper-triangular)
+
+  If fractional_coordinates=True:
+    - positions live in [0,1)^d
+    - displacement returns REAL vectors
+    - shift expects REAL dR and returns FRACTIONAL positions
+
+  If fractional_coordinates=False:
+    - positions and dR are REAL; internally we map to fractional for
+      minimum-image, then map back.
+  """
+
+  def _canonical_box(b: Box) -> Box:
+    if b.ndim == 1:              # orthorhombic -> diagonal matrix
+      return jnp.diag(b).astype(b.dtype)
+    if b.ndim == 2:
+      return b
+    raise ValueError("Provide vector (orthorhombic) or upper-triangular matrix.")
+
+  base = _canonical_box(box)
+  # Early validation: must be at least 2D box (2x2 or 3x3).
+  if base.ndim != 2 or base.shape[0] < 2:
+    raise ValueError("shearing requires a box of dimension >= 2 (2x2 or 3x3).")
+  # The box should have positive Ly (height) and base_xy (xy tilt).
+  if base[1, 1] <= 0.0 or (keep_base_xy and base[0, 1] < 0.0):
+    raise ValueError("shearing requires a box with positive Ly and base_xy.")
+
+  def _box_of(**kwargs) -> Box:
+    b = _canonical_box(kwargs.get('box', base))
+    # instantaneous gamma
+    if 'gamma' in kwargs:
+      gamma = kwargs['gamma']
+    else:
+      sr = kwargs.get('shear_rate', shear_rate)
+      t = kwargs.get('t', 0.0)
+      gamma = sr * t
+    if remap:
+      # keep shear strain in [-0.5, 0.5) with a definition that maps ±0.5 -> -0.5
+      gamma = jnp.mod(gamma + 0.5, 1.0) - 0.5
+
+    Ly = b[1, 1]
+    base_xy = b[0, 1] if keep_base_xy else 0.0
+    # set current xy entry = (base_xy + gamma) * Ly
+    return b.at[0, 1].set(base_xy + gamma * Ly)
+
+  def displacement_fn(Ra, Rb, **kwargs):
+    H = _box_of(**kwargs)
+    Hinv = jnp.linalg.inv(H)
+
+    if fractional_coordinates:
+      # positions in unit cube; minimum image there; map with current H
+      dRf = Ra - Rb
+      dRf = dRf - jnp.round(dRf)          # minimum image in unit cube
+      return transform(H, dRf)
+    else:
+      # positions in real, map to fractional → minimum image → back to real
+      Ra_f = transform(Hinv, Ra)
+      Rb_f = transform(Hinv, Rb)
+      dRf = Ra_f - Rb_f
+      dRf = dRf - jnp.round(dRf)
+      return transform(H, dRf)
+
+  def shift_fn(R, dR, **kwargs):
+    H = _box_of(**kwargs)
+    Hinv = jnp.linalg.inv(H)
+    ones = jnp.ones(R.shape[-1], dtype=R.dtype)
+
+    if fractional_coordinates:
+      # R fractional; convert real dR → fractional, wrap in unit cube
+      dRf = transform(Hinv, dR)
+      return periodic_shift(ones, R, dRf)   # wrap in [0,1)^d
+    else:
+      # R, dR real; map both to fractional, wrap, map back
+      Rf  = transform(Hinv, R)
+      dRf = transform(Hinv, dR)
+      Rf2 = periodic_shift(ones, Rf, dRf)
+      return transform(H, Rf2)
+
+  # Return the usual (displacement, shift), plus a helper to get the box at time t.
+  return displacement_fn, shift_fn, _box_of
+
 
 def metric(displacement: DisplacementFn) -> MetricFn:
   """Takes a displacement function and creates a metric."""
