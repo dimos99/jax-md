@@ -1148,6 +1148,101 @@ def brownian(energy_or_force: Callable[..., Array],
   return init_fn, apply_fn
 
 
+
+@dataclasses.dataclass
+class ShearedBrownianState:
+  """A tuple containing state information for Brownian dynamics.
+
+  Attributes:
+    position: The current position of the particles. An ndarray of floats with
+      shape `[n, spatial_dimension]`.
+    mass: The mass of particles. Will either be a float or an ndarray of floats
+      with shape `[n]`.
+    rng: The current state of the random number generator.
+  """
+  position: Array
+  mass: Array
+  rng: Array
+  # Extra attributes for compatibility with shear box simulations.
+  shear_box_prev: Array
+  t_prev: Array
+
+
+def brownian_with_shear(energy_or_force_fn,
+                              shift_fn,
+                              dt,
+                              kT,
+                              gamma=0.1,
+                              *,
+                              box_of=None):
+  """Brownian dynamics that automatically remaps across Lees–Edwards flips.
+
+  Pass either `box` each step (the instantaneous H(t)) *or* provide `box_of(t)`
+  here and pass `t` each step. Positions are fractional; we remap with
+  space.remap_fractional_positions(H_old -> H_new) so real-space x is continuous.
+  
+  NOTE: Be careful, this does not remap the neighbor list, so if you use
+  neighbor lists, you must ensure that the neighbor list is updated
+  whenever the box changes. This is done automatically in the
+  `partition.neighbor_list` function, but be careful anyway.
+  """
+  base_init, base_step = brownian(energy_or_force_fn, shift_fn, dt, kT, gamma=gamma)
+
+  @jit
+  def init_fn(key, R, mass=f32(1.0), **kwargs):
+    t0 = kwargs.get('t', f32(0.0))
+    H0 = kwargs.get('box', None)
+    if H0 is None and box_of is not None:
+      H0 = box_of(t=t0)
+    if H0 is None:
+      H0 = jnp.eye(R.shape[-1], dtype=R.dtype)
+    bstate = base_init(key, R, kT, mass=mass, **kwargs)
+    return ShearedBrownianState(bstate.position, bstate.mass, bstate.rng, H0, t0)
+
+  @jit
+  def _step_sheared(state: ShearedBrownianState, **kwargs):
+    # Get instantaneous box
+    t = kwargs.get('t', state.t_prev)
+    H_new = kwargs.get('box', None)
+    if H_new is None and box_of is not None:
+      H_new = box_of(t=t)
+
+    # Remap fractional positions across box change
+    if H_new is not None:
+      R_rf = space.remap_fractional_positions(state.position, state.shear_box_prev, H_new)
+      state = state.set(position=R_rf, shear_box_prev=H_new, t_prev=t)
+      kwargs = dict(kwargs); kwargs['box'] = H_new
+
+    # Delegate to original Brownian step
+    bstate = BrownianState(position=state.position, mass=state.mass, rng=state.rng)
+    bstate = base_step(bstate, **kwargs)
+
+    return ShearedBrownianState(bstate.position, bstate.mass, bstate.rng,
+                                state.shear_box_prev, t)
+
+  @jit
+  def _step_brownian_first(state: BrownianState, **kwargs):
+    # First production call after equilibration: promote to sheared state.
+    t0 = kwargs.get('t', f32(0.0))
+    H0 = kwargs.get('box', None)
+    if H0 is None and box_of is not None:
+      H0 = box_of(t=t0)
+    if H0 is None:
+      H0 = jnp.eye(state.position.shape[-1], dtype=state.position.dtype)
+    sheared = ShearedBrownianState(state.position, state.mass, state.rng, H0, t0)
+    return _step_sheared(sheared, **kwargs)
+
+  def step_fn(state, **kwargs):
+    # Non-jitted dispatcher so either state type is accepted
+    if hasattr(state, 't_prev') and hasattr(state, 'shear_box_prev'):
+      return _step_sheared(state, **kwargs)
+    else:
+      return _step_brownian_first(state, **kwargs)
+
+  return init_fn, step_fn
+
+
+
 """Experimental Simulations.
 
 

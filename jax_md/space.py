@@ -424,6 +424,11 @@ def shearing(box: Box,
   Constant shear in x with gradient along y.
   gamma(t) = shear_rate * t; instantaneous xy tilt = (base_xy + gamma) * Ly.
 
+  In real-coordinate mode (`fractional_coordinates=False`), the integer part of
+  `gamma` is always reduced internally (i.e., we keep `gamma` in [-0.5, 0.5)),
+  mirroring LAMMPS tilt "flip" behavior so that `gamma` and `gamma + n` (n ∈ ℤ)
+  produce equivalent boxes and identical displacements/energies.
+
   kwargs accepted by the returned functions:
     - t: time (float), default 0.0
     - shear_rate: override rate
@@ -464,8 +469,12 @@ def shearing(box: Box,
       sr = kwargs.get('shear_rate', shear_rate)
       t = kwargs.get('t', 0.0)
       gamma = sr * t
-    if remap:
-      # keep shear strain in [-0.5, 0.5) with a definition that maps ±0.5 -> -0.5
+    # Normalize gamma into [-0.5, 0.5) in two cases:
+    #   (i) when remap=True (explicit request), and
+    #   (ii) always in real-coordinate mode to make integer-tilt-equivalent boxes
+    #        identical (LAMMPS "flip" semantics). This guarantees invariance of
+    #        distances/energies under gamma -> gamma + n when fractional_coordinates=False.
+    if remap or (not fractional_coordinates):
       gamma = jnp.mod(gamma + 0.5, 1.0) - 0.5
 
     Ly = b[1, 1]
@@ -474,7 +483,33 @@ def shearing(box: Box,
     return b.at[0, 1].set(base_xy + gamma * Ly)
 
   def displacement_fn(Ra, Rb, **kwargs):
-    H = _box_of(**kwargs)
+    # In fractional mode, if a full box matrix is provided by the caller,
+    # treat it as the instantaneous physical box and use it directly, without
+    # applying any additional gamma override.
+    if fractional_coordinates and ('box' in kwargs) and (jnp.ndim(kwargs['box']) == 2):
+      # Use the provided physical box as-is (except for vector->diag conversion).
+      H = kwargs['box']
+      if H.ndim == 1:
+        H = jnp.diag(H)
+    else:
+      # Otherwise build H from base + (possibly canonicalized) gamma.
+      # Enforce invariance under gamma -> gamma + n in fractional mode by
+      # reducing the integer part of gamma for displacement only.
+      if 'gamma' in kwargs:
+        _gamma_raw = kwargs['gamma']
+      else:
+        _sr = kwargs.get('shear_rate', shear_rate)
+        _t = kwargs.get('t', 0.0)
+        _gamma_raw = _sr * _t
+
+      if fractional_coordinates:
+        _gamma_eff = jnp.mod(_gamma_raw + 0.5, 1.0) - 0.5
+        _kwargs = dict(kwargs)
+        _kwargs['gamma'] = _gamma_eff
+        H = _box_of(**_kwargs)
+      else:
+        H = _box_of(**kwargs)
+
     Hinv = jnp.linalg.inv(H)
 
     if fractional_coordinates:
@@ -496,9 +531,11 @@ def shearing(box: Box,
     ones = jnp.ones(R.shape[-1], dtype=R.dtype)
 
     if fractional_coordinates:
-      # R fractional; convert real dR → fractional, wrap in unit cube
+      # R fractional; convert real dR -> fractional and wrap in unit cube.
+      # Use component-wise wrapping here so that for small steps
+      # disp(shift(R, dR), R) ≈ dR exactly (no extra shear offsets).
       dRf = transform(Hinv, dR)
-      return periodic_shift(ones, R, dRf)   # wrap in [0,1)^d
+      return periodic_shift(ones, R, dRf)
     else:
       # R, dR real; map both to fractional, wrap, map back
       Rf  = transform(Hinv, R)
@@ -552,4 +589,32 @@ def canonicalize_displacement_or_metric(displacement_or_metric):
   raise ValueError(
     'Canonicalize displacement not implemented for spatial dimension larger'
     'than 4.')
+
+
+def remap_fractional_positions(Rf: Array, old_box: Box, new_box: Box) -> Array:
+  """Remap fractional coordinates from old_box to new_box preserving real pos.
+
+  Given fractional positions Rf defined with respect to old_box (upper-triangular
+  or diagonal), return fractional positions Rf' with respect to new_box such that
+  old_box @ Rf ≡ new_box @ Rf' (mod lattice vectors), and wrap Rf' into [0,1)^d.
+
+  This is useful when using shearing with remap=True: when the box basis flips
+  at gamma crossing a half-integer, map the fractional coordinates accordingly
+  to avoid discontinuities in real space.
+  """
+  def _as_matrix(b, dim):
+    arr = jnp.asarray(b)
+    if arr.ndim == 0:
+      return jnp.diag(jnp.ones((dim,), dtype=arr.dtype)) * arr
+    if arr.ndim == 1:
+      return jnp.diag(arr)
+    return arr
+
+  dim = Rf.shape[-1]
+  H_old = _as_matrix(old_box, dim)
+  H_new = _as_matrix(new_box, dim)
+  R_real = transform(H_old, Rf)
+  Rf_new = transform(jnp.linalg.inv(H_new), R_real)
+  # Wrap into [0,1)
+  return Rf_new - jnp.floor(Rf_new)
 

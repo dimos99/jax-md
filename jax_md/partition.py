@@ -589,6 +589,36 @@ def is_box_valid(box: Array) -> bool:
   return False
 
 
+def _canonicalize_upper_triangular_box(H: Array) -> Array:
+  """Canonicalize upper-triangular box by wrapping off-diagonals.
+
+  For an upper-triangular lattice matrix with diagonal lengths
+  Lx = H[0,0], Ly = H[1,1], Lz = H[2,2], wrap the off-diagonals into the
+  fundamental domain of equivalent lattice bases:
+    - H[0,1] (xy tilt) modulo Lx
+    - H[0,2] (xz tilt) modulo Lx
+    - H[1,2] (yz tilt) modulo Ly
+  i.e., each wrapped into [-0.5*L, 0.5*L).
+
+  No-op for scalar/vector inputs.
+  """
+  if not util.is_array(H) or H.ndim != 2:
+    return H
+  out = H
+  n = H.shape[0]
+  def wrap_offdiag(val, L):
+    return jnp.where(L != 0, jnp.mod(val + 0.5 * L, L) - 0.5 * L, val)
+  if n >= 2:
+    Lx = H[0, 0]
+    out = out.at[0, 1].set(wrap_offdiag(H[0, 1], Lx))
+  if n >= 3:
+    Lx = H[0, 0]
+    Ly = H[1, 1]
+    out = out.at[0, 2].set(wrap_offdiag(H[0, 2], Lx))
+    out = out.at[1, 2].set(wrap_offdiag(H[1, 2], Ly))
+  return out
+
+
 @dataclasses.dataclass
 class NeighborList:
   """A struct containing the state of a Neighbor List.
@@ -616,8 +646,11 @@ class NeighborList:
   """
   idx: Array
   reference_position: Array
+  reference_box: Box
   box_at_build: Optional[Array]
   error: PartitionError
+  # Add a non-static field that remembers the instantaneous box used last time.
+  last_box: Array
   cell_list_capacity: Optional[int] = dataclasses.static_field()
   max_occupancy: int = dataclasses.static_field()
 
@@ -886,6 +919,32 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
                        neighbors = None,
                        extra_capacity: int = 0,
                        **kwargs) -> NeighborList:
+    # Auto-remap fractional positions only when a discrete lattice-equivalent
+    # flip occurs (off-diagonal wrap count changes). This preserves real-space
+    # continuity across canonical remap flips but avoids remapping on small
+    # shear updates where fractional positions should remain fixed.
+    H_new = kwargs.get('box', None)
+    if (neighbors is not None and fractional_coordinates and
+        (H_new is not None) and hasattr(neighbors, 'last_box') and
+        (neighbors.last_box is not None)):
+      def _wrap_counts(H: Array) -> Array:
+        if not util.is_array(H) or H.ndim != 2:
+          return jnp.zeros((3,), dtype=i32)
+        n = H.shape[0]
+        Lx = H[0, 0]
+        Ly = H[1, 1] if n >= 2 else Lx
+        # round(s/L) to nearest integer
+        n_xy = jnp.where(n >= 2, jnp.floor(H[0, 1] / Lx + 0.5), 0.0)
+        n_xz = jnp.where(n >= 3, jnp.floor(H[0, 2] / Lx + 0.5), 0.0)
+        n_yz = jnp.where(n >= 3, jnp.floor(H[1, 2] / Ly + 0.5), 0.0)
+        return jnp.array([n_xy, n_xz, n_yz], dtype=i32)
+      counts_old = _wrap_counts(neighbors.last_box)
+      counts_new = _wrap_counts(H_new)
+      flip_event = jnp.any(counts_old != counts_new)
+      position = lax.cond(flip_event,
+                          position, lambda R: space.remap_fractional_positions(R, neighbors.last_box, H_new),
+                          position, lambda R: R)
+
     def neighbor_fn(position_and_error, max_occupancy=None):
       position, err = position_and_error
       N = position.shape[0]
@@ -947,22 +1006,26 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         if max_occupancy > capacity_limit:
           max_occupancy = capacity_limit
       idx = idx[:, :max_occupancy]
-      update_fn = (neighbor_list_fn if neighbors is None else
-                   neighbors.update_fn)
+      update_fn = (neighbor_list_fn if neighbors is None else neighbors.update_fn)
+
+      # Construct NeighborList using keyword args (avoids positional mismatches)
       return NeighborList(
-          idx,
-          position,
-          box_for_ref,
-          err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
-          cl_capacity,
-          max_occupancy,
-          format,
-          cell_size,
-          cl_fn,
-          update_fn)  # pytype: disable=wrong-arg-count
+          idx=idx,
+          reference_position=position,
+          reference_box=box_for_ref,
+          box_at_build=box_for_ref,
+          error=err.update(PEC.NEIGHBOR_LIST_OVERFLOW, occupancy > max_occupancy),
+          last_box=box_for_ref,
+          cell_list_capacity=cl_capacity,
+          max_occupancy=max_occupancy,
+          format=format,
+          cell_size=cell_size,
+          cell_list_fn=cl_fn,
+          update_fn=update_fn)
 
     nbrs = neighbors
     if nbrs is None:
+      # Allocate new neighbor list (neighbor_fn sets last_box=box_for_ref)
       return neighbor_fn((position, PartitionError(jnp.zeros((), jnp.uint8))))
 
     neighbor_fn = partial(neighbor_fn, max_occupancy=nbrs.max_occupancy)
@@ -975,11 +1038,8 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
                          'if fractional_coordinates is not enabled.')
       # `cell_size` is really the minimum cell size.
       cur_cell_size = _cell_size(1.0, nbrs.cell_size)
-      new_cell_size = _cell_size(1.0,
-                                 _fractional_cell_size(kwargs['box'], cutoff))
-      err = nbrs.error.update(PEC.CELL_SIZE_TOO_SMALL,
-                              new_cell_size > cur_cell_size)
-      # Set MALFORMED_BOX only when the provided box is NOT upper triangular.
+      new_cell_size = _cell_size(1.0, _fractional_cell_size(kwargs['box'], cutoff))
+      err = nbrs.error.update(PEC.CELL_SIZE_TOO_SMALL, new_cell_size > cur_cell_size)
       err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(kwargs['box'])))
       nbrs = dataclasses.replace(nbrs, error=err)
 
@@ -1005,7 +1065,12 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       dim = position.shape[1]
       H_now = _as_matrix(kwargs['box'], dim)
       H_ref = _as_matrix(nbrs.box_at_build if hasattr(nbrs, 'box_at_build') else box, dim)
-      dH = H_now - H_ref
+      # Canonicalize equivalent upper-triangular representations so that
+      # remap flips (e.g., xy -> xy ± Ly) don’t appear as large box changes.
+      # TODO: CHECK IF THIS IS NECESSARY
+      H_now_c = _canonicalize_upper_triangular_box(H_now)
+      H_ref_c = _canonicalize_upper_triangular_box(H_ref)
+      dH = H_now_c - H_ref_c
       # 0.5 * Frobenius norm bound
       box_delta = 0.5 * jnp.sqrt(jnp.sum(dH * dH))
       # Safe condition: rebuild when the worst-case change exceeds the skin (dr_threshold).
@@ -1015,17 +1080,20 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     do_rebuild = jnp.logical_or(motion_trigger, box_trigger)
 
-    return lax.cond(
+    new_nl = lax.cond(
         do_rebuild,
         (position, nbrs.error), neighbor_fn,
         nbrs, lambda x: x)
 
-  def allocate_fn(position: Array, extra_capacity: int = 0, **kwargs
-                  ):
+    # Propagate last_box even if we didn't rebuild
+    prev_last = getattr(nbrs, 'last_box', nbrs.box_at_build)
+    new_last = H_new if H_new is not None else prev_last
+    return dataclasses.replace(new_nl, last_box=new_last)
+
+  def allocate_fn(position: Array, extra_capacity: int = 0, **kwargs):
     return neighbor_list_fn(position, extra_capacity=extra_capacity, **kwargs)
 
-  def update_fn(position: Array, neighbors, **kwargs
-                ):
+  def update_fn(position: Array, neighbors, **kwargs):
     return neighbor_list_fn(position, neighbors, **kwargs)
 
   return NeighborListFns(allocate_fn, update_fn)  # pytype: disable=wrong-arg-count
