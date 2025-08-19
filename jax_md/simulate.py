@@ -1196,7 +1196,7 @@ def brownian_with_shear(energy_or_force_fn,
       H0 = box_of(t=t0)
     if H0 is None:
       H0 = jnp.eye(R.shape[-1], dtype=R.dtype)
-    bstate = base_init(key, R, kT, mass=mass, **kwargs)
+    bstate = base_init(key, R, mass=mass, **kwargs)
     return ShearedBrownianState(bstate.position, bstate.mass, bstate.rng, H0, t0)
 
   @jit
