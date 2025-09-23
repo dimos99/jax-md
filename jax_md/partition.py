@@ -933,17 +933,18 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         n = H.shape[0]
         Lx = H[0, 0]
         Ly = H[1, 1] if n >= 2 else Lx
-        # round(s/L) to nearest integer
         n_xy = jnp.where(n >= 2, jnp.floor(H[0, 1] / Lx + 0.5), 0.0)
         n_xz = jnp.where(n >= 3, jnp.floor(H[0, 2] / Lx + 0.5), 0.0)
         n_yz = jnp.where(n >= 3, jnp.floor(H[1, 2] / Ly + 0.5), 0.0)
         return jnp.array([n_xy, n_xz, n_yz], dtype=i32)
       counts_old = _wrap_counts(neighbors.last_box)
       counts_new = _wrap_counts(H_new)
-      flip_event = jnp.any(counts_old != counts_new)
-      position = lax.cond(flip_event,
+      tilt_reset = jnp.any(counts_old != counts_new)
+      position = lax.cond(tilt_reset,
                           position, lambda R: space.remap_fractional_positions(R, neighbors.last_box, H_new),
                           position, lambda R: R)
+    else:
+      tilt_reset = jnp.array(False)
 
     def neighbor_fn(position_and_error, max_occupancy=None):
       position, err = position_and_error
@@ -1008,7 +1009,16 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       idx = idx[:, :max_occupancy]
       update_fn = (neighbor_list_fn if neighbors is None else neighbors.update_fn)
 
-      # Construct NeighborList using keyword args (avoids positional mismatches)
+      # Coerce static metadata to hashable Python types to avoid traced equality checks.
+      _cell_size_meta = cell_size
+      try:
+        # Convert JAX/NumPy scalar arrays to Python float if possible.
+        import jax.numpy as _jnp  # local import to avoid polluting module namespace
+        if hasattr(_cell_size_meta, "shape") and getattr(_cell_size_meta, "ndim", 0) == 0:
+          _cell_size_meta = float(_cell_size_meta)
+      except Exception:
+        pass
+
       return NeighborList(
           idx=idx,
           reference_position=position,
@@ -1019,7 +1029,7 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
           cell_list_capacity=cl_capacity,
           max_occupancy=max_occupancy,
           format=format,
-          cell_size=cell_size,
+          cell_size=_cell_size_meta,
           cell_list_fn=cl_fn,
           update_fn=update_fn)
 
@@ -1045,12 +1055,11 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     d = partial(metric_sq, **kwargs)
     d = vmap(d)
-    # Standard motion trigger: rebuild if any particle has drifted by > dr_threshold/2.
-    motion_trigger = jnp.any(d(position, nbrs.reference_position) > threshold_sq)
+    # Per-particle squared displacement since build (real units; disp_fn already uses current H)
+    d_sq = d(position, nbrs.reference_position)
+    d_max = jnp.sqrt(jnp.max(d_sq))
 
-    # Box-change trigger: conservative bound on maximum change in any minimum-image
-    # displacement due to an affine box update H -> H'. For fractional coordinates,
-    # displacements are H * wrap(Δf). The worst-case change is ≤ 0.5 * ||ΔH||_F.
+    # Box-change bound: (sqrt(dim)/2) * ||ΔH||_F after canonicalizing equivalent upper-triangular reps
     def _as_matrix(b, dim):
       if util.is_array(b):
         if b.ndim == 0:
@@ -1058,27 +1067,23 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         if b.ndim == 1:
           return jnp.diag(b)
         return b
-      # Python scalar
       return jnp.diag(jnp.ones((dim,), dtype=f32(b))) * f32(b)
 
     if 'box' in kwargs and fractional_coordinates:
       dim = position.shape[1]
       H_now = _as_matrix(kwargs['box'], dim)
       H_ref = _as_matrix(nbrs.box_at_build if hasattr(nbrs, 'box_at_build') else box, dim)
-      # Canonicalize equivalent upper-triangular representations so that
-      # remap flips (e.g., xy -> xy ± Ly) don’t appear as large box changes.
-      # TODO: CHECK IF THIS IS NECESSARY
       H_now_c = _canonicalize_upper_triangular_box(H_now)
       H_ref_c = _canonicalize_upper_triangular_box(H_ref)
       dH = H_now_c - H_ref_c
-      # 0.5 * Frobenius norm bound
-      box_delta = 0.5 * jnp.sqrt(jnp.sum(dH * dH))
-      # Safe condition: rebuild when the worst-case change exceeds the skin (dr_threshold).
-      box_trigger = box_delta > dr_threshold
+      fro = jnp.sqrt(jnp.sum(dH * dH))
+      box_bound = 0.5 * jnp.sqrt(f32(dim)) * fro
     else:
-      box_trigger = jnp.array(False)
+      box_bound = jnp.array(0.0, dtype=position.dtype)
 
-    do_rebuild = jnp.logical_or(motion_trigger, box_trigger)
+    # Combined safe inequality: 2*d_max + box_bound > dr_threshold  OR any integer tilt reset
+    combined = 2.0 * d_max + box_bound
+    do_rebuild = jnp.logical_or(tilt_reset, combined > dr_threshold)
 
     new_nl = lax.cond(
         do_rebuild,

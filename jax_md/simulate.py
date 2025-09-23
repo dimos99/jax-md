@@ -1143,7 +1143,7 @@ def brownian(energy_or_force: Callable[..., Array],
   force_fn = quantity.canonicalize_force(energy_or_force)
 
   # Ensure `dt` is a static JAX scalar with the right dtype.
-  _dt = static_cast(dt)
+  (_dt,) = static_cast(dt)
 
   @jit
   def init_fn(key, R, **kwargs):
@@ -1232,7 +1232,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
   - `time`: the simulation clock.
   - `force`: the deterministic force used at the step.
   - `stress`: instantaneous stress. If `pair_energy_for_stress` is provided,
-    uses the Irving–Kirkwood pairwise form; otherwise uses the virial-like
+    uses the Irving-Kirkwood pairwise form; otherwise uses the virial-like
     tensor sum_i F_i ⊗ x_i (real positions), divided by the box volume.
 
   Expected geometry setup: construct `displacement`, `shift`, and `box_of`
@@ -1255,9 +1255,10 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
       `[n]` or `[n, 1]` (the latter broadcasts cleanly over coordinates). The
       value is stored in the state and can be overridden at initialization via
       `init_fn(..., mobility=...)`.
-    shear_fn: Function returning the reduced shear `gamma(t)`.
-      The actual axes of shear are determined by the provided `space.shearing`
-      geometry; this function simply computes the time-dependent strain.
+    shear_fn: Either a single function returning the reduced shear `gamma(t)`
+      (applied to the 'xy' tilt), or a dict mapping plane names ('xy','xz','yz')
+      to functions of time. The geometry is determined by the provided
+      `space.shearing` configuration.
     box_of: Function returning the current triclinic box. Use the one returned
       by `space.shearing(...)`. It should accept either `t=` or `gamma=` and
       return a box matrix compatible with `space.transform`. Required to compute
@@ -1269,6 +1270,11 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     remap: If True, apply a nearest-integer remap so that `gamma` is kept in
       `[-0.5, 0.5)` and, when using fractional positions, apply the exact
       unimodular change-of-basis to keep coordinates inside the base cell.
+    pair_energy_for_stress: Optional callable mapping pairs of positions
+      (displacements) to pair energies. If provided, the Irving-Kirkwood
+      expression is used to compute stress; otherwise, stress will not be
+      computed. Its presence implies the computation of stress.
+      TODO: add support for non-pairwise forces.
 
   Returns:
     A pair `(init_fn, apply_fn)`:
@@ -1317,39 +1323,54 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
   _dt = f32(dt)
   t0 = f32(t0)
   
+  
+  # Normalize `shear_fn` into per-plane callables (zeros for missing planes).
+  if isinstance(shear_fn, dict): #< Then, we have per-plane functions.
+    sf_xy = shear_fn.get('xy', lambda t: f32(0.0))
+    sf_xz = shear_fn.get('xz', lambda t: f32(0.0))
+    sf_yz = shear_fn.get('yz', lambda t: f32(0.0))
+  else: #< Single function, applies to 'xy' plane by convention.
+    sf_xy = shear_fn
+    sf_xz = lambda t: f32(0.0)
+    sf_yz = lambda t: f32(0.0)
+  
   # Optional pairwise force magnitude function for Irving–Kirkwood stress.
   pair_force_mag_fn = None
   if pair_energy_for_stress is not None:
     def _sum_pair_energy(dr, **pkw):
+      """Sum of pair energies for a set of pair distances.
+      Assumes dr has shape (...,) and returns a scalar.
+      That's basically the total potential energy of the system as a function
+      of all the pair distances.
+      """
       return jnp.sum(pair_energy_for_stress(dr, **pkw))
     pair_force_mag_fn = grad(_sum_pair_energy)
 
+  @jit
   def _ik_stress_from_pairs(Rf: Array, H: Array, kwargs: Dict[str, Any]) -> Array:
     """Compute IK stress via pairwise forces and displacements.
 
     Supports neighbor lists when provided via kwargs['neighbor'].
-    NOTE: this feature hasn't been tested yet (TODO - and maybe get rid of 
-    energy_or_force in favor of pair_energy_for_stress?).
     Expects Rf fractional coordinates and H the current real-space box.
     """
     assert pair_force_mag_fn is not None
 
-    neighbor = kwargs.get('neighbor', None)
+    neighbor = kwargs.get('neighbor', None) #< Optional neighbor list.
 
     if neighbor is None:
       # Dense all-pairs path (O(N^2)).
-      dSf = Rf[:, None, :] - Rf[None, :, :]
-      dSf = dSf - jnp.round(dSf)
-      dR  = space.transform(H, dSf)              # (N, N, d)
-      dr  = space.distance(dR)                   # (N, N)
+      dSf = Rf[:, None, :] - Rf[None, :, :] # Displacements in fractional coords.
+      dSf = dSf - jnp.round(dSf)          # Apply PBCs.
+      dR  = space.transform(H, dSf) # Convert to real coords; (N, N, d)
+      dr  = space.distance(dR)      # Convert to real pairwise distances; (N, N)
 
       # Mask diagonal to avoid self interactions.
       mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
-      dr = dr * mask
+      dr = dr * mask # The diagonal is now zero and won't contribute.
 
       # f_mag = -dU/dr elementwise.
       dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * mask
+      f_mag = -dUdR * mask 
 
       # Unit vectors; safe divide.
       eps = jnp.array(1e-12, dtype=Rf.dtype)
@@ -1362,12 +1383,12 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     # Neighbor list present.
     if partition.is_sparse(neighbor.format):
       send, recv = neighbor.idx
-      pair_mask = partition.neighbor_list_mask(neighbor)
+      pair_mask = partition.neighbor_list_mask(neighbor) # Gets rid of sentinels
 
-      dSf = Rf[send] - Rf[recv]
-      dSf = dSf - jnp.round(dSf)
-      dR  = space.transform(H, dSf)              # (B, d)
-      dr  = space.distance(dR)                   # (B,)
+      dSf = Rf[send] - Rf[recv] # Only the listed pairs.
+      dSf = dSf - jnp.round(dSf) # Apply PBCs.
+      dR  = space.transform(H, dSf) # Convert to real coords; (B, d)
+      dr  = space.distance(dR)      #  Convert to real pairwise distances; (B,)
 
       dUdR = pair_force_mag_fn(dr, **kwargs)
       f_mag = -dUdR * pair_mask
@@ -1376,67 +1397,79 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
       f_hat = dR / (dr[:, None] + eps)
       Fij = f_mag[:, None] * f_hat               # (B, d)
 
+      # OrderedSparse counts each pair once; Sparse counts each twice.
       norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
       virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
       return virial / vol
+    
+    elif neighbor.format is partition.Dense:
+      # Dense neighbor list format. Avoid, since it's numerically heavy.
+      idx = neighbor.idx                            # (N, max_nbrs)
+      N = Rf.shape[0]
+      mask = (idx < N).astype(Rf.dtype)            # (N, max_nbrs)
 
-    # Dense neighbor list format.
-    idx = neighbor.idx                            # (N, max_nbrs)
-    N = Rf.shape[0]
-    mask = (idx < N).astype(Rf.dtype)            # (N, max_nbrs)
+      Rn = Rf[idx]                                  # (N, max_nbrs, d)
+      dSf = Rf[:, None, :] - Rn
+      dSf = dSf - jnp.round(dSf)
+      dR  = space.transform(H, dSf)                 # (N, max_nbrs, d)
+      dr  = space.distance(dR)                      # (N, max_nbrs)
 
-    Rn = Rf[idx]                                  # (N, max_nbrs, d)
-    dSf = Rf[:, None, :] - Rn
-    dSf = dSf - jnp.round(dSf)
-    dR  = space.transform(H, dSf)                 # (N, max_nbrs, d)
-    dr  = space.distance(dR)                      # (N, max_nbrs)
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * mask
 
-    dUdR = pair_force_mag_fn(dr, **kwargs)
-    f_mag = -dUdR * mask
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[..., None] + eps)
+      Fij = f_mag[..., None] * f_hat                # (N, max_nbrs, d)
 
-    eps = jnp.array(1e-12, dtype=Rf.dtype)
-    f_hat = dR / (dr[..., None] + eps)
-    Fij = f_mag[..., None] * f_hat                # (N, max_nbrs, d)
+      virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
+      return virial / vol
+    
+    else:
+      raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
 
-    virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
-    return virial / vol
-  
   @jit
   def init_fn(key, R, **kwargs):
     # Stash μ in the state; allow overriding at init via kwargs if desired.
     mu = kwargs.get('mobility', mobility)
     # Initial gamma and current box for stress/real positions.
     # Use reduced gamma to match neighbor-list/space kernels.
-    gamma_unwrapped = shear_fn(t0)
-    if remap: # wrap gamma to [-0.5, 0.5)
-      m_curr = jnp.floor(gamma_unwrapped + 0.5)
-      curr_gamma = gamma_unwrapped - m_curr
+    gamma_xy = f32(sf_xy(jnp.array(t0, dtype=R.dtype)))
+    gamma_xz = f32(sf_xz(jnp.array(t0, dtype=R.dtype))) if R.shape[1] >= 3 else f32(0.0)
+    gamma_yz = f32(sf_yz(jnp.array(t0, dtype=R.dtype))) if R.shape[1] >= 3 else f32(0.0)
+      
+    if remap:
+      m_xy = jnp.floor(gamma_xy + 0.5)
+      m_xz = jnp.floor(gamma_xz + 0.5)
+      m_yz = jnp.floor(gamma_yz + 0.5)
+      curr_xy = gamma_xy - m_xy
+      curr_xz = gamma_xz - m_xz
+      curr_yz = gamma_yz - m_yz
     else:
-      curr_gamma = gamma_unwrapped
+      curr_xy, curr_xz, curr_yz = gamma_xy, gamma_xz, gamma_yz
 
     # Compute deterministic force at t0 (passes gamma for sheared BCs if needed).
     init_kwargs = dict(kwargs)
-    init_kwargs['gamma'] = curr_gamma
+    if R.shape[1] >= 3:
+      init_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
+    else:
+      init_kwargs['gamma'] = curr_xy
     F0 = force_fn(R, **init_kwargs)
 
-    # Compute stress at init: IK when configured, else virial-like fallback.
+    # Compute stress at init: IK when configured, otherwise keep it None.
     if pair_force_mag_fn is not None:
-      H0 = box_of(gamma=curr_gamma)
+      H0 = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
+            if R.shape[1] >= 3 else box_of(gamma=curr_xy))
       if fractional_position:
         Rf0 = R
       else:
         Rf0 = space.transform(jnp.linalg.inv(H0), R)
       stress0 = _ik_stress_from_pairs(Rf0, H0, init_kwargs)
     else:
-      if fractional_position:
-        H0 = box_of(gamma=curr_gamma)
-        X0 = space.transform(H0, R)
-      else:
-        X0 = R
-      stress0 = jnp.einsum('ni,nj->ij', F0, X0) / vol
+      stress0 = None
 
-    state = ShearedBrownianState(position=R, mobility=mu, rng=key,
-                                 time=t0, force=F0, stress=stress0)
+    state = ShearedBrownianState(position=R, mobility=mu, rng=key,  #type: ignore
+                                 time=t0, force=F0, stress=stress0) #type: ignore
+    
     # Reshape μ for broadcasting with positions (e.g., [n] -> [n,1]).
     state = canonicalize_mobility(state)
     return state
@@ -1448,56 +1481,86 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
 
     R, mu, key, time, _, _ = dataclasses.astuple(state)
 
-
     if remap:
       # --- Shear handling: compute reduced gamma and optional integer remap ---
       # Unwrapped shears at start/end of the step
-      prev_unwrapped = shear_fn(time)
-      curr_unwrapped = shear_fn(time + _dt)
+      prev_xy = f32(sf_xy(time))
+      curr_xy = f32(sf_xy(time + _dt))
+      if R.shape[1] >= 3: # Do the same for the other planes.
+        prev_xz = f32(sf_xz(time)); curr_xz = f32(sf_xz(time + _dt))
+        prev_yz = f32(sf_yz(time)); curr_yz = f32(sf_yz(time + _dt))
+      else:
+        prev_xz = curr_xz = prev_yz = curr_yz = f32(0.0)
 
       # Nearest-integer counters (how many unit tilts elapsed)
-      m_prev = jnp.floor(prev_unwrapped + 0.5)
-      m_curr = jnp.floor(curr_unwrapped + 0.5)
-      m = (m_curr - m_prev).astype(jnp.int32)  # could be -1, 0, +1, ...
+      m_prev_xy = jnp.floor(prev_xy + 0.5); m_curr_xy = jnp.floor(curr_xy + 0.5)
+      m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
+      if R.shape[1] >= 3: # Do the same for the other planes.
+        m_prev_xz = jnp.floor(prev_xz + 0.5); m_curr_xz = jnp.floor(curr_xz + 0.5)
+        m_prev_yz = jnp.floor(prev_yz + 0.5); m_curr_yz = jnp.floor(curr_yz + 0.5)
+        m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
+        m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
+      else:
+        m_xz = m_yz = jnp.array(0, dtype=jnp.int32)
 
       # Reduced shear to pass to kernels (in [-0.5, 0.5))
-      curr_gamma = curr_unwrapped - m_curr
+      curr_xy = curr_xy - m_curr_xy
+      if R.shape[1] >= 3:  # Do the same for the other planes.
+        curr_xz = curr_xz - m_curr_xz
+        curr_yz = curr_yz - m_curr_yz
 
       # If we store fractional coordinates and a tilt index changed, apply the exact
-      # unimodular change-of-basis map s_x <- s_x + m * (Ly/Lx) * s_y.
+      # unimodular change-of-basis map to the coordinates. Handle 2D and 3D.
       if fractional_position:
-        H_tmp = box_of(gamma=curr_gamma)
-        Ly = H_tmp[1, 1]
-        Lx = H_tmp[0, 0]
-        factor = Ly / Lx
-        def _apply_remap(R_in):
-          return R_in.at[:, 0].add(factor * R_in[:, 1] * jnp.asarray(m, R_in.dtype))
-        R = lax.cond(jnp.not_equal(m, 0), _apply_remap, lambda R_in: R_in, R)
+        if R.shape[1] >= 3:
+          mxy = jnp.asarray(m_xy, R.dtype)
+          mxz = jnp.asarray(m_xz, R.dtype)
+          myz = jnp.asarray(m_yz, R.dtype)
+          def _apply_3d_remap(Rin):
+            add_x = mxy * Rin[:, 1] + (mxz + mxy * myz) * Rin[:, 2]
+            add_y = myz * Rin[:, 2]
+            Rout = Rin.at[:, 0].add(add_x).at[:, 1].add(add_y)
+            return jnp.mod(Rout, 1.0)
+          any_flip = jnp.not_equal(m_xy, 0) | jnp.not_equal(m_xz, 0) | jnp.not_equal(m_yz, 0)
+          R = lax.cond(any_flip, _apply_3d_remap, lambda Rin: Rin, R)
+        else:
+          # 2D case: x' = x + m_xy * y, y' = y (fractional coordinates)
+          mxy = jnp.asarray(m_xy, R.dtype)
+          def _apply_2d_remap(Rin):
+            Rout = Rin.at[:, 0].add(mxy * Rin[:, 1])
+            return jnp.mod(Rout, 1.0)
+          any_flip = jnp.not_equal(m_xy, 0)
+          R = lax.cond(any_flip, _apply_2d_remap, lambda Rin: Rin, R)
     else:
-      curr_gamma = shear_fn(time + _dt)
+      curr_xy = f32(sf_xy(time + _dt))
+      if R.shape[1] >= 3:
+        curr_xz = f32(sf_xz(time + _dt))
+        curr_yz = f32(sf_yz(time + _dt))
+      else:
+        curr_xz = curr_yz = f32(0.0)
 
     # Expose the reduced shear to downstream kernels (displacement/shift)
-    kwargs['gamma'] = curr_gamma
+    if R.shape[1] >= 3:
+      kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
+    else:
+      kwargs['gamma'] = curr_xy
     
     # Compute deterministic force.
     F = force_fn(R, **kwargs)
 
-    # Compute stress via Irving–Kirkwood if configured; else virial-like.
+    # Compute stress via Irving–Kirkwood if configured; else return None.
     if pair_force_mag_fn is not None:
-      H = box_of(gamma=curr_gamma)
+      H = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
+           if R.shape[1] >= 3 else box_of(gamma=curr_xy))
       if fractional_position:
         Rf = R
       else:
         Rf = space.transform(jnp.linalg.inv(H), R)
       stress = _ik_stress_from_pairs(Rf, H, kwargs)
     else:
-      if fractional_position:
-        H = box_of(gamma=curr_gamma)
-        X = space.transform(H, R)
-      else:
-        X = R
-      stress = jnp.einsum('ni,nj->ij', F, X) / vol
-
+      stress = None
+      
+    # Now, advance time.
     # Draw i.i.d. standard normal noise per coordinate.
     key, split = random.split(key)
     xi = random.normal(split, R.shape, R.dtype)
@@ -1509,8 +1572,8 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     dR = mu * F * _dt + jnp.sqrt(f32(2) * mu * _kT * _dt) * xi
     R  = shift(R, dR, **kwargs)
     # Package updated state, canonicalize mobility broadcasting, and return.
-    new_state = ShearedBrownianState(position=R, mobility=mu, rng=key,
-                                     time=time + _dt, force=F, stress=stress)
+    new_state = ShearedBrownianState(position=R, mobility=mu, rng=key, #type: ignore
+                                     time=time + _dt, force=F, stress=stress) #type: ignore
     new_state = canonicalize_mobility(new_state)
     return new_state
   

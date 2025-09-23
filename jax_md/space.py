@@ -416,27 +416,30 @@ def periodic_general(box: Box,
   return displacement_fn, shift_fn
 
 def shearing(box: Box,
-             shear_fn: Callable[[Array], Array],
+             shear_fn: Optional[Callable[[Array], Array]] = None,
              fractional_coordinates: bool = True,
              remap: bool = False,
-             keep_base_xy: bool = True):
+             keep_base_xy: bool = True,
+             shear_fns: Optional[dict] = None):
   """
-  Simple shear in x with gradient along y, driven by a user-specified schedule.
+  Simple shear in one or more planes, each driven by its own schedule.
 
-  Replaces constant-rate shear with a general time-dependent shear function
-  `shear_fn(t) -> gamma`. The instantaneous xy tilt is
-  `xy = base_xy + gamma * Ly` if `keep_base_xy=True`, else `xy = gamma * Ly`.
+  Provide either a single function `shear_fn(t)` (applied to 'xy') or a dict
+  `shear_fns` mapping plane names ('xy','xz','yz') to functions of time. For
+  each plane `(i,j)` present (i<j), we set `H[i,j] = (keep? H[i,j] : 0) +
+  gamma_ij(t) * H[j,j]`.
 
   Args:
     box: Base box (scalar, vector, or upper-triangular matrix).
-    shear_fn: Function of time returning the scalar shear `gamma(t)`.
+    shear_fn: Optional function of time returning shear for 'xy' (convenience).
     fractional_coordinates: If True, store positions in fractional coords and
       return real displacements. If False, positions and displacements are real.
     remap: If True, wrap gamma into [-0.5, 0.5) to keep the box well-conditioned.
            Be careful when using this option: it changes the topology of the
            simulation, and requires remapping fractional coordinates when the
            box basis flips (see `remap_fractional_positions`).
-    keep_base_xy: If True, preserve the base box's xy tilt in addition to shear.
+    keep_base_xy: If True, preserve the base box's existing off-diagonals for all planes.
+    shear_fns: Optional dict mapping 'xy','xz','yz' to functions of time.
 
   kwargs for displacement/shift/box_fn:
     - t: time (float). Used as input to `shear_fn` when `gamma` is not provided.
@@ -478,34 +481,76 @@ def shearing(box: Box,
       return b
     raise ValueError("Box must be a scalar, vector, or matrix.")
   
-  def _gamma(gamma: Optional[float] = None, **kwargs) -> Array:
-    """Return instantaneous gamma, from explicit `gamma` or from `t` via `shear_fn`.
+  def _gammas(**kwargs):
+    """Return dict of instantaneous shear values per plane.
 
-    - If `gamma` is provided it is used directly.
-    - Else, if `t` is provided, compute `gamma = shear_fn(t)`.
-    - Else, raise.
-
-    If `remap=True` the result is wrapped into [-0.5, 0.5).
+    Accepts any of:
+      - gamma: scalar -> {'xy': gamma}; or dict {'xy': ..., 'xz': ..., 'yz': ...}
+      - gamma_xy, gamma_xz, gamma_yz as separate scalars
+      - t (time) together with provided shear_fn / shear_fns to compute values
+    Applies wrapping to [-0.5, 0.5) per plane if `remap=True`.
     """
-    if gamma is None and 't' not in kwargs:
-      raise ValueError("Either gamma or t must be provided.")
+    planes = []
+    dim = base.shape[0]
+    if dim >= 2:
+      planes.append('xy')
+    if dim >= 3:
+      planes.extend(['xz', 'yz'])
 
-    if gamma is None:
-      t = kwargs.get('t', 0.0)
-      gamma = shear_fn(f32(t))
-    gamma = f32(gamma)
+    g = {}
+    if 'gamma' in kwargs:
+      val = kwargs['gamma']
+      if isinstance(val, dict):
+        for k, v in val.items():
+          if k in planes:
+            g[k] = f32(v)
+      else:
+        # scalar provided, apply to xy only for compatibility
+        if 'xy' in planes:
+          g['xy'] = f32(val)
+    # Individual overrides
+    for k in ['xy', 'xz', 'yz']:
+      key = f'gamma_{k}'
+      if key in kwargs and k in planes:
+        g[k] = f32(kwargs[key])
+
+    # If still missing components and time provided, use functions
+    missing = [k for k in planes if k not in g]
+    if missing:
+      if 't' not in kwargs:
+        raise ValueError("Either gamma/gamma_* or t must be provided.")
+      t = f32(kwargs['t'])
+      fn_map = {}
+      if shear_fns is not None:
+        fn_map.update(shear_fns)
+      if shear_fn is not None:
+        # convenience: default xy if not present in map
+        fn_map.setdefault('xy', shear_fn)
+      for k in missing:
+        if k in fn_map and callable(fn_map[k]):
+          g[k] = f32(fn_map[k](t))
+        else:
+          g[k] = f32(0.0)
+
     if remap:
-      gamma = gamma - jnp.floor(gamma + f32(0.5))
-    return gamma
+      g = {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
+    return g
 
   # Convert and validate base box.
   base = _canonical_box(box)
   # Early validation: must be at least 2D box (2x2 or 3x3).
   if base.ndim != 2 or base.shape[0] < 2:
     raise ValueError("shearing requires a box of dimension >= 2 (2x2 or 3x3).")
-  # The box should have positive Ly (height) and base_xy (xy tilt).
-  if base[1, 1] <= 0.0 or (keep_base_xy and base[0, 1] < 0.0):
-    raise ValueError("shearing requires a box with positive Ly and base_xy.")
+  # Validate diagonal lengths for planes in use (if specified via functions).
+  used_planes = set()
+  if shear_fns is not None:
+    used_planes.update([p for p in shear_fns.keys() if p in ('xy','xz','yz')])
+  if shear_fn is not None:
+    used_planes.add('xy')
+  if 'xy' in used_planes and base[1, 1] <= 0.0:
+    raise ValueError("shearing requires positive length along y (base[1,1] > 0).")
+  if base.shape[0] >= 3 and any(p in used_planes for p in ('xz','yz')) and base[2, 2] <= 0.0:
+    raise ValueError("shearing requires positive length along z (base[2,2] > 0) for xz/yz planes.")
   # The box should be square or cubic. Variations are not supported yet (TODO).
   # if base.shape[0] >= 3 and not jnp.isclose(base[2, 2], base[1, 1]):
     # raise ValueError("shearing currently requires a cubic box.")
@@ -539,14 +584,20 @@ def shearing(box: Box,
     """
     # Compute the current sheared box from base and gamma.
     b = _canonical_box(kwargs.get('box', base))
-    # Make it float if int
     b = b.astype(jnp.result_type(b, f32))
-    # Instantaneous gamma. args should be either gamma or t/shear_rate
-    gamma = _gamma(**kwargs)
-    Ly = b[1, 1]
-    base_xy = b[0, 1] if keep_base_xy else 0.0
-    # set current xy entry = (base_xy + gamma) * Ly
-    return b.at[0, 1].set(base_xy + gamma * Ly)
+    gammas = _gammas(**kwargs)  # dict per plane
+    # Apply in upper-triangular convention: (i<j)
+    if b.shape[0] >= 2 and 'xy' in gammas:
+      base_off = b[0, 1] if keep_base_xy else f32(0.0)
+      b = b.at[0, 1].set(base_off + gammas['xy'] * b[1, 1])
+    if b.shape[0] >= 3:
+      if 'xz' in gammas:
+        base_off = b[0, 2] if keep_base_xy else f32(0.0)
+        b = b.at[0, 2].set(base_off + gammas['xz'] * b[2, 2])
+      if 'yz' in gammas:
+        base_off = b[1, 2] if keep_base_xy else f32(0.0)
+        b = b.at[1, 2].set(base_off + gammas['yz'] * b[2, 2])
+    return b
 
   def displacement_fn(Ra, Rb, **kwargs):
 
