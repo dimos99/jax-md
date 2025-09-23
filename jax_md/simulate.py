@@ -42,6 +42,7 @@ import functools
 from jax import grad
 from jax import jit
 from jax import random
+from jax import debug
 import jax.numpy as jnp
 from jax import lax
 from jax.tree_util import tree_map, tree_reduce, tree_flatten, tree_unflatten
@@ -131,6 +132,26 @@ def canonicalize_mass(state: T) -> T:
     )
     raise ValueError(msg)
   return state.set(mass=tree_map(canonicalize_fn, state.mass))
+
+@dispatch_by_state
+def canonicalize_mobility(state: T) -> T:
+  """Reshape mobility vector for broadcasting with positions."""
+  def canonicalize_fn(mobility):
+    if isinstance(mobility, float):
+      return mobility
+    if mobility.ndim == 2 and mobility.shape[1] == 1:
+      return mobility
+    elif mobility.ndim == 1:
+      return jnp.reshape(mobility, (mobility.shape[0], 1))
+    elif mobility.ndim == 0:
+      return mobility
+    msg = (
+      'Expected mobility to be either a floating point number or a one-dimensional'
+      'ndarray. Found {}.'.format(mobility)
+    )
+    raise ValueError(msg)
+  return state.set(mobility=tree_map(canonicalize_fn, state.mobility))
+
 
 @dispatch_by_state
 def initialize_momenta(state: T, key: Array, kT: float) -> T:
@@ -1080,12 +1101,15 @@ class BrownianState:
   Attributes:
     position: The current position of the particles. An ndarray of floats with
       shape `[n, spatial_dimension]`.
-    mass: The mass of particles. Will either be a float or an ndarray of floats
-      with shape `[n]`.
+    mobility: The mobility of particles. Will either be a float or an ndarray
+      of floats with shape `[n]`. It is not really time-dependent but we include it
+      in the state so that it can be overridden at each step if desired.
+      (for example, to implement spatially varying mobility, which is NOT
+      supported at this time).
     rng: The current state of the random number generator.
   """
   position: Array
-  mass: Array
+  mobility: Array
   rng: Array
 
 
@@ -1093,60 +1117,67 @@ def brownian(energy_or_force: Callable[..., Array],
              shift: ShiftFn,
              dt: float,
              kT: float,
-             gamma: float=0.1) -> Simulator:
-  """Simulation of Brownian dynamics.
+             mobility) -> Simulator:
+  """Simulation of Brownian dynamics with explicit (possibly per-particle) mobility.
 
-  Simulates Brownian dynamics which are synonymous with the overdamped
-  regime of Langevin dynamics. However, in this case we don't need to take into
-  account velocity information and the dynamics simplify. Consequently, when
-  Brownian dynamics can be used they will be faster than Langevin. As in the
-  case of Langevin dynamics our implementation follows Carlon et al. [#carlon]_
+  Implements the overdamped Langevin (Brownian) update using Euler–Maruyama:
+
+    R_{t+dt} = R_t + μ ∘ F(R_t) dt + sqrt(2 μ kT dt) ∘ ξ,
+
+  where μ ("mobility") can be a scalar or per-particle array; broadcasting over
+  coordinates is supported when μ has shape [n, 1].
 
   Args:
-    energy_or_force: A function that produces either an energy or a force from
-      a set of particle positions specified as an ndarray of shape
-      `[n, spatial_dimension]`.
-    shift_fn: A function that displaces positions, `R`, by an amount `dR`.
-      Both `R` and `dR` should be ndarrays of shape `[n, spatial_dimension]`.
-    dt: Floating point number specifying the timescale (step size) of the
-      simulation.
-    kT: Floating point number specifying the temperature in units of Boltzmann
-      constant. To update the temperature dynamically during a simulation one
-      should pass `kT` as a keyword argument to the step function.
-    gamma: A float specifying the friction coefficient between the particles
-      and the solvent.
+    energy_or_force: Callable returning either an energy or a force given positions
+      of shape `[n, spatial_dimension]`. Energies are converted to forces via
+      `quantity.canonicalize_force`.
+    shift: Position update function handling boundary conditions. Called as
+      `shift(R, dR, **kwargs)` and should return the shifted positions.
+    dt: Integrator time step (float).
+    kT: Thermal energy (k_B T) in the same units as the potential energy.
+    mobility: Mobility μ. Can be a scalar or ndarray with shape `[n]` or `[n,1]`.
 
   Returns:
-    See above.
+    A pair `(init_fn, apply_fn)` consistent with other JAX MD simulators.
   """
-
   force_fn = quantity.canonicalize_force(energy_or_force)
 
-  dt, gamma = static_cast(dt, gamma)
+  # Ensure `dt` is a static JAX scalar with the right dtype.
+  _dt = static_cast(dt)
 
-  def init_fn(key, R, mass=f32(1)):
-    state = BrownianState(R, mass, key)
-    return canonicalize_mass(state)
+  @jit
+  def init_fn(key, R, **kwargs):
+    # Stash μ in the state; allow overriding at init via kwargs if desired.
+    mu = kwargs.get('mobility', mobility)
+    state = BrownianState(R, mu, key)
+    # Reshape μ for broadcasting with positions (e.g., [n] -> [n,1]).
+    state = canonicalize_mobility(state)
+    return state
 
+  @jit
   def apply_fn(state, **kwargs):
-    _kT = kT if 'kT' not in kwargs else kwargs['kT']
+    # Allow temperature to be overridden at step time.
+    _kT = kwargs.get('kT', kT)
 
-    R, mass, key = dataclasses.astuple(state)
+    R, mu, key = dataclasses.astuple(state)
 
-    key, split = random.split(key)
-
+    # Compute deterministic force.
     F = force_fn(R, **kwargs)
+
+    # Draw i.i.d. standard normal noise per coordinate.
+    key, split = random.split(key)
     xi = random.normal(split, R.shape, R.dtype)
 
-    nu = f32(1) / (mass * gamma)
+    # Broadcast μ to coordinates: expected shapes are scalar or [n,1].
+    mu = jnp.asarray(mu, dtype=R.dtype)
 
-    dR = F * dt * nu + jnp.sqrt(f32(2) * _kT * dt * nu) * xi
-    R = shift(R, dR, **kwargs)
+    # Brownian increment: μ F dt + sqrt(2 μ kT dt) ξ
+    dR = mu * F * _dt + jnp.sqrt(f32(2) * mu * _kT * _dt) * xi
+    R  = shift(R, dR, **kwargs)
 
-    return BrownianState(R, mass, key)  # pytype: disable=wrong-arg-count
+    return BrownianState(R, mu, key)
 
   return init_fn, apply_fn
-
 
 
 @dataclasses.dataclass
@@ -1156,91 +1187,334 @@ class ShearedBrownianState:
   Attributes:
     position: The current position of the particles. An ndarray of floats with
       shape `[n, spatial_dimension]`.
-    mass: The mass of particles. Will either be a float or an ndarray of floats
-      with shape `[n]`.
+    mobility: The mobility of particles. Will either be a float or an ndarray
+  time: The current simulation time (float).
     rng: The current state of the random number generator.
+    force: Deterministic force on each particle; shape `[n, spatial_dimension]`.
+    stress: Instantaneous stress tensor. If configured with
+      `pair_energy_for_stress`, uses Irving–Kirkwood (pairwise) form; otherwise
+      uses the virial-like form sum_i F_i ⊗ x_i with real positions.
+      Shape `[spatial_dimension, spatial_dimension]`.
   """
   position: Array
-  mass: Array
+  mobility: Array
   rng: Array
-  # Extra attributes for compatibility with shear box simulations.
-  shear_box_prev: Array
-  t_prev: Array
+  time: float
+  force: Array
+  stress: Array
 
 
-def brownian_with_shear(energy_or_force_fn,
-                              shift_fn,
-                              dt,
-                              kT,
-                              gamma=0.1,
-                              *,
-                              box_of=None):
-  """Brownian dynamics that automatically remaps across Lees–Edwards flips.
+def brownian_with_shear(energy_or_force: Callable[..., Array],
+                          shift: ShiftFn,
+                          dt: float,
+                          kT: float,
+                          mobility,
+                          shear_fn: Callable[[Array], Array],
+                          box_of: Optional[Callable[..., Box]],
+                          t0: float = 0.0,
+                          fractional_position: bool = True,
+                          remap = True,
+                          pair_energy_for_stress: Optional[Callable[..., Array]] = None) -> Simulator:
+  """Overdamped Langevin (Brownian) dynamics under simple shear with PBCs.
 
-  Pass either `box` each step (the instantaneous H(t)) *or* provide `box_of(t)`
-  here and pass `t` each step. Positions are fractional; we remap with
-  space.remap_fractional_positions(H_old -> H_new) so real-space x is continuous.
-  
-  NOTE: Be careful, this does not remap the neighbor list, so if you use
-  neighbor lists, you must ensure that the neighbor list is updated
-  whenever the box changes. This is done automatically in the
-  `partition.neighbor_list` function, but be careful anyway.
+  This integrator advances positions using Euler-Maruyama in the presence of a
+  time-dependent simple shear defined by a user-specified `shear_fn(t)`.
+  The update is:
+
+    R_{t+dt} = shift(R_t, μ ∘ F(R_t) dt + sqrt(2 μ kT dt) ∘ ξ; gamma)
+
+  where `mu` (mobility) can be a scalar or per-particle array, `F` is the force
+  derived from `energy_or_force`, `ξ ~ N(0, I)`, and `gamma` is the reduced
+  shear strain computed from `shear_rate * t` and (optionally) wrapped into
+  `[-0.5, 0.5)` when `remap=True`.
+
+  This routine also maintains useful diagnostics in the returned state:
+  - `time`: the simulation clock.
+  - `force`: the deterministic force used at the step.
+  - `stress`: instantaneous stress. If `pair_energy_for_stress` is provided,
+    uses the Irving–Kirkwood pairwise form; otherwise uses the virial-like
+    tensor sum_i F_i ⊗ x_i (real positions), divided by the box volume.
+
+  Expected geometry setup: construct `displacement`, `shift`, and `box_of`
+  using `jax_md.space.shearing(...)` so that all components share a consistent
+  definition of the sheared periodic boundary conditions. The `apply_fn`
+  forwards `gamma` (the reduced shear) via `**kwargs` to both `shift` and the
+  force function, enabling correct use with neighbor lists and sheared metrics.
+
+  Args:
+    energy_or_force: Callable mapping positions to an energy or to a force.
+      Energies are converted to forces via `quantity.canonicalize_force`. The
+      callable should accept `**kwargs` such as `gamma` and `neighbor` if
+      required by your setup (e.g., neighbor-list aware pair functions).
+    shift: Position update function handling boundary conditions, typically the
+      `shift` returned by `space.shearing(...)`. It will be called as
+      `shift(R, dR, gamma=..., ...)` each step.
+    dt: Time step.
+    kT: Thermal energy (k_B T) in the same units as the potential energy.
+    mobility: Particle mobility μ. Can be a scalar or an array with shape
+      `[n]` or `[n, 1]` (the latter broadcasts cleanly over coordinates). The
+      value is stored in the state and can be overridden at initialization via
+      `init_fn(..., mobility=...)`.
+    shear_fn: Function returning the reduced shear `gamma(t)`.
+      The actual axes of shear are determined by the provided `space.shearing`
+      geometry; this function simply computes the time-dependent strain.
+    box_of: Function returning the current triclinic box. Use the one returned
+      by `space.shearing(...)`. It should accept either `t=` or `gamma=` and
+      return a box matrix compatible with `space.transform`. Required to compute
+      stress and volume diagnostics.
+    t0: Initial time.
+    fractional_position: If True, `R` are interpreted as fractional coordinates
+      inside the unit cell; real positions are obtained via
+      `space.transform(box_of(...), R)`. For stress, real positions are used.
+    remap: If True, apply a nearest-integer remap so that `gamma` is kept in
+      `[-0.5, 0.5)` and, when using fractional positions, apply the exact
+      unimodular change-of-basis to keep coordinates inside the base cell.
+
+  Returns:
+    A pair `(init_fn, apply_fn)`:
+      - `init_fn(key, R, **kwargs)` -> ShearedBrownianState. Recognizes an
+        optional `mobility` override.
+      - `apply_fn(state, **kwargs)` -> ShearedBrownianState. Recognizes an
+        optional `kT` override and forwards all other `**kwargs` (including
+        `neighbor`, etc.) to the force and shift functions. The field
+        `state.time` is advanced by `dt` each call.
+
+  Example:
+    disp, shift, box_of = space.shearing(box=H0, shear_fn=sr_fn,
+                                         remap=True, fractional_coordinates=True)
+    pair_fn = smap.pair_neighbor_list(..., displacement_or_metric=disp, ...)
+    init_fn, apply_fn = simulate.brownian_with_shear(pair_fn, shift, dt, kT,
+                                                     mobility=1.0,
+                                                     shear_fn=sr_fn,
+                                                     box_of=box_of,
+                                                     fractional_position=True,
+                                                     remap=True)
+    state = init_fn(key, R0)
+    state = apply_fn(state, neighbor=nbrs)  # kwargs forwarded as needed
+
+  Notes:
+    - The mobility stored in the state is canonicalized for broadcasting.
+    - The stress tensor computed here is an instantaneous, non-symmetrized
+      quantity for diagnostics; post-processing may be needed for rheology.
+    - If `pair_energy_for_stress` is provided, stress is computed using the
+      Irving-Kirkwood expression: σ = (1/(2V)) Σ_{i,j} r_ij ⊗ f_ij where
+      f_ij = -∂U_pair/∂r_ij r̂_ij. A neighbor list passed via `apply_fn(..., neighbor=...)`
+      is used when available; otherwise a dense O(N^2) computation is used.
+    - If `box_of` is None, a `ValueError` is raised because stress requires
+      the box to compute real positions and volume.
   """
-  base_init, base_step = brownian(energy_or_force_fn, shift_fn, dt, kT, gamma=gamma)
+  
+  force_fn = quantity.canonicalize_force(energy_or_force)
+    
+  if box_of is not None:
+    box = box_of(t=t0)
+  else:
+    raise ValueError("box_of must be provided to compute stress.")
+  
+  vol = quantity.volume(box.shape[0], box)
+  
+  # Ensure `dt` is a static JAX scalar with the right dtype.
+  _dt = f32(dt)
+  t0 = f32(t0)
+  
+  # Optional pairwise force magnitude function for Irving–Kirkwood stress.
+  pair_force_mag_fn = None
+  if pair_energy_for_stress is not None:
+    def _sum_pair_energy(dr, **pkw):
+      return jnp.sum(pair_energy_for_stress(dr, **pkw))
+    pair_force_mag_fn = grad(_sum_pair_energy)
 
+  def _ik_stress_from_pairs(Rf: Array, H: Array, kwargs: Dict[str, Any]) -> Array:
+    """Compute IK stress via pairwise forces and displacements.
+
+    Supports neighbor lists when provided via kwargs['neighbor'].
+    NOTE: this feature hasn't been tested yet (TODO - and maybe get rid of 
+    energy_or_force in favor of pair_energy_for_stress?).
+    Expects Rf fractional coordinates and H the current real-space box.
+    """
+    assert pair_force_mag_fn is not None
+
+    neighbor = kwargs.get('neighbor', None)
+
+    if neighbor is None:
+      # Dense all-pairs path (O(N^2)).
+      dSf = Rf[:, None, :] - Rf[None, :, :]
+      dSf = dSf - jnp.round(dSf)
+      dR  = space.transform(H, dSf)              # (N, N, d)
+      dr  = space.distance(dR)                   # (N, N)
+
+      # Mask diagonal to avoid self interactions.
+      mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
+      dr = dr * mask
+
+      # f_mag = -dU/dr elementwise.
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * mask
+
+      # Unit vectors; safe divide.
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[..., None] + eps)
+      Fij = f_mag[..., None] * f_hat            # (N, N, d)
+
+      virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
+      return virial / vol
+
+    # Neighbor list present.
+    if partition.is_sparse(neighbor.format):
+      send, recv = neighbor.idx
+      pair_mask = partition.neighbor_list_mask(neighbor)
+
+      dSf = Rf[send] - Rf[recv]
+      dSf = dSf - jnp.round(dSf)
+      dR  = space.transform(H, dSf)              # (B, d)
+      dr  = space.distance(dR)                   # (B,)
+
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * pair_mask
+
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[:, None] + eps)
+      Fij = f_mag[:, None] * f_hat               # (B, d)
+
+      norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
+      virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
+      return virial / vol
+
+    # Dense neighbor list format.
+    idx = neighbor.idx                            # (N, max_nbrs)
+    N = Rf.shape[0]
+    mask = (idx < N).astype(Rf.dtype)            # (N, max_nbrs)
+
+    Rn = Rf[idx]                                  # (N, max_nbrs, d)
+    dSf = Rf[:, None, :] - Rn
+    dSf = dSf - jnp.round(dSf)
+    dR  = space.transform(H, dSf)                 # (N, max_nbrs, d)
+    dr  = space.distance(dR)                      # (N, max_nbrs)
+
+    dUdR = pair_force_mag_fn(dr, **kwargs)
+    f_mag = -dUdR * mask
+
+    eps = jnp.array(1e-12, dtype=Rf.dtype)
+    f_hat = dR / (dr[..., None] + eps)
+    Fij = f_mag[..., None] * f_hat                # (N, max_nbrs, d)
+
+    virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
+    return virial / vol
+  
   @jit
-  def init_fn(key, R, mass=f32(1.0), **kwargs):
-    t0 = kwargs.get('t', f32(0.0))
-    H0 = kwargs.get('box', None)
-    if H0 is None and box_of is not None:
-      H0 = box_of(t=t0)
-    if H0 is None:
-      H0 = jnp.eye(R.shape[-1], dtype=R.dtype)
-    bstate = base_init(key, R, mass=mass, **kwargs)
-    return ShearedBrownianState(bstate.position, bstate.mass, bstate.rng, H0, t0)
-
-  @jit
-  def _step_sheared(state: ShearedBrownianState, **kwargs):
-    # Get instantaneous box
-    t = kwargs.get('t', state.t_prev)
-    H_new = kwargs.get('box', None)
-    if H_new is None and box_of is not None:
-      H_new = box_of(t=t)
-
-    # Remap fractional positions across box change
-    if H_new is not None:
-      R_rf = space.remap_fractional_positions(state.position, state.shear_box_prev, H_new)
-      state = state.set(position=R_rf, shear_box_prev=H_new, t_prev=t)
-      kwargs = dict(kwargs); kwargs['box'] = H_new
-
-    # Delegate to original Brownian step
-    bstate = BrownianState(position=state.position, mass=state.mass, rng=state.rng)
-    bstate = base_step(bstate, **kwargs)
-
-    return ShearedBrownianState(bstate.position, bstate.mass, bstate.rng,
-                                state.shear_box_prev, t)
-
-  @jit
-  def _step_brownian_first(state: BrownianState, **kwargs):
-    # First production call after equilibration: promote to sheared state.
-    t0 = kwargs.get('t', f32(0.0))
-    H0 = kwargs.get('box', None)
-    if H0 is None and box_of is not None:
-      H0 = box_of(t=t0)
-    if H0 is None:
-      H0 = jnp.eye(state.position.shape[-1], dtype=state.position.dtype)
-    sheared = ShearedBrownianState(state.position, state.mass, state.rng, H0, t0)
-    return _step_sheared(sheared, **kwargs)
-
-  def step_fn(state, **kwargs):
-    # Non-jitted dispatcher so either state type is accepted
-    if hasattr(state, 't_prev') and hasattr(state, 'shear_box_prev'):
-      return _step_sheared(state, **kwargs)
+  def init_fn(key, R, **kwargs):
+    # Stash μ in the state; allow overriding at init via kwargs if desired.
+    mu = kwargs.get('mobility', mobility)
+    # Initial gamma and current box for stress/real positions.
+    # Use reduced gamma to match neighbor-list/space kernels.
+    gamma_unwrapped = shear_fn(t0)
+    if remap: # wrap gamma to [-0.5, 0.5)
+      m_curr = jnp.floor(gamma_unwrapped + 0.5)
+      curr_gamma = gamma_unwrapped - m_curr
     else:
-      return _step_brownian_first(state, **kwargs)
+      curr_gamma = gamma_unwrapped
 
-  return init_fn, step_fn
+    # Compute deterministic force at t0 (passes gamma for sheared BCs if needed).
+    init_kwargs = dict(kwargs)
+    init_kwargs['gamma'] = curr_gamma
+    F0 = force_fn(R, **init_kwargs)
 
+    # Compute stress at init: IK when configured, else virial-like fallback.
+    if pair_force_mag_fn is not None:
+      H0 = box_of(gamma=curr_gamma)
+      if fractional_position:
+        Rf0 = R
+      else:
+        Rf0 = space.transform(jnp.linalg.inv(H0), R)
+      stress0 = _ik_stress_from_pairs(Rf0, H0, init_kwargs)
+    else:
+      if fractional_position:
+        H0 = box_of(gamma=curr_gamma)
+        X0 = space.transform(H0, R)
+      else:
+        X0 = R
+      stress0 = jnp.einsum('ni,nj->ij', F0, X0) / vol
+
+    state = ShearedBrownianState(position=R, mobility=mu, rng=key,
+                                 time=t0, force=F0, stress=stress0)
+    # Reshape μ for broadcasting with positions (e.g., [n] -> [n,1]).
+    state = canonicalize_mobility(state)
+    return state
+  
+  @jit
+  def apply_fn(state, **kwargs):
+    # Allow temperature to be overridden at step time.
+    _kT = kwargs.get('kT', kT)
+
+    R, mu, key, time, _, _ = dataclasses.astuple(state)
+
+
+    if remap:
+      # --- Shear handling: compute reduced gamma and optional integer remap ---
+      # Unwrapped shears at start/end of the step
+      prev_unwrapped = shear_fn(time)
+      curr_unwrapped = shear_fn(time + _dt)
+
+      # Nearest-integer counters (how many unit tilts elapsed)
+      m_prev = jnp.floor(prev_unwrapped + 0.5)
+      m_curr = jnp.floor(curr_unwrapped + 0.5)
+      m = (m_curr - m_prev).astype(jnp.int32)  # could be -1, 0, +1, ...
+
+      # Reduced shear to pass to kernels (in [-0.5, 0.5))
+      curr_gamma = curr_unwrapped - m_curr
+
+      # If we store fractional coordinates and a tilt index changed, apply the exact
+      # unimodular change-of-basis map s_x <- s_x + m * (Ly/Lx) * s_y.
+      if fractional_position:
+        H_tmp = box_of(gamma=curr_gamma)
+        Ly = H_tmp[1, 1]
+        Lx = H_tmp[0, 0]
+        factor = Ly / Lx
+        def _apply_remap(R_in):
+          return R_in.at[:, 0].add(factor * R_in[:, 1] * jnp.asarray(m, R_in.dtype))
+        R = lax.cond(jnp.not_equal(m, 0), _apply_remap, lambda R_in: R_in, R)
+    else:
+      curr_gamma = shear_fn(time + _dt)
+
+    # Expose the reduced shear to downstream kernels (displacement/shift)
+    kwargs['gamma'] = curr_gamma
+    
+    # Compute deterministic force.
+    F = force_fn(R, **kwargs)
+
+    # Compute stress via Irving–Kirkwood if configured; else virial-like.
+    if pair_force_mag_fn is not None:
+      H = box_of(gamma=curr_gamma)
+      if fractional_position:
+        Rf = R
+      else:
+        Rf = space.transform(jnp.linalg.inv(H), R)
+      stress = _ik_stress_from_pairs(Rf, H, kwargs)
+    else:
+      if fractional_position:
+        H = box_of(gamma=curr_gamma)
+        X = space.transform(H, R)
+      else:
+        X = R
+      stress = jnp.einsum('ni,nj->ij', F, X) / vol
+
+    # Draw i.i.d. standard normal noise per coordinate.
+    key, split = random.split(key)
+    xi = random.normal(split, R.shape, R.dtype)
+
+    # Broadcast μ to coordinates: expected shapes are scalar or [n,1].
+    mu = jnp.asarray(mu, dtype=R.dtype)
+
+    # Brownian increment: μ F dt + sqrt(2 μ kT dt) ξ
+    dR = mu * F * _dt + jnp.sqrt(f32(2) * mu * _kT * _dt) * xi
+    R  = shift(R, dR, **kwargs)
+    # Package updated state, canonicalize mobility broadcasting, and return.
+    new_state = ShearedBrownianState(position=R, mobility=mu, rng=key,
+                                     time=time + _dt, force=F, stress=stress)
+    new_state = canonicalize_mobility(new_state)
+    return new_state
+  
+  return init_fn, apply_fn
 
 
 """Experimental Simulations.

@@ -416,42 +416,89 @@ def periodic_general(box: Box,
   return displacement_fn, shift_fn
 
 def shearing(box: Box,
-             shear_rate: float = 0.0,
+             shear_fn: Callable[[Array], Array],
              fractional_coordinates: bool = True,
              remap: bool = False,
              keep_base_xy: bool = True):
   """
-  Constant shear in x with gradient along y.
-  gamma(t) = shear_rate * t; instantaneous xy tilt = (base_xy + gamma) * Ly.
+  Simple shear in x with gradient along y, driven by a user-specified schedule.
 
-  In real-coordinate mode (`fractional_coordinates=False`), the integer part of
-  `gamma` is always reduced internally (i.e., we keep `gamma` in [-0.5, 0.5)),
-  mirroring LAMMPS tilt "flip" behavior so that `gamma` and `gamma + n` (n ∈ ℤ)
-  produce equivalent boxes and identical displacements/energies.
+  Replaces constant-rate shear with a general time-dependent shear function
+  `shear_fn(t) -> gamma`. The instantaneous xy tilt is
+  `xy = base_xy + gamma * Ly` if `keep_base_xy=True`, else `xy = gamma * Ly`.
 
-  kwargs accepted by the returned functions:
-    - t: time (float), default 0.0
-    - shear_rate: override rate
-    - gamma: override instantaneous strain; if provided, it overrides rate*t
-    - box: override the *base* box for that call (vector or upper-triangular)
+  Args:
+    box: Base box (scalar, vector, or upper-triangular matrix).
+    shear_fn: Function of time returning the scalar shear `gamma(t)`.
+    fractional_coordinates: If True, store positions in fractional coords and
+      return real displacements. If False, positions and displacements are real.
+    remap: If True, wrap gamma into [-0.5, 0.5) to keep the box well-conditioned.
+           Be careful when using this option: it changes the topology of the
+           simulation, and requires remapping fractional coordinates when the
+           box basis flips (see `remap_fractional_positions`).
+    keep_base_xy: If True, preserve the base box's xy tilt in addition to shear.
 
-  If fractional_coordinates=True:
-    - positions live in [0,1)^d
-    - displacement returns REAL vectors
-    - shift expects REAL dR and returns FRACTIONAL positions
+  kwargs for displacement/shift/box_fn:
+    - t: time (float). Used as input to `shear_fn` when `gamma` is not provided.
+    - gamma: instantaneous shear (float). If provided, overrides `t`/`shear_fn`.
+    - box: optional override for the current physical box (scalar/vector/matrix).
 
-  If fractional_coordinates=False:
-    - positions and dR are REAL; internally we map to fractional for
-      minimum-image, then map back.
+  Coordinate conventions:
+    - If `fractional_coordinates=True`:
+        positions live in [0,1)^d; displacement returns REAL dR; shift expects
+        FRACTIONAL R and REAL dR and returns FRACTIONAL R (compatible with
+        e.g. `shift(R, force(R))`).
+    - If `fractional_coordinates=False`:
+        positions and dR are REAL; internally we map to fractional for
+        minimum-image, then map back.
+
+  Note: See Tuckerman, ch. 13 for background on shear-periodic BCs.
   """
 
+  # Helper Functions
   def _canonical_box(b: Box) -> Box:
-    if b.ndim == 1:              # orthorhombic -> diagonal matrix
-      return jnp.diag(b).astype(b.dtype)
-    if b.ndim == 2:
-      return b
-    raise ValueError("Provide vector (orthorhombic) or upper-triangular matrix.")
+    """
+    Convert a box representation into a matrix.
 
+    Supported inputs:
+      scalar -> [[L, 0], [0, L]] or [[L, 0, 0], [0, L, 0], [0, 0, L]]
+      vector -> [[Lx, 0], [0, Ly]] or [[Lx, 0, 0], [0, Ly, 0], [0, 0, Lz]]
+      matrix -> as-is
+    """
+    b = jnp.asarray(b)
+    if jnp.ndim(b) == 0:              # scalar -> isotropic matrix
+      # Infer spatial dimension using the outer `box` argument where possible.
+      # Use jnp.shape / jnp.ndim helpers which accept Python scalars safely.
+      print("Warning: treating scalar 'box' as 3D by default; provide an explicit box to select 2D.")
+      dim = 3
+      return jnp.diag(jnp.ones((dim,), dtype=b.dtype) * b).astype(b.dtype)
+    if jnp.ndim(b) == 1:              # orthorhombic -> diagonal matrix
+      return jnp.diag(b).astype(b.dtype)
+    if jnp.ndim(b) == 2:
+      return b
+    raise ValueError("Box must be a scalar, vector, or matrix.")
+  
+  def _gamma(gamma: Optional[float] = None, **kwargs) -> Array:
+    """Return instantaneous gamma, from explicit `gamma` or from `t` via `shear_fn`.
+
+    - If `gamma` is provided it is used directly.
+    - Else, if `t` is provided, compute `gamma = shear_fn(t)`.
+    - Else, raise.
+
+    If `remap=True` the result is wrapped into [-0.5, 0.5).
+    """
+    if gamma is None and 't' not in kwargs:
+      raise ValueError("Either gamma or t must be provided.")
+
+    if gamma is None:
+      t = kwargs.get('t', 0.0)
+      gamma = shear_fn(f32(t))
+    gamma = f32(gamma)
+    if remap:
+      gamma = gamma - jnp.floor(gamma + f32(0.5))
+    return gamma
+
+  # Convert and validate base box.
   base = _canonical_box(box)
   # Early validation: must be at least 2D box (2x2 or 3x3).
   if base.ndim != 2 or base.shape[0] < 2:
@@ -459,56 +506,56 @@ def shearing(box: Box,
   # The box should have positive Ly (height) and base_xy (xy tilt).
   if base[1, 1] <= 0.0 or (keep_base_xy and base[0, 1] < 0.0):
     raise ValueError("shearing requires a box with positive Ly and base_xy.")
+  # The box should be square or cubic. Variations are not supported yet (TODO).
+  # if base.shape[0] >= 3 and not jnp.isclose(base[2, 2], base[1, 1]):
+    # raise ValueError("shearing currently requires a cubic box.")
+  # if not jnp.isclose(base[0, 0], base[1, 1]):
+    # raise ValueError("shearing currently requires a square box.")
+  # TODO: properly test fractional_coordinates=False case.
+  if not fractional_coordinates:
+    print("Warning: shearing with fractional_coordinates=False is not tested much.")
 
   def _box_of(**kwargs) -> Box:
+    """
+    Compute a sheared box configuration from base box parameters and shear.
+    This function creates a box matrix by applying shear deformation to a base box
+    configuration. The shear is applied in the xy direction, modifying the off-diagonal
+    element b[0,1] of the box matrix.
+    Args:
+      **kwargs: Keyword arguments that may include:
+        - box: Base box matrix to apply shear to. If not provided, uses the 
+             default 'base' box.
+        - gamma: Shear strain parameter, or
+        - t: Time parameter (used with shear_rate to compute gamma)
+        - shear_rate: Rate of shear (used with t to compute gamma)
+    Returns:
+      Box: A box matrix with applied shear deformation. The xy component b[0,1]
+         is set to (base_xy + gamma * Ly), where Ly is the y-dimension length
+         and base_xy is either the original xy component (if keep_base_xy is True)
+         or 0.0.
+    Note:
+      The function relies on module-level variables 'base' and 'keep_base_xy',
+      and helper functions '_canonical_box' and '_gamma'.
+    """
+    # Compute the current sheared box from base and gamma.
     b = _canonical_box(kwargs.get('box', base))
-    # instantaneous gamma
-    if 'gamma' in kwargs:
-      gamma = kwargs['gamma']
-    else:
-      sr = kwargs.get('shear_rate', shear_rate)
-      t = kwargs.get('t', 0.0)
-      gamma = sr * t
-    # Normalize gamma into [-0.5, 0.5) in two cases:
-    #   (i) when remap=True (explicit request), and
-    #   (ii) always in real-coordinate mode to make integer-tilt-equivalent boxes
-    #        identical (LAMMPS "flip" semantics). This guarantees invariance of
-    #        distances/energies under gamma -> gamma + n when fractional_coordinates=False.
-    if remap or (not fractional_coordinates):
-      gamma = jnp.mod(gamma + 0.5, 1.0) - 0.5
-
+    # Make it float if int
+    b = b.astype(jnp.result_type(b, f32))
+    # Instantaneous gamma. args should be either gamma or t/shear_rate
+    gamma = _gamma(**kwargs)
     Ly = b[1, 1]
     base_xy = b[0, 1] if keep_base_xy else 0.0
     # set current xy entry = (base_xy + gamma) * Ly
     return b.at[0, 1].set(base_xy + gamma * Ly)
 
   def displacement_fn(Ra, Rb, **kwargs):
-    # In fractional mode, if a full box matrix is provided by the caller,
-    # treat it as the instantaneous physical box and use it directly, without
-    # applying any additional gamma override.
-    if fractional_coordinates and ('box' in kwargs) and (jnp.ndim(kwargs['box']) == 2):
-      # Use the provided physical box as-is (except for vector->diag conversion).
-      H = kwargs['box']
-      if H.ndim == 1:
-        H = jnp.diag(H)
-    else:
-      # Otherwise build H from base + (possibly canonicalized) gamma.
-      # Enforce invariance under gamma -> gamma + n in fractional mode by
-      # reducing the integer part of gamma for displacement only.
-      if 'gamma' in kwargs:
-        _gamma_raw = kwargs['gamma']
-      else:
-        _sr = kwargs.get('shear_rate', shear_rate)
-        _t = kwargs.get('t', 0.0)
-        _gamma_raw = _sr * _t
 
-      if fractional_coordinates:
-        _gamma_eff = jnp.mod(_gamma_raw + 0.5, 1.0) - 0.5
-        _kwargs = dict(kwargs)
-        _kwargs['gamma'] = _gamma_eff
-        H = _box_of(**_kwargs)
-      else:
-        H = _box_of(**kwargs)
+    if 'box' in kwargs:
+      # Use the provided physical box as-is (except for vector->diag conversion).
+      H = _canonical_box(kwargs['box'])
+    else:
+      # Compute the current sheared box from base and gamma.
+      H = _box_of(**kwargs)
 
     Hinv = jnp.linalg.inv(H)
 
@@ -526,7 +573,14 @@ def shearing(box: Box,
       return transform(H, dRf)
 
   def shift_fn(R, dR, **kwargs):
-    H = _box_of(**kwargs)
+    
+    if 'box' in kwargs:
+      # Use the provided physical box as-is (except for vector->diag conversion).
+      H = _canonical_box(kwargs['box'])
+    else:
+      # Compute the current sheared box from base and gamma.
+      H = _box_of(**kwargs)
+      
     Hinv = jnp.linalg.inv(H)
     ones = jnp.ones(R.shape[-1], dtype=R.dtype)
 
@@ -617,4 +671,3 @@ def remap_fractional_positions(Rf: Array, old_box: Box, new_box: Box) -> Array:
   Rf_new = transform(jnp.linalg.inv(H_new), R_real)
   # Wrap into [0,1)
   return Rf_new - jnp.floor(Rf_new)
-
