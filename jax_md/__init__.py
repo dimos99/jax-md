@@ -26,6 +26,7 @@ from jax_md import util
 from jax_md import io
 from jax_md import rigid_body
 from jax_md import rheo
+from jax_md import shearing_tutorial
 try:
   # Attempt to load colab_tools if IPython is installed.
   from jax_md import colab_tools

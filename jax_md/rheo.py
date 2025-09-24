@@ -194,6 +194,39 @@ def stress_autocorrelation(stress_tensor: Array,
     return result
 
 
+def viscosity_integral_direct(autocorr_func: Array, time: Array) -> Array:
+    """
+    Compute cumulative viscosity integral directly from autocorrelation function.
+    
+    This function integrates the stress autocorrelation function cumulatively
+    to show how the viscosity converges as a function of integration time.
+    The final value in the returned array is the total viscosity.
+    
+    Args:
+        autocorr_func: Stress autocorrelation function values
+        time: Corresponding time array
+        
+    Returns:
+        Array of cumulative viscosity integrals, where element i contains
+        the integral from time[0] to time[i]
+    """
+    autocorr_func = jnp.asarray(autocorr_func)
+    time = jnp.asarray(time)
+    
+    # Compute cumulative integral using trapezoidal rule
+    def scan_fn(carry, i):
+        # Trapezoidal rule for interval [time[i-1], time[i]]
+        dt = jnp.where(i == 0, 0.0, time[i] - time[i-1])
+        acf_avg = jnp.where(i == 0, 0.0, 0.5 * (autocorr_func[i-1] + autocorr_func[i]))
+        integral_increment = acf_avg * dt
+        new_cumulative = carry + integral_increment
+        return new_cumulative, new_cumulative
+    
+    _, cumulative_viscosity = jax.lax.scan(scan_fn, 0.0, jnp.arange(len(time)))
+    
+    return cumulative_viscosity
+
+
 class MaxwellModel:
     """
     Maxwell model (Prony series) for fitting stress autocorrelation functions.
@@ -524,6 +557,50 @@ class MaxwellModel:
         
         return float(viscosity)
     
+    def viscosity_integral_cumulative(self, time: Array) -> Array:
+        """
+        Compute cumulative viscosity integral over given time array.
+        
+        This method returns an array where each element i contains the integral
+        of the stress autocorrelation function from time 0 to time[i], allowing
+        you to see how the viscosity converges as a function of integration time.
+        
+        Args:
+            time: Time array for integration
+            
+        Returns:
+            Array of cumulative viscosity integrals, where the final value
+            is the converged viscosity
+        """
+        if self.moduli is None or self.tau_values is None:
+            raise ValueError("Model must be fitted before computing viscosity")
+        
+        time = jnp.asarray(time)
+        
+        # Use current fitted parameters in correct format [G1, tau1, G2, tau2, ...]
+        params = jnp.zeros(2 * len(self.moduli))
+        params = params.at[::2].set(self.moduli)
+        params = params.at[1::2].set(self.tau_values)
+        
+        # Evaluate the model at all time points
+        g_t = self.evaluate(params, time)
+        
+        # Compute cumulative integral using trapezoidal rule
+        # For cumulative integration, we need to compute the integral from 0 to each time point
+        
+        # Use JAX's scan to compute cumulative integral efficiently
+        def scan_fn(carry, i):
+            # Trapezoidal rule for interval [time[i-1], time[i]]
+            dt = jnp.where(i == 0, 0.0, time[i] - time[i-1])
+            g_avg = jnp.where(i == 0, 0.0, 0.5 * (g_t[i-1] + g_t[i]))
+            integral_increment = g_avg * dt
+            new_cumulative = carry + integral_increment
+            return new_cumulative, new_cumulative
+        
+        _, cumulative_viscosity = jax.lax.scan(scan_fn, 0.0, jnp.arange(len(time)))
+        
+        return cumulative_viscosity
+    
     def frequency_response(self, frequencies: Array) -> Tuple[Array, Array]:
         """
         Compute frequency-dependent storage and loss moduli.
@@ -656,8 +733,17 @@ def green_kubo_viscosity(stress_tensor: Array,
     # Select best Maxwell model
     best_model, model_results = select_best_model(t_fit, acf_fit, max_modes)
     
-    # Compute viscosity
+    # Produce fitted G(t) for times
+    acf_fitted = best_model.evaluate(model_results['fit_result']['fitted_params'], time)
+    
+    # Compute viscosity (final value)
     viscosity = best_model.viscosity_integral()
+    
+    # Compute cumulative viscosity integral from fitted model
+    cumulative_viscosity_fitted = best_model.viscosity_integral_cumulative(time)
+    
+    # Compute cumulative viscosity integral directly from raw ACF
+    cumulative_viscosity_raw = viscosity_integral_direct(acf, time)
     
     # Compute frequency response for a standard frequency range
     log_freq_range = jnp.logspace(-3, 3, 100)  # 10^-3 to 10^3 rad/s
@@ -665,10 +751,12 @@ def green_kubo_viscosity(stress_tensor: Array,
     
     return {
         'viscosity': viscosity,
+        'cumulative_viscosity_fitted': cumulative_viscosity_fitted,
+        'cumulative_viscosity_raw': cumulative_viscosity_raw,
         'autocorrelation_function': acf,
         'time': time,
-        'fitted_time': t_fit,
-        'fitted_acf': acf_fit,
+        # 'fitted_time': t_fit,
+        'fitted_acf': acf_fitted,
         'model': best_model,
         'model_results': model_results,
         'frequencies': log_freq_range,
