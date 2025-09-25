@@ -24,6 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.cm as cm
+from matplotlib import colors as mcolors
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import FancyArrowPatch
 from mpl_toolkits.mplot3d import Axes3D
@@ -582,9 +583,35 @@ def create_trajectory_animation(trajectory: jnp.ndarray, box_history: jnp.ndarra
         phantom_box = ax2.plot([], [], 'b--', linewidth=1, alpha=0.3)[0]
         phantom_box_lines.append(phantom_box)
     
+    # Compute global x/y limits across all frames and periodic images to account for remapping
+    # We use the actual box history (including remaps) and the same periodic images we will render.
+    all_offsets = [[0, 0]] + image_offsets
+    x_min_global, x_max_global = np.inf, -np.inf
+    y_min_global, y_max_global = np.inf, -np.inf
+    n_frames_total = int(box_history.shape[0])
+    for f in range(n_frames_total):
+        Hf = box_history[f, :2, :2]
+        main_corners = corners_of_box(Hf)  # np array of polygon corners (closed)
+        for off in all_offsets:
+            lattice_shift = np.asarray(Hf) @ np.array(off)
+            corners_shifted = main_corners + lattice_shift
+            x_min_global = min(x_min_global, float(corners_shifted[:, 0].min()))
+            x_max_global = max(x_max_global, float(corners_shifted[:, 0].max()))
+            y_min_global = min(y_min_global, float(corners_shifted[:, 1].min()))
+            y_max_global = max(y_max_global, float(corners_shifted[:, 1].max()))
+
+    # Add small margins for visuals
+    x_range = x_max_global - x_min_global
+    y_range = y_max_global - y_min_global
+    x_margin = 0.05 * x_range if np.isfinite(x_range) and x_range > 0 else 0.5
+    y_margin = 0.05 * y_range if np.isfinite(y_range) and y_range > 0 else 0.5
+    ax2.set_xlim(x_min_global - x_margin, x_max_global + x_margin)
+    ax2.set_ylim(y_min_global - y_margin, y_max_global + y_margin)
+
     # Text displays
-    time_text = fig.text(0.02, 0.95, '', fontsize=12, fontweight='bold')
-    gamma_text = fig.text(0.02, 0.90, '', fontsize=12, fontweight='bold')
+    # Place text in the bottom-left figure margin to avoid overlapping subplot titles
+    time_text = fig.text(0.02, 0.06, '', fontsize=12, fontweight='bold')
+    gamma_text = fig.text(0.02, 0.02, '', fontsize=12, fontweight='bold')
     
     # Trajectory lines (sample a few particles for clarity)
     sample_particles = range(0, N_particles, max(1, N_particles//8))
@@ -616,21 +643,19 @@ def create_trajectory_animation(trajectory: jnp.ndarray, box_history: jnp.ndarra
         
         # Update phantom particles and boxes (periodic images)
         for i, offset in enumerate(image_offsets):
-            # Fractional phantom positions (wrapped around unit cell)
-            phantom_frac = pos_frac + np.array(offset)
+            # Fractional phantom positions in neighboring images
+            # (do not wrap back into unit cell so we can show distinct images in fractional view)
+            offset_vec = np.array(offset)
+            phantom_frac = pos_frac + offset_vec
             phantom_scats1[i].set_offsets(phantom_frac)
-            
-            # Real phantom positions  
-            phantom_frac_wrapped = (pos_frac + np.array(offset)) % 1.0  # Keep in [0,1)
-            phantom_real = space.transform(H, phantom_frac_wrapped)
+
+            # Real phantom positions: r_image = H * (s + offset) = H*s + H*offset
+            # Compute the lattice shift once and translate current real positions
+            lattice_shift = H @ offset_vec
+            phantom_real = pos_real + lattice_shift
             phantom_scats2[i].set_offsets(phantom_real)
-            
-            # Update phantom box boundaries in real coordinates
-            # For periodic images, we need to shift by lattice vectors
-            # Lattice vectors are the columns of H matrix
-            lattice_shift = offset[0] * H[:, 0] + offset[1] * H[:, 1]
-            
-            # Main box corners shifted by lattice vectors
+
+            # Update phantom box boundaries in real coordinates by the same lattice shift
             main_corners = corners_of_box(H)
             phantom_corners_shifted = main_corners + lattice_shift
             phantom_box_lines[i].set_data(phantom_corners_shifted[:, 0], phantom_corners_shifted[:, 1])
@@ -639,29 +664,7 @@ def create_trajectory_animation(trajectory: jnp.ndarray, box_history: jnp.ndarra
         corners = corners_of_box(H)
         box_lines.set_data(corners[:, 0], corners[:, 1])
         
-        # Calculate fixed plot limits based on maximum expected deformation
-        # Get the current box dimensions to center the view
-        box_corners = corners_of_box(H)
-        box_center_x = (box_corners[:, 0].min() + box_corners[:, 0].max()) / 2
-        box_center_y = (box_corners[:, 1].min() + box_corners[:, 1].max()) / 2
-        
-        # Estimate maximum deformation from shear function over all times
-        try:
-            gamma_values = [abs(shear_fn(t)) for t in times]
-            max_gamma = max(gamma_values) if gamma_values else 2.0
-        except:
-            max_gamma = 2.0  # fallback value
-        
-        box_height = box_corners[:, 1].max() - box_corners[:, 1].min()
-        max_shear_displacement = max_gamma * box_height
-        
-        # Set fixed limits with some margin, centered on the deforming box
-        # Include space for phantom boxes (±1 box width in each direction)
-        plot_width = 3 * box_height + 2 * max_shear_displacement + 1.0  # Extra space for phantoms
-        plot_height = 3 * box_height + 1.0  # Extra space for phantoms
-        
-        ax2.set_xlim(box_center_x - plot_width/2, box_center_x + plot_width/2)
-        ax2.set_ylim(box_center_y - plot_height/2, box_center_y + plot_height/2)
+    # Axes limits are fixed globally above (accounting for remapping); no per-frame updates.
         
         # Update trajectory trails (show last 20 frames) with periodic unwrapping
         trail_length = min(20, frame + 1)
@@ -688,8 +691,9 @@ def create_trajectory_animation(trajectory: jnp.ndarray, box_history: jnp.ndarra
         
         # Update text
         gamma_val = shear_fn(t)
-        time_text.set_text(f'Time: {t:.6f}')
-        gamma_text.set_text(f'Shear strain γ: {gamma_val:.6f}')
+        # Keep to 3 decimals for cleaner display
+        time_text.set_text(f'Time: {t:.3f}')
+        gamma_text.set_text(f'Shear strain γ: {gamma_val:.3f}')
         
         return ([scat1, scat2, box_lines, time_text, gamma_text] + 
                 phantom_scats1 + phantom_scats2 + phantom_box_lines + 
@@ -706,6 +710,127 @@ def create_trajectory_animation(trajectory: jnp.ndarray, box_history: jnp.ndarra
     plt.tight_layout(rect=(0, 0.1, 1, 0.95))
     
     return anim, fig
+
+
+def plot_static_configuration(
+    R_frac: Union[jnp.ndarray, np.ndarray],
+    H: jnp.ndarray,
+    title: str = "Static Configuration",
+    n_images: int = 1,
+    radii_frac: Optional[Union[float, jnp.ndarray, np.ndarray]] = None,
+    fancy: bool = True,
+    figsize: Tuple[int, int] = (8, 8),
+):
+    """Plot a publication-quality static image of a configuration in real space only.
+
+    Shows only the primary box and particles in real coordinates (no periodic images,
+    no fractional coordinate panel).
+
+    Args:
+        R_frac: Particle positions in fractional coordinates, shape (N, 2) or (N, >=2).
+        H: 2x2 real-space box matrix for xy-plane visualization.
+        title: Figure title.
+        n_images: Number of periodic image layers to show in each direction (ignored).
+        radii_frac: Optional per-particle radii in fractional units (of box height). If float,
+            used for all particles. If None, a sensible default is used.
+        fancy: If True, draw glossy 3D-like spheres; if False, draw simple scatter.
+        figsize: Matplotlib figure size.
+
+    Returns:
+        (fig, ax_real)
+    """
+    R_frac = np.asarray(R_frac)
+    if R_frac.shape[1] > 2:
+        R_frac = R_frac[:, :2]
+
+    # Styling consistent with animation
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['font.size'] = 12
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    fig.suptitle(title, fontsize=18, fontweight='bold', y=0.98)
+
+    # Colors to match animation
+    particle_color = 'red'
+    particle_edge = 'darkred'
+    box_color = 'blue'
+
+    # Helper: glossy particle painter
+    def _draw_glossy_particles(ax_target, P, r, base_color=particle_color, edge_color=particle_edge, z=5):
+        # Convert color to rgb
+        base_rgb = np.array(mcolors.to_rgb(base_color))
+        dark_rgb = base_rgb * 0.75
+        light_rgb = 1 - (1 - base_rgb) * 0.2  # blend towards white
+
+        # Ensure per-particle radii
+        if np.ndim(r) == 0:
+            r_scalar = float(np.asarray(r))
+            radii = np.full(len(P), r_scalar, dtype=float)
+        else:
+            radii = np.asarray(r, dtype=float)
+
+        # Draw per particle
+        for (x, y), rr in zip(P, radii):
+            # Concentric rings to fake radial gradient
+            rings = 6
+            for k in range(rings):
+                t = k / (rings - 1)
+                c = (1 - t) * dark_rgb + t * light_rgb
+                alpha = 0.95 if k == 0 else 0.9
+                circ = patches.Circle((x, y), rr * (1 - 0.12*k),
+                                      facecolor=(*c, alpha), edgecolor=edge_color,
+                                      linewidth=0.5 if k == 0 else 0.0, zorder=z+1)
+                ax_target.add_patch(circ)
+
+    # Determine radii in fractional units
+    # Default ~3% of box height in fractional coords
+    if radii_frac is None:
+        radius_frac_val: Union[float, np.ndarray] = 0.03
+    else:
+        # Normalize to numpy float/array for downstream use
+        if np.ndim(radii_frac) == 0:
+            radius_frac_val = float(np.asarray(radii_frac))
+        else:
+            radius_frac_val = np.asarray(radii_frac, dtype=float)
+
+    # Real coordinates only - primary box only
+    ax.set_aspect('equal')
+    ax.set_title('Real Coordinates (xy plane)', fontsize=14, fontweight='bold')
+    ax.grid(False)
+
+    # Box boundary (main box only, no periodic images)
+    H2_jax = jnp.asarray(H[:2, :2])
+    main_corners = corners_of_box(H2_jax)
+    ax.plot(main_corners[:, 0], main_corners[:, 1], '-', color=box_color, linewidth=2)
+
+    # Plot particles in real space (main box only)
+    R_real = space.transform(H2_jax, jnp.asarray(R_frac))
+
+    # Map fractional radius to real-space length scale
+    H2_np = np.asarray(H2_jax)
+    Lx = float(H2_np[0, 0])
+    Ly = float(H2_np[1, 1])
+    length_scale = min(abs(Lx), abs(Ly))
+    if np.ndim(radius_frac_val) == 0:
+        r_real = float(np.asarray(radius_frac_val)) * length_scale
+    else:
+        r_real = np.asarray(radius_frac_val, dtype=float) * length_scale
+
+    if fancy:
+        _draw_glossy_particles(ax, R_real, r_real)
+    else:
+        ax.scatter(R_real[:, 0], R_real[:, 1], s=50, alpha=0.8,
+                   c=particle_color, edgecolors=particle_edge, linewidth=1)
+
+    # Set limits in real space to include main box with a margin
+    x_min, x_max = np.min(main_corners[:, 0]), np.max(main_corners[:, 0])
+    y_min, y_max = np.min(main_corners[:, 1]), np.max(main_corners[:, 1])
+    x_margin = 0.05 * (x_max - x_min if x_max > x_min else 1.0)
+    y_margin = 0.05 * (y_max - y_min if y_max > y_min else 1.0)
+    ax.set_xlim(x_min - x_margin, x_max + x_margin)
+    ax.set_ylim(y_min - y_margin, y_max + y_margin)
+
+    plt.tight_layout(rect=(0, 0.0, 1, 0.95))
+    return fig, ax
 
 
 # =============================================================================
@@ -1143,6 +1268,7 @@ __all__ = [
     'compare_shear_protocols',
     'create_demonstration_grid',
     'create_boundary_particles',
+    'plot_static_configuration',
     
     # Tutorial demonstrations
     'demonstrate_coordinate_transformation',
