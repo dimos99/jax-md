@@ -141,56 +141,99 @@ def stress_autocorrelation(stress_tensor: Array,
     Compute stress autocorrelation function for Green-Kubo viscosity.
     
     Args:
-        stress_tensor: Stress tensor time series of shape (N, 3, 3) or (N, 6)
-                      where the 6 components are [xx, yy, zz, xy, xz, yz]
+        stress_tensor: Stress tensor time series. Supported shapes include
+                       (N, 3, 3), (N, 6), (M, N, 3, 3) and (M, N, 6) where
+                       leading dimensions represent independent replicas.
+                       For flattened tensors the 6 components are
+                       [xx, yy, zz, xy, xz, yz].
         volume: System volume in consistent units
         temperature: Temperature in consistent units
         components: Which stress components to use for shear viscosity.
                    If None, uses off-diagonal components (xy, xz, yz)
                    
     Returns:
-        Stress autocorrelation function
+        Stress autocorrelation function averaged over components (and replicas
+        if present)
     """
     stress_tensor = jnp.asarray(stress_tensor)
-    
-    if stress_tensor.ndim == 3:
-        # Extract off-diagonal components for shear viscosity
-        if components is None:
-            # For 3x3 tensor, extract xy, xz, yz components
-            stress_components = jnp.stack([
-                stress_tensor[:, 0, 1],  # xy
-                stress_tensor[:, 0, 2],  # xz 
-                stress_tensor[:, 1, 2]   # yz
-            ], axis=1)
-        else:
-            # Use specified component indices as (i,j) pairs
-            stress_components = jnp.stack([
-                stress_tensor[:, components[k*2], components[k*2+1]] 
-                for k in range(len(components)//2)
-            ], axis=1)
+
+    # Bring stress tensor into a common shape: (n_rep, n_time, n_components)
+    stress_components: Array
+
+    if stress_tensor.ndim == 4 and stress_tensor.shape[-2:] == (3, 3):
+        # Already in replica form (n_rep, n_time, 3, 3)
+        stress_3x3 = stress_tensor
+    elif stress_tensor.ndim == 3 and stress_tensor.shape[-2:] == (3, 3):
+        # Single replica (n_time, 3, 3)
+        stress_3x3 = stress_tensor[None, ...]
     else:
-        # Assume flattened format [xx, yy, zz, xy, xz, yz]
+        stress_3x3 = None
+
+    if stress_3x3 is not None:
         if components is None:
-            components = (3, 4, 5)  # xy, xz, yz indices
-        stress_components = stress_tensor[:, jnp.array(components)]
-    
-    # Compute autocorrelation for each component
-    acfs = jax.vmap(autocorrelation_fft, in_axes=1, out_axes=1)(stress_components)
-    
-    # Average over components
-    acf_avg = jnp.mean(acfs, axis=1)
-    
+            # Extract xy, xz, yz components
+            stress_components = jnp.stack([
+                stress_3x3[..., 0, 1],
+                stress_3x3[..., 0, 2],
+                stress_3x3[..., 1, 2]
+            ], axis=-1)
+        else:
+            if len(components) % 2 != 0:
+                raise ValueError("Components must be provided as (i, j) pairs")
+            comp_list = []
+            for idx in range(0, len(components), 2):
+                i = components[idx]
+                j = components[idx + 1]
+                comp_list.append(stress_3x3[..., i, j])
+            stress_components = jnp.stack(comp_list, axis=-1)
+    else:
+        # Handle flattened format [..., 6]
+        if stress_tensor.ndim == 3 and stress_tensor.shape[-1] == 6:
+            # Assume (n_rep, n_time, 6)
+            stress_flat = stress_tensor
+        elif stress_tensor.ndim == 2 and stress_tensor.shape[-1] == 6:
+            # Single replica (n_time, 6)
+            stress_flat = stress_tensor[None, ...]
+        else:
+            raise ValueError(
+                "Unsupported stress tensor shape. Expected (..., N, 3, 3) or (..., N, 6)."
+            )
+
+        if components is None:
+            components = (3, 4, 5)
+        stress_components = stress_flat[..., jnp.array(components)]
+
+    # Ensure we have explicit replica axis
+    if stress_components.ndim != 3:
+        raise RuntimeError("Internal error: stress components must have shape (n_rep, n_time, n_comp)")
+
+    n_rep = stress_components.shape[0]
+
+    # Move component axis forward for efficient vmaps: (n_rep, n_comp, n_time)
+    components_perm = jnp.swapaxes(stress_components, 1, 2)
+
+    def _acf_per_replica(component_traces: Array) -> Array:
+        # component_traces shape: (n_comp, n_time)
+        acfs = jax.vmap(autocorrelation_fft)(component_traces)
+        return acfs
+
+    acfs = jax.vmap(_acf_per_replica)(components_perm)  # (n_rep, n_comp, n_time)
+    acfs = jnp.swapaxes(acfs, 1, 2)  # (n_rep, n_time, n_comp)
+
+    # Average over components then replicas
+    acf_avg_components = jnp.mean(acfs, axis=-1)
+    acf_avg = jnp.mean(acf_avg_components, axis=0) if n_rep > 1 else acf_avg_components[0]
+
     # Apply Green-Kubo prefactor with numerical stability
-    # Factor for converting to appropriate units
     if temperature <= 0 or volume <= 0:
         raise ValueError("Temperature and volume must be positive")
-    
+
     prefactor = volume / temperature
     result = prefactor * acf_avg
-    
+
     # Ensure finite values
     result = jnp.where(jnp.isfinite(result), result, 0.0)
-    
+
     return result
 
 
@@ -704,7 +747,9 @@ def green_kubo_viscosity(stress_tensor: Array,
     Maxwell model fitting, and viscosity computation.
     
     Args:
-        stress_tensor: Stress tensor time series
+    stress_tensor: Stress tensor time series. Supports shapes (N, 3, 3),
+               (N, 6) and replica batched variants (M, N, 3, 3) or
+               (M, N, 6).
         time: Time array
         volume: System volume
         temperature: Temperature
