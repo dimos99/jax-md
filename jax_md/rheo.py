@@ -384,21 +384,38 @@ class MaxwellModel:
         # Use log-spaced tau values spanning the time range (like gk.py)
         min_tau = max(float(jnp.min(t_valid)) * 0.1, 1e-10)
         max_tau = float(jnp.max(t_valid)) * 10
+        
+        # Ensure min_tau and max_tau are sufficiently separated
+        if max_tau / min_tau < 10:
+            # If range is too narrow, expand it
+            geometric_mean = np.sqrt(min_tau * max_tau)
+            min_tau = geometric_mean * 0.01
+            max_tau = geometric_mean * 100
+        
         tau_est = jnp.logspace(jnp.log10(min_tau), jnp.log10(max_tau), self.n_modes)
         
         # Build design matrix A where A[i,j] = exp(-t[i]/tau[j])
         A = jnp.exp(-t_valid[:, None] / tau_est[None, :])
         
-        # Verify A matrix has no NaN or inf values
-        if not jnp.all(jnp.isfinite(A)):
-            print("Warning: Design matrix contains non-finite values, using fallback")
+        # Check if design matrix is well-conditioned
+        condition_number = np.linalg.cond(np.array(A))
+        if not jnp.all(jnp.isfinite(A)) or condition_number > 1e10:
+            print(f"Warning: Design matrix poorly conditioned (cond={condition_number:.2e}), using fallback")
             # Fallback to simple estimation
             G_est = jnp.full(self.n_modes, float(jnp.max(data_valid)) / self.n_modes)
         else:
             # Use non-negative least squares to estimate G values (like gk.py)
             from scipy.optimize import nnls
-            G_est, _ = nnls(np.array(A), np.array(data_valid))
-            G_est = jnp.array(G_est)
+            try:
+                G_est, residual = nnls(np.array(A, dtype=np.float64), 
+                                      np.array(data_valid, dtype=np.float64),
+                                      maxiter=self.n_modes * 100)
+                G_est = jnp.array(G_est)
+                # Ensure no zero or negative values
+                G_est = jnp.maximum(G_est, float(jnp.max(data_valid)) * 1e-6)
+            except Exception as e:
+                print(f"Warning: NNLS failed ({e}), using fallback")
+                G_est = jnp.full(self.n_modes, float(jnp.max(data_valid)) / self.n_modes)
         
         # Interleave G and tau values: [G1, tau1, G2, tau2, ...]
         params = jnp.zeros(2 * self.n_modes)
@@ -444,14 +461,21 @@ class MaxwellModel:
         bounds_list = []
         for i in range(self.n_modes):
             # G (modulus) bounds: reasonable fraction of max data
-            G_min = max_data * 1e-6
-            G_max = max_data * 10  # Allow some overshoot for noisy data
+            G_min = max(max_data * 1e-6, 1e-12)
+            G_max = max(max_data * 10, 1e-6)  # Allow some overshoot for noisy data
             bounds_list.append((G_min, G_max))
             
             # tau (relaxation time) bounds: based on time range
-            tau_min = t_min * 0.01   # Fast relaxation
-            tau_max = t_max * 100    # Slow relaxation
+            tau_min = max(t_min * 0.01, 1e-10)   # Fast relaxation
+            tau_max = max(t_max * 100, 1e-6)     # Slow relaxation
             bounds_list.append((tau_min, tau_max))
+        
+        # Validate bounds
+        for i, (low, high) in enumerate(bounds_list):
+            if not (0 < low < high):
+                raise ValueError(f"Invalid bounds at index {i}: ({low}, {high})")
+            if not np.isfinite(low) or not np.isfinite(high):
+                raise ValueError(f"Non-finite bounds at index {i}: ({low}, {high})")
         
         # Perform optimization using scipy with curve_fit (like gk.py)
         from scipy.optimize import curve_fit
@@ -461,15 +485,26 @@ class MaxwellModel:
             n_modes = len(params) // 2
             Gs = params[0::2]  # G values
             taus = params[1::2]  # tau values
-            result = np.zeros_like(t)
+            result = np.zeros_like(t, dtype=np.float64)
             for G, tau in zip(Gs, taus):
-                result += G * np.exp(-t / tau)
+                # Protect against division by zero or very small tau
+                if tau > 1e-12:
+                    result += G * np.exp(-t / tau)
+                else:
+                    # For very small tau, the exponential decays instantly to zero
+                    pass
             return result
         
         # Convert to numpy for scipy optimization
         t_np = np.array(t)
         data_np = np.array(data)
         initial_params_np = np.array(initial_params)
+        
+        # Ensure initial parameters are within bounds and valid
+        for i, (low, high) in enumerate(bounds_list):
+            if not np.isfinite(initial_params_np[i]):
+                initial_params_np[i] = np.sqrt(low * high)  # Geometric mean
+            initial_params_np[i] = np.clip(initial_params_np[i], low * 1.01, high * 0.99)
         
         # Try multiple optimization strategies with different starting points
         best_result = None
@@ -739,7 +774,8 @@ def green_kubo_viscosity(stress_tensor: Array,
                         volume: float,
                         temperature: float,
                         max_modes: int = 10,
-                        components: Optional[Tuple[int, ...]] = None) -> Dict[str, Any]:
+                        components: Optional[Tuple[int, ...]] = None,
+                        max_fit_points: int = 10000) -> Dict[str, Any]:
     """
     Compute viscosity using Green-Kubo formalism.
     
@@ -755,6 +791,8 @@ def green_kubo_viscosity(stress_tensor: Array,
         temperature: Temperature
         max_modes: Maximum number of Maxwell modes to try
         components: Stress tensor components to use
+        max_fit_points: Maximum number of points to use for fitting (default: 10000).
+                       Large datasets will be downsampled to avoid numerical issues.
         
     Returns:
         Dictionary containing viscosity and fitting results
@@ -762,18 +800,34 @@ def green_kubo_viscosity(stress_tensor: Array,
     # Compute stress autocorrelation function
     acf = stress_autocorrelation(stress_tensor, volume, temperature, components)
     
+    # Downsample if dataset is too large for fitting
+    n_points = len(time)
+    if n_points > max_fit_points:
+        print(f"Downsampling from {n_points} to {max_fit_points} points for fitting...")
+        # Use logarithmic spacing to keep more detail at early times
+        indices = np.unique(np.logspace(0, np.log10(n_points - 1), max_fit_points).astype(int))
+        time_fit = time[indices]
+        acf_fit_full = acf[indices]
+    else:
+        time_fit = time
+        acf_fit_full = acf
+    
     # Only use positive part of ACF
-    positive_mask = acf > 0
+    positive_mask = acf_fit_full > 0
     if not jnp.any(positive_mask):
         raise ValueError("No positive autocorrelation values found")
     
     # Truncate to positive values
-    first_negative = jnp.argmax(~positive_mask) if jnp.any(~positive_mask) else len(acf)
+    first_negative = jnp.argmax(~positive_mask) if jnp.any(~positive_mask) else len(acf_fit_full)
     if first_negative == 0:
-        first_negative = len(acf)
+        first_negative = len(acf_fit_full)
     
-    t_fit = time[:first_negative]
-    acf_fit = acf[:first_negative]
+    t_fit = time_fit[:first_negative]
+    acf_fit = acf_fit_full[:first_negative]
+    
+    # Further check: ensure we have enough valid points
+    if len(t_fit) < 10:
+        raise ValueError(f"Insufficient positive ACF points for fitting: {len(t_fit)}")
     
     # Select best Maxwell model
     best_model, model_results = select_best_model(t_fit, acf_fit, max_modes)
