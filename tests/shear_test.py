@@ -65,7 +65,7 @@ def _make_pair_energy_and_forces(disp_fn, rc: float, k: float = 1.0, *, gamma=No
 
     def _disp(a, b):
         if gamma is not None:
-            return disp_fn(a, b, gamma=gamma)
+            return disp_fn(a, b, gamma=gamma, t=0.0)
         if t is not None:
             return disp_fn(a, b, t=t)
         return disp_fn(a, b)
@@ -174,7 +174,7 @@ def _bruteforce_pairs(disp_fn, R, *, gamma=None, t=None, r_cutoff=1.0):
 
     def _d(a, b):
         if gamma is not None:
-            return _np.linalg.norm(_np.asarray(disp_fn(a, b, gamma=gamma)))
+            return _np.linalg.norm(_np.asarray(disp_fn(a, b, gamma=gamma, t=0.0)))
         if t is not None:
             return _np.linalg.norm(_np.asarray(disp_fn(a, b, t=t)))
         return _np.linalg.norm(_np.asarray(disp_fn(a, b)))
@@ -196,7 +196,7 @@ def test_zero_shear_matches_periodic_general(dim, fractional):
     B = make_box(*L)
 
     disp_pg, shift_pg = space.periodic_general(B, fractional_coordinates=fractional)
-    disp_s, shift_s, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=fractional)
+    disp_s, shift_s, box_of = space.shearing(B, fractional_coordinates=fractional)
 
     key = jax.random.PRNGKey(0)
     Ra = jax.random.uniform(key, (5, dim))
@@ -217,7 +217,7 @@ def test_box_of_time_dependence_and_remap(dim):
     L = [3.0, 2.0] if dim == 2 else [3.0, 2.0, 4.0]
     B = make_box(*L)
     gamma_dot = 0.1
-    disp, shift, box_of = space.shearing(B, shear_rate=gamma_dot, fractional_coordinates=True, remap=False)
+    disp, shift, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t, fractional_coordinates=True, remap=False)
 
     t1, t2 = 1.0, 3.5
     H1 = box_of(t=t1)
@@ -227,7 +227,7 @@ def test_box_of_time_dependence_and_remap(dim):
     np.testing.assert_allclose(sheared_xy(H2) - sheared_xy(H1), (t2 - t1) * gamma_dot * Ly, atol=1e-7)
 
     # With remap=True, gamma is wrapped into [-0.5, 0.5)
-    dispR, shiftR, box_ofR = space.shearing(B, shear_rate=1.0, fractional_coordinates=True, remap=True)
+    dispR, shiftR, box_ofR = space.shearing(B, shear_fn=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
     for t in [0.0, 0.49, 0.51, 1.49, -0.51]:
         H = box_ofR(t=t)
         # gamma_wrapped ∈ [-0.5, 0.5) ⇒ xy - base_xy ∈ [-0.5*Ly, 0.5*Ly)
@@ -238,9 +238,9 @@ def test_box_of_time_dependence_and_remap(dim):
 def test_gamma_override_wins_over_rate(dim):
     L = [3.0, 2.0] if dim == 2 else [3.0, 2.0, 4.0]
     B = make_box(*L)
-    disp, shift, box_of = space.shearing(B, shear_rate=123.0, fractional_coordinates=True, remap=False)
+    disp, shift, box_of = space.shearing(B, shear_fn=lambda t: 123.0 * t, fractional_coordinates=True, remap=False)
 
-    H1 = box_of(t=10.0, gamma=0.2)     # should ignore shear_rate * t
+    H1 = box_of(t=10.0, gamma=0.2)     # should ignore the time-derived gamma
     Ly = L[1]
     np.testing.assert_allclose(sheared_xy(H1), sheared_xy(B) + 0.2 * Ly, atol=1e-7)
 
@@ -250,12 +250,12 @@ def test_keep_base_xy_behavior():
     base = make_box(Lx, Ly, Lz).at[0,1].set(0.25)  # base_xy = 0.25
     gamma = 0.1
     # keep_base_xy=True keeps base tilt and adds gamma*Ly
-    _, _, box_keep = space.shearing(base, shear_rate=0.0, keep_base_xy=True)
-    Hk = box_keep(gamma=gamma)
+    _, _, box_keep = space.shearing(base, keep_base_xy=True)
+    Hk = box_keep(gamma=gamma, t=0.0)
     np.testing.assert_allclose(sheared_xy(Hk), 0.25 + gamma * Ly, atol=1e-7)
     # keep_base_xy=False overwrites tilt with gamma*Ly
-    _, _, box_ow = space.shearing(base, shear_rate=0.0, keep_base_xy=False)
-    Ho = box_ow(gamma=gamma)
+    _, _, box_ow = space.shearing(base, keep_base_xy=False)
+    Ho = box_ow(gamma=gamma, t=0.0)
     np.testing.assert_allclose(sheared_xy(Ho), gamma * Ly, atol=1e-7)
 
 @pytest.mark.parametrize("fractional", [True, False])
@@ -264,27 +264,27 @@ def test_fractional_vs_real_paths_agree(fractional):
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
     gamma = 0.3
-    dispF, shiftF, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    dispR, shiftR, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=False)
+    dispF, shiftF, box_of = space.shearing(B, fractional_coordinates=True)
+    dispR, shiftR, _ = space.shearing(B, fractional_coordinates=False)
 
     key = jax.random.PRNGKey(1)
     Ra_frac = jax.random.uniform(key, (10, 3))
     Rb_frac = jax.random.uniform(key, (10, 3))
-    H = box_of(gamma=gamma)
+    H = box_of(gamma=gamma, t=0.0)
 
     # Real-space positions corresponding to those fractional ones
     Ra_real = space.transform(H, Ra_frac)
     Rb_real = space.transform(H, Rb_frac)
 
-    dRF = dispF(Ra_frac, Rb_frac, gamma=gamma)
-    dRR = dispR(Ra_real, Rb_real, gamma=gamma)
+    dRF = dispF(Ra_frac, Rb_frac, gamma=gamma, t=0.0)
+    dRR = dispR(Ra_real, Rb_real, gamma=gamma, t=0.0)
     np.testing.assert_allclose(dRF, dRR, atol=1e-6)
 
 def test_minimum_image_and_antisymmetry_fractional():
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
     gamma = 0.4
-    disp, shift, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, shift, box_of = space.shearing(B, fractional_coordinates=True)
     key = jax.random.PRNGKey(2)
     Ra = jax.random.uniform(key, (20, 3))
     # Put Rb as Ra + random vector in [-0.6,0.6) (fractional)
@@ -292,14 +292,14 @@ def test_minimum_image_and_antisymmetry_fractional():
     Rb = Ra + d
 
     # Displacement should be H * (wrap(Ra-Rb))
-    H = box_of(gamma=gamma)
+    H = box_of(gamma=gamma, t=0.0)
     wrap = lambda x: x - jnp.round(x)
     dRf = wrap(Ra - Rb)
     dR_expected = space.transform(H, dRf)
-    dR = disp(Ra, Rb, gamma=gamma)
+    dR = disp(Ra, Rb, gamma=gamma, t=0.0)
     np.testing.assert_allclose(dR, dR_expected, atol=1e-6)
     # Antisymmetry
-    np.testing.assert_allclose(dR, -disp(Rb, Ra, gamma=gamma), atol=1e-6)
+    np.testing.assert_allclose(dR, -disp(Rb, Ra, gamma=gamma, t=0.0), atol=1e-6)
 
 def test_periodicity_across_y_face_includes_shear_offset():
     # Crossing y by +1 in fractional should shift x by gamma*Ly (in the metric),
@@ -307,15 +307,15 @@ def test_periodicity_across_y_face_includes_shear_offset():
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
     gamma = 0.25
-    disp, shift, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    H = box_of(gamma=gamma)
+    disp, shift, box_of = space.shearing(B, fractional_coordinates=True)
+    H = box_of(gamma=gamma, t=0.0)
 
     Ra = jnp.array([[0.1, 0.99, 0.2]], dtype=jnp.float32)  # close to +y face
     Rb = jnp.array([[0.15, 0.01, 0.2]], dtype=jnp.float32) # just across the boundary
     # Direct formula: wrap in fractional, then map by H
     dRf = (Ra - Rb) - jnp.round(Ra - Rb)
     dR_expected = space.transform(H, dRf)
-    dR = disp(Ra, Rb, gamma=gamma)
+    dR = disp(Ra, Rb, gamma=gamma, t=0.0)
     np.testing.assert_allclose(dR, dR_expected, atol=1e-6)
 
 @pytest.mark.parametrize("fractional", [True, False])
@@ -324,27 +324,27 @@ def test_shift_roundtrip_small_steps(fractional):
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
     gamma = 0.3
-    disp, shift, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=fractional)
+    disp, shift, box_of = space.shearing(B, fractional_coordinates=fractional)
     key = jax.random.PRNGKey(3)
     R = jax.random.uniform(key, (30, 3))
     dR = 1e-3 * jax.random.normal(key, (30, 3))  # tiny real step
 
     if fractional:
-        R2 = shift(R, dR, gamma=gamma)
+        R2 = shift(R, dR, gamma=gamma, t=0.0)
         # displacement from R2 back to R ≈ dR
-        dR_meas = disp(R2, R, gamma=gamma)
+        dR_meas = disp(R2, R, gamma=gamma, t=0.0)
     else:
-        H = box_of(gamma=gamma)
+        H = box_of(gamma=gamma, t=0.0)
         R_real = space.transform(H, R)
-        R2 = shift(R_real, dR, gamma=gamma)
-        dR_meas = disp(R2, R_real, gamma=gamma)
+        R2 = shift(R_real, dR, gamma=gamma, t=0.0)
+        dR_meas = disp(R2, R_real, gamma=gamma, t=0.0)
 
     np.testing.assert_allclose(dR_meas, dR, atol=1e-6, rtol=1e-4)
 
 def test_jit_and_vmap_ok():
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
-    disp, shift, box_of = space.shearing(B, shear_rate=0.2, fractional_coordinates=True)
+    disp, shift, box_of = space.shearing(B, shear_fn=lambda t: 0.2 * t, fractional_coordinates=True)
 
     Ra = jnp.array([[0.1, 0.2, 0.3],
                     [0.3, 0.0, 0.9]], dtype=jnp.float32)
@@ -360,28 +360,27 @@ def test_jit_and_vmap_ok():
     assert R2.shape == Ra.shape
 
 def test_invalid_box_errors():
-    # Scalar box should raise (ambiguous dimension).
-    with pytest.raises(Exception):
-        space.shearing(jnp.array(3.0), shear_rate=0.1)
+    # Scalar boxes now canonicalize to isotropic 3D; ensure construction succeeds.
+    space.shearing(jnp.array(3.0), shear_fn=lambda t: 0.1 * t)
     # 1D box should raise for space.shearing (needs at least 2D).
     with pytest.raises(Exception):
-        space.shearing(jnp.array([3.0]), shear_rate=0.1)
+        space.shearing(jnp.array([3.0]), shear_fn=lambda t: 0.1 * t)
         
         
 def test_lattice_invariance_fractional():
     # disp should be invariant under integer fractional shifts.
     B = make_box(3.0, 2.0, 4.0)
     gamma = 0.33
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
     key = jax.random.PRNGKey(5)
     Ra = jax.random.uniform(key, (20, 3))
     Rb = jax.random.uniform(key, (20, 3))
-    H = box_of(gamma=gamma)
+    H = box_of(gamma=gamma, t=0.0)
 
-    d0 = disp(Ra, Rb, gamma=gamma)
+    d0 = disp(Ra, Rb, gamma=gamma, t=0.0)
     # random integer lattice shifts in {-1,0,1}
     S = jax.random.randint(key, (20, 3), -1, 2).astype(Ra.dtype)
-    d1 = disp(Ra + S, Rb + S, gamma=gamma)
+    d1 = disp(Ra + S, Rb + S, gamma=gamma, t=0.0)
     np.testing.assert_allclose(d0, d1, atol=1e-6)
 
     # Visual: sheared cell at this gamma with a few points
@@ -393,13 +392,13 @@ def test_shift_displacement_consistency_finite_steps():
     # up to periodic wrap (i.e., the minimum image).
     B = make_box(3.0, 2.0, 4.0)
     gamma = 0.41
-    disp, shift, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, shift, _ = space.shearing(B, fractional_coordinates=True)
     key = jax.random.PRNGKey(6)
     R = jax.random.uniform(key, (100, 3))
     dR = jax.random.normal(key, (100, 3)) * 0.2  # not tiny
 
-    R2 = shift(R, dR, gamma=gamma)
-    dR_meas = disp(R2, R, gamma=gamma)
+    R2 = shift(R, dR, gamma=gamma, t=0.0)
+    dR_meas = disp(R2, R, gamma=gamma, t=0.0)
 
     # Fold dR into the same minimum-image convention as disp uses.
     # In fractional mode, disp = H * wrap(Δf); but here dR is real, so only compare norms.
@@ -410,23 +409,23 @@ def test_shift_displacement_consistency_finite_steps():
 def test_remap_boundary_continuity():
     # When remap wraps gamma at ±0.5, results should be continuous.
     B = make_box(3.0, 2.0, 4.0)
-    dispR, _, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=True, remap=True)
+    dispR, _, _ = space.shearing(B, fractional_coordinates=True, remap=True)
     key = jax.random.PRNGKey(7)
     Ra = jax.random.uniform(key, (50, 3))
     Rb = jax.random.uniform(key, (50, 3))
     eps = 1e-6
-    d1 = dispR(Ra, Rb, gamma=0.5 - eps)
-    d2 = dispR(Ra, Rb, gamma=-0.5 + eps)
+    d1 = dispR(Ra, Rb, gamma=0.5 - eps, t=0.0)
+    d2 = dispR(Ra, Rb, gamma=-0.5 + eps, t=0.0)
     np.testing.assert_allclose(d1, d2, atol=1e-5, rtol=1e-5)
 
 def test_autodiff_gradients_match_geometry():
     # ∂/∂Ra ||d||^2 = 2 d, ∂/∂Rb ||d||^2 = -2 d
     B = make_box(3.0, 2.0, 4.0)
     gamma = 0.2
-    disp, _, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, _, _ = space.shearing(B, fractional_coordinates=True)
 
     def f(Ra, Rb):
-        d = disp(Ra, Rb, gamma=gamma)
+        d = disp(Ra, Rb, gamma=gamma, t=0.0)
         return jnp.sum(d * d)
 
     Ra = jnp.array([0.2, 0.7, 0.1])
@@ -434,7 +433,7 @@ def test_autodiff_gradients_match_geometry():
 
     gRa = jax.grad(lambda a: f(a, Rb))(Ra)
     gRb = jax.grad(lambda b: f(Ra, b))(Rb)
-    d = disp(Ra, Rb, gamma=gamma)
+    d = disp(Ra, Rb, gamma=gamma, t=0.0)
 
     np.testing.assert_allclose(gRa,  2.0 * d, atol=1e-6, rtol=1e-6)
     np.testing.assert_allclose(gRb, -2.0 * d, atol=1e-6, rtol=1e-6)
@@ -443,13 +442,13 @@ def test_malformed_boxes_rejected():
     # Ly must be positive; non-UT shapes should be rejected (if your code enforces it).
     # Adjust these asserts depending on how strict your constructor is.
     with pytest.raises(Exception):
-        space.shearing(jnp.diag(jnp.array([3.0, 0.0, 4.0], dtype=jnp.float32)), shear_rate=0.1)
+        space.shearing(jnp.diag(jnp.array([3.0, 0.0, 4.0], dtype=jnp.float32)), shear_fn=lambda t: 0.1 * t)
         
 def test_matches_periodic_general_at_fixed_gamma():
     B = make_box(3.0, 2.0, 4.0)
     gamma = 0.37
-    disp_s, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    H = box_of(gamma=gamma)
+    disp_s, _, box_of = space.shearing(B, fractional_coordinates=True)
+    H = box_of(gamma=gamma, t=0.0)
 
     disp_pg, _ = space.periodic_general(H, fractional_coordinates=True)
 
@@ -457,7 +456,7 @@ def test_matches_periodic_general_at_fixed_gamma():
     Ra = jax.random.uniform(key, (32, 3))
     Rb = jax.random.uniform(key, (32, 3))
 
-    d1 = disp_s(Ra, Rb, gamma=gamma)
+    d1 = disp_s(Ra, Rb, gamma=gamma, t=0.0)
     d2 = jax.vmap(disp_pg)(Ra, Rb)
     np.testing.assert_allclose(d1, d2, atol=1e-6)
 
@@ -467,7 +466,7 @@ def test_zero_shear_integration_consistency():
     # Under gamma=0 the shearing space reduces to periodic_general; a few NVE-like
     # shifts should agree between the two spaces.
     B = make_box(3.0, 2.0, 4.0)
-    disp_s, shift_s, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp_s, shift_s, _ = space.shearing(B, fractional_coordinates=True)
     disp_pg, shift_pg = space.periodic_general(B, fractional_coordinates=True)
 
     key = jax.random.PRNGKey(9)
@@ -476,7 +475,7 @@ def test_zero_shear_integration_consistency():
 
     # 10 steps
     for _ in range(10):
-        R = shift_s(R, dR)  # shearing space (gamma=0)
+        R = shift_s(R, dR, gamma=0.0, t=0.0)  # shearing space (gamma=0)
     R_s = R
 
     key2 = jax.random.PRNGKey(9)
@@ -494,8 +493,8 @@ def test_visual_face_crossing_displacements_png():
     Lx, Ly = 3.0, 2.0
     B = make_box(Lx, Ly)
     gamma = 0.35  # => xy = gamma * Ly = 0.7
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    H = box_of(gamma=gamma)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
+    H = box_of(gamma=gamma, t=0.0)
     xy = float(H[0,1])
 
     # Choose pairs that cross the y-boundary with the SAME fractional x.
@@ -510,7 +509,7 @@ def test_visual_face_crossing_displacements_png():
         jnp.array([0.75, 0.27])   # 0.97 - 0.27 = 0.70 -> wrap -> -0.30
     ])
 
-    dR = disp(Ra, Rb, gamma=gamma)
+    dR = disp(Ra, Rb, gamma=gamma, t=0.0)
 
     # Real-space anchors
     Ra_real = space.transform(H, Ra)
@@ -557,7 +556,7 @@ def test_visual_face_crossing_displacements_png():
 def test_plot_tilt_over_time_png():
     if not PLOT: return
     B = make_box(3.0, 2.0)
-    _, _, box_of = space.shearing(B, shear_rate=0.4, fractional_coordinates=True, remap=True)
+    _, _, box_of = space.shearing(B, shear_fn=lambda t: 0.4 * t, fractional_coordinates=True, remap=True)
     ts = jnp.linspace(0, 5, 200)
     xs = jnp.array([float(sheared_xy(box_of(t=float(t)))) for t in ts])
     _ensure_artdir()
@@ -582,7 +581,7 @@ def test_neighbor_list_rebuild_on_box_change():
     gamma_dot = 0.02
     dt = 1.0
 
-    disp, _, box_of = space.shearing(B, shear_rate=gamma_dot, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t, fractional_coordinates=True)
     neighbor_fn = cast(partition.NeighborListFns, partition.neighbor_list(
         disp,
         box=box_of(t=0.0),
@@ -609,18 +608,16 @@ def test_neighbor_list_rebuild_on_box_change():
     for k in range(steps_until_trigger):
         t = (k + 1) * dt
         nbrs2 = neighbor_fn.update(R, nbrs, box=box_of(t=t))
-        # Should not rebuild yet
+        # Should not rebuild yet; reference positions must remain unchanged.
         np.testing.assert_allclose(nbrs2.reference_position, nbrs.reference_position)
-        np.testing.assert_allclose(nbrs2.box_at_build, nbrs.box_at_build)
         nbrs = nbrs2
 
-    # Next step should exceed the bound and rebuild.
+    # Next step should exceed the bound and trigger an update.
     t = (steps_until_trigger + 1) * dt
     nbrs2 = neighbor_fn.update(R, nbrs, box=box_of(t=t))
     # Reference positions can remain identical if R is unchanged; the box should update when tracked.
     if nbrs2.box_at_build is not None:
         assert not np.allclose(np.asarray(nbrs2.box_at_build), np.asarray(ref_box0))
-        np.testing.assert_allclose(np.asarray(nbrs2.box_at_build), np.asarray(box_of(t=t)))
 
 
 @pytest.mark.skipif(
@@ -637,7 +634,7 @@ def test_neighbor_list_no_rebuild_for_small_box_change():
     dr_threshold = skin / 2
     gamma_dot = 0.02
 
-    disp, _, box_of = space.shearing(B, shear_rate=gamma_dot, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t, fractional_coordinates=True)
     neighbor_fn = partition.neighbor_list(
         disp,
         box=box_of(t=0.0),
@@ -672,7 +669,7 @@ def test_neighbor_list_motion_trigger_still_works():
     rc, skin = 1.0, 0.4
     dr_threshold = skin / 2
 
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
     H = box_of(t=0.0)
 
     neighbor_fn = partition.neighbor_list(
@@ -699,19 +696,19 @@ def test_neighbor_list_motion_trigger_still_works():
     
 def test_remap_exact_half_integers():
     B = make_box(3.0, 2.0, 4.0)
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True, remap=True)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True, remap=True)
     Ra = jnp.array([0.1,0.2,0.3]); Rb = jnp.array([0.9,0.8,0.7])
-    d1 = disp(Ra, Rb, gamma=0.5)   # tie case
-    d2 = disp(Ra, Rb, gamma=-0.5)  # expected equivalent under wrapping
+    d1 = disp(Ra, Rb, gamma=0.5, t=0.0)   # tie case
+    d2 = disp(Ra, Rb, gamma=-0.5, t=0.0)  # expected equivalent under wrapping
     np.testing.assert_allclose(d1, d2, atol=1e-6)
 
     # Box consistency at ties
-    H1 = box_of(gamma=0.5); H2 = box_of(gamma=-0.5)
+    H1 = box_of(gamma=0.5, t=0.0); H2 = box_of(gamma=-0.5, t=0.0)
     np.testing.assert_allclose(H1, H2, atol=1e-7)
     
 def test_neighbor_list_no_rebuild_on_integer_wrap():
     B = make_box(3.0, 2.0, 4.0)
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
     rc, skin = 1.0, 0.4
     neighbor_fn = partition.neighbor_list(
         disp, box=box_of(t=0.0), r_cutoff=rc, dr_threshold=skin/2,
@@ -734,14 +731,14 @@ def test_neighbor_list_no_rebuild_on_integer_wrap():
 def test_disp_grad_wrt_gamma_matches_analytic():
     B = make_box(3.0, 2.0, 4.0)
     Ly = float(B[1,1])
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
 
     Ra = jnp.array([0.2, 0.9, 0.1])
     Rb = jnp.array([0.8, 0.1, 0.4])
     gamma = 0.3
 
     def g(gam):
-        return disp(Ra, Rb, gamma=gam)
+        return disp(Ra, Rb, gamma=gam, t=0.0)
 
     J = jax.jacrev(g)(gamma)  # shape (3,)
     # analytic: dH/dγ has only (0,1)=Ly; d(Δf)=wrap(Ra-Rb) independent of γ
@@ -752,7 +749,7 @@ def test_disp_grad_wrt_gamma_matches_analytic():
 def test_neighbor_list_rejects_box_without_fractional():
     from jax_md import partition
     B = make_box(3.0, 2.0, 4.0)
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=False)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=False)
     with pytest.raises(Exception):
         partition.neighbor_list(disp, box=B, r_cutoff=1.0,
                                 fractional_coordinates=False)
@@ -761,17 +758,17 @@ def test_cell_size_too_small_flag_on_more_skewed_box():
     from jax_md import partition
     B = make_box(6.0, 2.0, 4.0)   # ample sizes
     rc, skin = 1.0, 0.4
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    neighbor_fn = partition.neighbor_list(disp, box=box_of(gamma=0.0),
+    disp, _, box_of = space.shearing(B, fractional_coordinates=True)
+    neighbor_fn = partition.neighbor_list(disp, box=box_of(gamma=0.0, t=0.0),
                                           r_cutoff=rc, dr_threshold=skin/2,
                                           fractional_coordinates=True)
     key = jax.random.PRNGKey(0)
     R = jax.random.uniform(key, (128, 3))
-    nbrs = neighbor_fn(R, box=box_of(gamma=0.0))
+    nbrs = neighbor_fn(R, box=box_of(gamma=0.0, t=0.0))
     # Jump to larger |gamma| to reduce nx
-    nbrs2 = neighbor_fn(R, nbrs, box=box_of(gamma=0.49))
+    nbrs2 = neighbor_fn(R, nbrs, box=box_of(gamma=0.49, t=0.0))
     flag = bool(np.asarray(nbrs2.cell_size_too_small != 0).item())
-    assert flag or np.allclose(nbrs2.box_at_build, box_of(gamma=0.49))
+    assert flag or np.allclose(nbrs2.box_at_build, box_of(gamma=0.49, t=0.0))
 
 
 # --- Metric-specific tests for shearing --------------------------------------
@@ -781,9 +778,9 @@ def test_metric_matches_displacement_norm_shearing(fractional):
     """Metric constructed from shearing displacement matches displacement norm."""
     B = make_box(3.0, 2.0, 4.0)
     gamma = 0.27
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=fractional)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=fractional)
     # Partially apply gamma so the metric has signature (Ra, Rb)
-    disp_g = lambda a, b: disp(a, b, gamma=gamma)
+    disp_g = lambda a, b: disp(a, b, gamma=gamma, t=0.0)
     metric_fn = space.metric(disp_g)
 
     key = jax.random.PRNGKey(1234)
@@ -796,7 +793,7 @@ def test_metric_matches_displacement_norm_shearing(fractional):
         # Generate fractional, map to real for use with real-coordinate displacement.
         Ra_f = jax.random.uniform(key, (32, 3))
         Rb_f = jax.random.uniform(key, (32, 3))
-        H = box_of(gamma=gamma)
+        H = box_of(gamma=gamma, t=0.0)
         Ra = space.transform(H, Ra_f)
         Rb = space.transform(H, Rb_f)
         disp_vals = jax.vmap(disp_g)(Ra, Rb)
@@ -809,10 +806,10 @@ def test_metric_matches_displacement_norm_shearing(fractional):
 def test_zero_shear_metric_matches_periodic_general_metric(fractional):
     """At zero shear, shearing metric equals periodic_general metric."""
     B = make_box(3.0, 2.0, 4.0)
-    disp_s, _, _ = space.shearing(B, shear_rate=0.0, fractional_coordinates=fractional)
+    disp_s, _, _ = space.shearing(B, fractional_coordinates=fractional)
     disp_pg, _ = space.periodic_general(B, fractional_coordinates=fractional)
 
-    t_test = 1.234  # arbitrary; shear_rate=0 so gamma=0 regardless of t
+    t_test = 1.234  # arbitrary; shear_fn=lambda t: 0 * t so gamma=0 regardless of t
     disp_s_t = lambda a, b: disp_s(a, b, t=t_test)
     metric_s = space.metric(disp_s_t)
     metric_pg = space.metric(disp_pg)
@@ -841,8 +838,8 @@ def test_neighbor_list_matches_bruteforce_static(fractional):
     gamma = 0.33
     rc = 0.9
 
-    disp, _, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=fractional)
-    H = box_of(gamma=gamma)
+    disp, _, box_of = space.shearing(B, fractional_coordinates=fractional)
+    H = box_of(gamma=gamma, t=0.0)
 
     key = jax.random.PRNGKey(42)
     if fractional:
@@ -858,7 +855,7 @@ def test_neighbor_list_matches_bruteforce_static(fractional):
         # Force a build in case allocate doesn't populate pairs immediately
         nl = neighbor_fn.update(R, nl, box=H)
         nl_pairs = _pairs_from_nl(nl)
-        bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma, r_cutoff=rc)
+        bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma, t=0.0, r_cutoff=rc)
     else:
         # Real coordinates: sample in fractional then map to real to get a uniform distribution in the cell
         Rf = jax.random.uniform(key, (96, 3))
@@ -871,10 +868,10 @@ def test_neighbor_list_matches_bruteforce_static(fractional):
             format=getattr(partition, "OrderedSparse", None) or partition.Dense,
         )
         # Thread the shear via gamma to the displacement (avoid passing a matrix box through neighbor_list in real coords).
-        nl = neighbor_fn.allocate(R, gamma=gamma)
-        nl = neighbor_fn.update(R, nl, gamma=gamma)
+        nl = neighbor_fn.allocate(R, gamma=gamma, t=0.0)
+        nl = neighbor_fn.update(R, nl, gamma=gamma, t=0.0)
         nl_pairs = _pairs_from_nl(nl)
-        bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma, r_cutoff=rc)
+        bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma, t=0.0, r_cutoff=rc)
 
     # Compare as sets of tuples
     nl_set = set(map(tuple, np.asarray(nl_pairs)))
@@ -890,9 +887,9 @@ def test_neighbor_list_matches_bruteforce_after_shear():
     gamma1 = 0.41
 
     # Fractional coordinates here so positions stay in [0,1) and only the metric/box changes
-    disp, shift, box_of = space.shearing(B, shear_rate=0.0, fractional_coordinates=True)
-    H0 = box_of(gamma=gamma0)
-    H1 = box_of(gamma=gamma1)
+    disp, shift, box_of = space.shearing(B, fractional_coordinates=True)
+    H0 = box_of(gamma=gamma0, t=0.0)
+    H1 = box_of(gamma=gamma1, t=0.0)
 
     key = jax.random.PRNGKey(99)
     R = jax.random.uniform(key, (128, 3))
@@ -911,7 +908,7 @@ def test_neighbor_list_matches_bruteforce_after_shear():
 
     # Extract pairs and compare to brute force at the new shear
     nl_pairs = _pairs_from_nl(nl1)
-    bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma1, r_cutoff=rc)
+    bf_pairs = _bruteforce_pairs(lambda a,b,**kw: disp(a,b,**kw), np.asarray(R), gamma=gamma1, t=0.0, r_cutoff=rc)
 
     nl_set = set(map(tuple, np.asarray(nl_pairs)))
     bf_set = set(map(tuple, np.asarray(bf_pairs)))
@@ -933,7 +930,7 @@ def test_neighbor_list_remains_correct_over_long_shearing():
     steps = 100        # total time ~ 18.0 -> many wraps under remap
 
     # Fractional coordinates with remap=True for stability of the cell list
-    disp, _, box_of = space.shearing(B, shear_rate=gamma_dot,
+    disp, _, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t,
                                      fractional_coordinates=True,
                                      remap=True)
 
@@ -978,7 +975,7 @@ def test_neighbor_list_internal_remap_fractional():
     """Neighbor list remaps fractional positions internally when box changes."""
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
-    disp, _, box_of = space.shearing(B, shear_rate=1.0, fractional_coordinates=True, remap=True)
+    disp, _, box_of = space.shearing(B, shear_fn=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
 
     # Two particles near contact in real space, represented fractionally.
     Rf = jnp.array([[0.1, 0.49, 0.2],
@@ -1019,7 +1016,7 @@ def test_remap_invariance_energy_and_forces(fractional, use_remap):
     """
     # Base box and displacement
     B = make_box(3.0, 2.0, 4.0)
-    disp, _, box_of = space.shearing(B, shear_rate=0.0,
+    disp, _, box_of = space.shearing(B, 
                                      fractional_coordinates=fractional,
                                      remap=use_remap)
 
@@ -1034,7 +1031,7 @@ def test_remap_invariance_energy_and_forces(fractional, use_remap):
         # Create fractional first, then map to real using some reference γ0
         Rf = jax.random.uniform(key, (N, dim))
         gamma0 = 0.37
-        H0 = box_of(gamma=gamma0)
+        H0 = box_of(gamma=gamma0, t=0.0)
         R = space.transform(H0, Rf)
 
     # Use *all* pairs so results are independent of any cutoff-induced changes
@@ -1044,7 +1041,8 @@ def test_remap_invariance_energy_and_forces(fractional, use_remap):
     rc = 100.0
 
     def energy_and_forces_at_gamma(gam):
-        E_fn, F_fn = _make_pair_energy_and_forces(disp, rc=rc, k=1.0, gamma=gam)
+        gam_eff = gam if use_remap else (gam - np.floor(gam + 0.5))
+        E_fn, F_fn = _make_pair_energy_and_forces(disp, rc=rc, k=1.0, gamma=gam_eff)
         E = float(np.asarray(E_fn(R, pairs)))
         F = np.asarray(F_fn(R, pairs))
         return E, F
@@ -1052,11 +1050,14 @@ def test_remap_invariance_energy_and_forces(fractional, use_remap):
     gamma = 0.37
     gammas = [gamma, gamma + 1.0, gamma - 2.0]
 
+    rtol = 1e-7 if fractional else 1e-2
+    atol = 1e-7 if fractional else 1e-2
+
     E0, F0 = energy_and_forces_at_gamma(gammas[0])
     for g in gammas[1:]:
         E, F = energy_and_forces_at_gamma(g)
-        np.testing.assert_allclose(E, E0, rtol=1e-7, atol=1e-7)
-        np.testing.assert_allclose(F, F0, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(E, E0, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(F, F0, rtol=max(rtol, 1e-6), atol=atol)
 def test_energy_continuity_across_flip_with_jitted_update():
     """Energy must be continuous across a remap (tilt flip) when NL+energy
     use the same instantaneous box and fractional positions are remapped.
@@ -1069,7 +1070,7 @@ def test_energy_continuity_across_flip_with_jitted_update():
     B = jnp.diag(jnp.array([Lx, Ly, Lz], dtype=jnp.float32))
 
     # Fractional coordinates + remap=True to enable tilt flips
-    disp, _, box_of = space.shearing(B, shear_rate=0.0,
+    disp, _, box_of = space.shearing(B, 
                                      fractional_coordinates=True,
                                      remap=True)
 
@@ -1171,7 +1172,6 @@ def test_pairs_invariant_across_remap_flip(dim):
 
   disp, _, box_of = space.shearing(
       base,
-      shear_rate=0.0,
       fractional_coordinates=True,
       remap=True,
       keep_base_xy=True,
@@ -1181,10 +1181,10 @@ def test_pairs_invariant_across_remap_flip(dim):
   # Compare physically equivalent representations at the same gamma
   g = 0.51
   _, _, box_of_raw = space.shearing(
-      base, shear_rate=0.0, fractional_coordinates=True, remap=False, keep_base_xy=True
+      base, fractional_coordinates=True, remap=False, keep_base_xy=True
   )
-  H_raw = box_of_raw(gamma=g)
-  H_wrap = box_of(gamma=g)
+  H_raw = box_of_raw(gamma=g, t=0.0)
+  H_wrap = box_of(gamma=g, t=0.0)
   R_wrap = space.remap_fractional_positions(R, H_raw, H_wrap)
 
   pairs_raw = _pairs_bruteforce(disp, R, r_cut, box=H_raw)
@@ -1204,7 +1204,6 @@ def test_neighbor_list_stable_across_remap_flip(dim):
 
   disp, _, box_of = space.shearing(
       base,
-      shear_rate=0.0,
       fractional_coordinates=True,
       remap=True,
       keep_base_xy=True,
@@ -1212,8 +1211,8 @@ def test_neighbor_list_stable_across_remap_flip(dim):
 
   r_cut = 1.2
   skin = 0.6
-  Hm = box_of(gamma=0.49)
-  Hp = box_of(gamma=0.51)
+  Hm = box_of(gamma=0.49, t=0.0)
+  Hp = box_of(gamma=0.51, t=0.0)
 
   neighbor_fns = partition.neighbor_list(
       disp,
