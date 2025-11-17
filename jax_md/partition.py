@@ -1092,7 +1092,11 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     # Propagate last_box even if we didn't rebuild
     prev_last = getattr(nbrs, 'last_box', nbrs.box_at_build)
-    new_last = H_new if H_new is not None else prev_last
+    if H_new is not None:
+      dim = position.shape[1]
+      new_last = _as_matrix(H_new, dim)
+    else:
+      new_last = prev_last
     return dataclasses.replace(new_nl, last_box=new_last)
 
   def allocate_fn(position: Array, extra_capacity: int = 0, **kwargs):

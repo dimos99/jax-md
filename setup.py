@@ -38,6 +38,10 @@ INSTALL_REQUIRES = [
     'pymatgen'
 ]
 
+EXTRAS_REQUIRE = {
+    'hydro': [],  # For hydrodynamic interactions
+}
+
 setuptools.setup(
     name='jax-md',
     version='0.2.8',
@@ -45,6 +49,7 @@ setuptools.setup(
     author='Google',
     author_email='jax-md-dev@google.com',
     install_requires=INSTALL_REQUIRES,
+    extras_require=EXTRAS_REQUIRE,
     url='https://github.com/google/jax-md',
     packages=setuptools.find_packages(),
     download_url = "https://pypi.org/project/jax-md/",

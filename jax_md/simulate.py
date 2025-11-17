@@ -53,6 +53,7 @@ from jax_md import space
 from jax_md import dataclasses
 from jax_md import partition
 from jax_md import smap
+from jax_md.hydro import pse as hydro_pse
 
 static_cast = util.static_cast
 
@@ -1094,6 +1095,106 @@ def nvt_langevin(energy_or_force_fn: Callable[..., Array],
   return init_fn, step_fn
 
 
+def _normalize_shear_schedule(
+    shear_spec: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None]
+) -> Tuple[Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]]:
+  """Return per-plane shear callables for xy/xz/yz with zero fallbacks."""
+  def _wrap(fn):
+    if fn is None:
+      return lambda t: f32(0.0)
+    return lambda t: f32(fn(t))
+
+  if isinstance(shear_spec, dict):
+    return (
+        _wrap(shear_spec.get('xy')),
+        _wrap(shear_spec.get('xz')),
+        _wrap(shear_spec.get('yz')),
+    )
+  return _wrap(shear_spec), _wrap(None), _wrap(None)
+
+
+def _build_pair_force_helpers(
+    pair_energy_for_stress: Optional[Callable[..., Array]],
+    vol: float,
+) -> Tuple[Optional[Callable[..., Array]], Optional[Callable[[Array, Array, Dict[str, Any]], Array]]]:
+  """Return (pair_force_magnitude_fn, ik_stress_fn) helpers when stress is requested."""
+  if pair_energy_for_stress is None:
+    return None, None
+
+  def _sum_pair_energy(dr, **pkw):
+    return jnp.sum(pair_energy_for_stress(dr, **pkw))
+
+  pair_force_mag_fn = grad(_sum_pair_energy)
+
+  @jit
+  def _ik_stress_from_pairs(Rf: Array, H: Array, kwargs: Dict[str, Any]) -> Array:
+    neighbor = kwargs.get('neighbor', None)
+
+    if neighbor is None:
+      dSf = Rf[:, None, :] - Rf[None, :, :]
+      dSf = dSf - jnp.round(dSf)
+      dR = space.transform(H, dSf)
+      dr = space.distance(dR)
+
+      mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
+      dr = dr * mask
+
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * mask
+
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[..., None] + eps)
+      Fij = f_mag[..., None] * f_hat
+
+      virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
+      return virial / vol
+
+    if partition.is_sparse(neighbor.format):
+      send, recv = neighbor.idx
+      pair_mask = partition.neighbor_list_mask(neighbor)
+
+      dSf = Rf[send] - Rf[recv]
+      dSf = dSf - jnp.round(dSf)
+      dR = space.transform(H, dSf)
+      dr = space.distance(dR)
+
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * pair_mask
+
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[:, None] + eps)
+      Fij = f_mag[:, None] * f_hat
+
+      norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
+      virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
+      return virial / vol
+
+    if neighbor.format is partition.Dense:
+      idx = neighbor.idx
+      N = Rf.shape[0]
+      mask = (idx < N).astype(Rf.dtype)
+
+      Rn = Rf[idx]
+      dSf = Rf[:, None, :] - Rn
+      dSf = dSf - jnp.round(dSf)
+      dR = space.transform(H, dSf)
+      dr = space.distance(dR)
+
+      dUdR = pair_force_mag_fn(dr, **kwargs)
+      f_mag = -dUdR * mask
+
+      eps = jnp.array(1e-12, dtype=Rf.dtype)
+      f_hat = dR / (dr[..., None] + eps)
+      Fij = f_mag[..., None] * f_hat
+
+      virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
+      return virial / vol
+
+    raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
+
+  return pair_force_mag_fn, _ik_stress_from_pairs
+
+
 @dataclasses.dataclass
 class BrownianState:
   """A tuple containing state information for Brownian dynamics.
@@ -1316,116 +1417,19 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     box = box_of(t=t0)
   else:
     raise ValueError("box_of must be provided to compute stress.")
-  
+
   vol = quantity.volume(box.shape[0], box)
-  
+
   # Ensure `dt` is a static JAX scalar with the right dtype.
   _dt = f32(dt)
   t0 = f32(t0)
-  
-  
-  # Normalize `shear_fn` into per-plane callables (zeros for missing planes).
-  if isinstance(shear_fn, dict): #< Then, we have per-plane functions.
-    sf_xy = shear_fn.get('xy', lambda t: f32(0.0))
-    sf_xz = shear_fn.get('xz', lambda t: f32(0.0))
-    sf_yz = shear_fn.get('yz', lambda t: f32(0.0))
-  else: #< Single function, applies to 'xy' plane by convention.
-    sf_xy = shear_fn
-    sf_xz = lambda t: f32(0.0)
-    sf_yz = lambda t: f32(0.0)
-  
-  # Optional pairwise force magnitude function for Irving–Kirkwood stress.
-  pair_force_mag_fn = None
-  if pair_energy_for_stress is not None:
-    def _sum_pair_energy(dr, **pkw):
-      """Sum of pair energies for a set of pair distances.
-      Assumes dr has shape (...,) and returns a scalar.
-      That's basically the total potential energy of the system as a function
-      of all the pair distances.
-      """
-      return jnp.sum(pair_energy_for_stress(dr, **pkw))
-    pair_force_mag_fn = grad(_sum_pair_energy)
 
-  @jit
-  def _ik_stress_from_pairs(Rf: Array, H: Array, kwargs: Dict[str, Any]) -> Array:
-    """Compute IK stress via pairwise forces and displacements.
 
-    Supports neighbor lists when provided via kwargs['neighbor'].
-    Expects Rf fractional coordinates and H the current real-space box.
-    """
-    assert pair_force_mag_fn is not None
-
-    neighbor = kwargs.get('neighbor', None) #< Optional neighbor list.
-
-    if neighbor is None:
-      # Dense all-pairs path (O(N^2)).
-      dSf = Rf[:, None, :] - Rf[None, :, :] # Displacements in fractional coords.
-      dSf = dSf - jnp.round(dSf)          # Apply PBCs.
-      dR  = space.transform(H, dSf) # Convert to real coords; (N, N, d)
-      dr  = space.distance(dR)      # Convert to real pairwise distances; (N, N)
-
-      # Mask diagonal to avoid self interactions.
-      mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
-      dr = dr * mask # The diagonal is now zero and won't contribute.
-
-      # f_mag = -dU/dr elementwise.
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * mask 
-
-      # Unit vectors; safe divide.
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[..., None] + eps)
-      Fij = f_mag[..., None] * f_hat            # (N, N, d)
-
-      virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
-      return virial / vol
-
-    # Neighbor list present.
-    if partition.is_sparse(neighbor.format):
-      send, recv = neighbor.idx
-      pair_mask = partition.neighbor_list_mask(neighbor) # Gets rid of sentinels
-
-      dSf = Rf[send] - Rf[recv] # Only the listed pairs.
-      dSf = dSf - jnp.round(dSf) # Apply PBCs.
-      dR  = space.transform(H, dSf) # Convert to real coords; (B, d)
-      dr  = space.distance(dR)      #  Convert to real pairwise distances; (B,)
-
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * pair_mask
-
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[:, None] + eps)
-      Fij = f_mag[:, None] * f_hat               # (B, d)
-
-      # OrderedSparse counts each pair once; Sparse counts each twice.
-      norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
-      virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
-      return virial / vol
-    
-    elif neighbor.format is partition.Dense:
-      # Dense neighbor list format. Avoid, since it's numerically heavy.
-      idx = neighbor.idx                            # (N, max_nbrs)
-      N = Rf.shape[0]
-      mask = (idx < N).astype(Rf.dtype)            # (N, max_nbrs)
-
-      Rn = Rf[idx]                                  # (N, max_nbrs, d)
-      dSf = Rf[:, None, :] - Rn
-      dSf = dSf - jnp.round(dSf)
-      dR  = space.transform(H, dSf)                 # (N, max_nbrs, d)
-      dr  = space.distance(dR)                      # (N, max_nbrs)
-
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * mask
-
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[..., None] + eps)
-      Fij = f_mag[..., None] * f_hat                # (N, max_nbrs, d)
-
-      virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
-      return virial / vol
-    
-    else:
-      raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
+  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_fn)
+  pair_force_mag_fn, _ik_stress_from_pairs = _build_pair_force_helpers(
+      pair_energy_for_stress,
+      vol,
+  )
 
   @jit
   def init_fn(key, R, **kwargs):
@@ -1577,6 +1581,378 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     new_state = canonicalize_mobility(new_state)
     return new_state
   
+  return init_fn, apply_fn
+
+
+@dataclasses.dataclass
+class RPYState:
+  """State for Ewald/Rotne-Prager–Yamakawa Brownian dynamics."""
+  position: Array
+  mobility_position: Array
+  ewald_state: hydro_ewald.EwaldState
+  rng: Array
+
+
+@dataclasses.dataclass
+class ShearedRPYState:
+  """State for Ewald RPY dynamics under shear."""
+  position: Array
+  mobility_position: Array
+  ewald_state: hydro_ewald.EwaldState
+  rng: Array
+  time: float
+  force: Array
+  stress: Optional[Array] = None
+
+
+def rpy(space_fns: Tuple[Callable, ...],
+        energy_or_force: Callable[..., Array],
+        dt: float,
+        kT: float,
+        *,
+        a: float,
+        xi: float,
+        eta: float,
+        Mr_params: Optional[Dict[str, Any]] = None,
+        Mw_params: Optional[Dict[str, Any]] = None,
+        rcut: Optional[float] = None,
+        P: Optional[int] = None,
+        Mgrid: Optional[int] = None,
+        theta: Optional[float] = None,
+        mr_iters: int = 10,
+        real_space_first: bool = True) -> Simulator:
+  """Brownian dynamics with hydrodynamic interactions via Spectral Ewald."""
+  if len(space_fns) < 2:
+    raise ValueError("space_fns must contain displacement and shift functions.")
+
+  # Unpack space functions and optional box function for real<->fractional transforms.
+  displacement_fn, shift_fn = space_fns[:2]
+  box_fn = space_fns[2] if len(space_fns) > 2 else None
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  (_dt,) = static_cast(dt)
+
+  Mw_params_local = dict(Mw_params) if Mw_params is not None else {}
+  if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
+    Mw_params_local['fused_wave'] = True
+
+  ewald_init, ewald_apply = hydro_ewald.build_ewald_mobility(
+      space_fns,
+      a,
+      xi,
+      eta,
+      Mr_params=Mr_params,
+      Mw_params=Mw_params_local,
+      rcut=rcut,
+      P=P,
+      Mgrid=Mgrid,
+      theta=theta,
+      real_space_first=real_space_first,
+  )
+
+  def init_fn(key, R, **kwargs):
+    mobility_position = jnp.asarray(R)
+    ewald_state = ewald_init(mobility_position, **kwargs)
+    box_matrix = ewald_state.real.box_matrix
+    position_real = space.transform(box_matrix, mobility_position)
+    return RPYState(position=position_real,
+                    mobility_position=mobility_position,
+                    ewald_state=ewald_state,
+                    rng=key)
+
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    _kT = step_kwargs.pop('kT', kT)
+    _mr_iters = step_kwargs.pop('mr_iters', mr_iters)
+
+    R_mobility = state.mobility_position
+    R_real = state.position
+    ewald_state = state.ewald_state
+    key = state.rng
+
+    force = force_fn(R_mobility, **step_kwargs)
+    apply_with_brownian = getattr(ewald_apply, 'with_brownian', None)
+    if apply_with_brownian is not None:
+      key, brownian_key = random.split(key)
+      velocities, dB, ewald_state = apply_with_brownian(
+          ewald_state,
+          R_mobility,
+          force,
+          brownian_key,
+          kT=_kT,
+          dt=_dt,
+          mr_iters=_mr_iters,
+          **step_kwargs,
+      )
+    else:
+      velocities, ewald_state = ewald_apply(ewald_state, R_mobility, force, **step_kwargs)
+      key, noise_key = random.split(key)
+      dB = hydro_ewald.brownian_increment(
+          noise_key, ewald_state, R_mobility, kT=_kT, dt=_dt, mr_iters=_mr_iters
+      )
+    # Combine deterministic and stochastic increments consistently in REAL coordinates.
+    # periodic_general with fractional_coordinates=True expects REAL displacement.
+    # NOTE: Ewald mobility already returns velocities and dB in real coordinates,
+    # so no transformation is needed.
+    displacement_real = _dt * velocities + dB
+    R_mobility = shift_fn(R_mobility, displacement_real, **step_kwargs)
+    R_real = R_real + displacement_real
+
+    return RPYState(position=R_real,
+                    mobility_position=R_mobility,
+                    ewald_state=ewald_state,
+                    rng=key)
+
+  return init_fn, apply_fn
+
+
+def rpy_with_shear(space_fns: Tuple[Callable, ...],
+                   energy_or_force: Callable[..., Array],
+                   dt: float,
+                   kT: float,
+                   *,
+                   a: float,
+                   xi: float,
+                   eta: float,
+                   shear_fn: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]]],
+                   t0: float = 0.0,
+                   fractional_position: bool = True,
+                   remap: bool = True,
+                   pair_energy_for_stress: Optional[Callable[..., Array]] = None,
+                   Mr_params: Optional[Dict[str, Any]] = None,
+                   Mw_params: Optional[Dict[str, Any]] = None,
+                   rcut: Optional[float] = None,
+                   P: Optional[int] = None,
+                   Mgrid: Optional[int] = None,
+                   theta: Optional[float] = None,
+                   mr_iters: int = 10,
+                   real_space_first: bool = True) -> Simulator:
+  """Spectral-Ewald RPY dynamics with the shearing box utilities."""
+  if len(space_fns) < 3:
+    raise ValueError(
+        "rpy_with_shear expects (displacement, shift, box_of) from space.shearing."
+    )
+
+  _, shift_fn, box_of = space_fns[:3]
+  force_fn = quantity.canonicalize_force(energy_or_force)
+
+  _dt = f32(dt)
+  t0 = f32(t0)
+
+  box = box_of(t=t0)
+  vol = quantity.volume(box.shape[0], box)
+  dim = box.shape[0]
+
+  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_fn)
+  pair_force_mag_fn, _ik_stress_from_pairs = _build_pair_force_helpers(
+      pair_energy_for_stress,
+      vol,
+  )
+
+  Mw_params_local = dict(Mw_params) if Mw_params is not None else {}
+  if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
+    Mw_params_local['fused_wave'] = True
+
+  ewald_init, ewald_apply = hydro_ewald.build_ewald_mobility(
+      space_fns,
+      a,
+      xi,
+      eta,
+      Mr_params=Mr_params,
+      Mw_params=Mw_params_local,
+      rcut=rcut,
+      P=P,
+      Mgrid=Mgrid,
+      theta=theta,
+      real_space_first=real_space_first,
+  )
+
+  def _reduced_shear(time):
+    gamma_xy = f32(sf_xy(time))
+    if dim >= 3:
+      gamma_xz = f32(sf_xz(time))
+      gamma_yz = f32(sf_yz(time))
+    else:
+      gamma_xz = gamma_yz = f32(0.0)
+    if remap:
+      m_xy = jnp.floor(gamma_xy + 0.5)
+      if dim >= 3:
+        m_xz = jnp.floor(gamma_xz + 0.5)
+        m_yz = jnp.floor(gamma_yz + 0.5)
+      else:
+        m_xz = m_yz = f32(0.0)
+      return (
+          gamma_xy - m_xy,
+          gamma_xz - m_xz,
+          gamma_yz - m_yz,
+          m_xy.astype(jnp.int32),
+          m_xz.astype(jnp.int32),
+          m_yz.astype(jnp.int32),
+      )
+    return (
+        gamma_xy,
+        gamma_xz,
+        gamma_yz,
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(0, dtype=jnp.int32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+
+  def init_fn(key, R, **kwargs):
+    mobility_position = jnp.asarray(R)
+    shear_kwargs = dict(kwargs)
+
+    curr_xy, curr_xz, curr_yz, _, _, _ = _reduced_shear(t0)
+    if dim >= 3:
+      shear_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
+    else:
+      shear_kwargs['gamma'] = curr_xy
+
+    ewald_state = ewald_init(mobility_position, **shear_kwargs)
+    F0 = force_fn(mobility_position, **shear_kwargs)
+
+    if pair_force_mag_fn is not None:
+      H0 = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
+            if dim >= 3 else box_of(gamma=curr_xy))
+      if fractional_position:
+        Rf0 = mobility_position
+      else:
+        Rf0 = space.transform(jnp.linalg.inv(H0), mobility_position)
+      stress0 = _ik_stress_from_pairs(Rf0, H0, shear_kwargs)
+    else:
+      stress0 = None
+
+    if fractional_position:
+      box_matrix0 = ewald_state.real.box_matrix
+      position_real0 = space.transform(box_matrix0, mobility_position)
+    else:
+      position_real0 = mobility_position
+
+    return ShearedRPYState(position=position_real0,
+                           mobility_position=mobility_position,
+                           ewald_state=ewald_state,
+                           rng=key,
+                           time=t0,
+                           force=F0,
+                           stress=stress0)
+
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    _kT = step_kwargs.pop('kT', kT)
+    _mr_iters = step_kwargs.pop('mr_iters', mr_iters)
+
+    mobility_position = state.mobility_position
+    position_real = state.position
+    ewald_state = state.ewald_state
+    key = state.rng
+    time = state.time
+
+    if remap:
+      prev_xy = f32(sf_xy(time))
+      curr_xy = f32(sf_xy(time + _dt))
+      if mobility_position.shape[1] >= 3:
+        prev_xz = f32(sf_xz(time)); curr_xz = f32(sf_xz(time + _dt))
+        prev_yz = f32(sf_yz(time)); curr_yz = f32(sf_yz(time + _dt))
+      else:
+        prev_xz = curr_xz = prev_yz = curr_yz = f32(0.0)
+
+      m_prev_xy = jnp.floor(prev_xy + 0.5); m_curr_xy = jnp.floor(curr_xy + 0.5)
+      m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
+      if mobility_position.shape[1] >= 3:
+        m_prev_xz = jnp.floor(prev_xz + 0.5); m_curr_xz = jnp.floor(curr_xz + 0.5)
+        m_prev_yz = jnp.floor(prev_yz + 0.5); m_curr_yz = jnp.floor(curr_yz + 0.5)
+        m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
+        m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
+      else:
+        m_xz = m_yz = jnp.array(0, dtype=jnp.int32)
+
+      curr_xy = curr_xy - m_curr_xy
+      if mobility_position.shape[1] >= 3:
+        curr_xz = curr_xz - m_curr_xz
+        curr_yz = curr_yz - m_curr_yz
+
+      if fractional_position:
+        if mobility_position.shape[1] >= 3:
+          mxy = jnp.asarray(m_xy, mobility_position.dtype)
+          mxz = jnp.asarray(m_xz, mobility_position.dtype)
+          myz = jnp.asarray(m_yz, mobility_position.dtype)
+          def _apply_3d_remap(Rin):
+            add_x = mxy * Rin[:, 1] + (mxz + mxy * myz) * Rin[:, 2]
+            add_y = myz * Rin[:, 2]
+            Rout = Rin.at[:, 0].add(add_x).at[:, 1].add(add_y)
+            return jnp.mod(Rout, 1.0)
+          any_flip = jnp.not_equal(m_xy, 0) | jnp.not_equal(m_xz, 0) | jnp.not_equal(m_yz, 0)
+          mobility_position = lax.cond(any_flip, _apply_3d_remap, lambda Rin: Rin, mobility_position)
+        else:
+          mxy = jnp.asarray(m_xy, mobility_position.dtype)
+          def _apply_2d_remap(Rin):
+            Rout = Rin.at[:, 0].add(mxy * Rin[:, 1])
+            return jnp.mod(Rout, 1.0)
+          any_flip = jnp.not_equal(m_xy, 0)
+          mobility_position = lax.cond(any_flip, _apply_2d_remap, lambda Rin: Rin, mobility_position)
+    else:
+      curr_xy = f32(sf_xy(time + _dt))
+      if mobility_position.shape[1] >= 3:
+        curr_xz = f32(sf_xz(time + _dt))
+        curr_yz = f32(sf_yz(time + _dt))
+      else:
+        curr_xz = curr_yz = f32(0.0)
+
+    if mobility_position.shape[1] >= 3:
+      step_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
+    else:
+      step_kwargs['gamma'] = curr_xy
+
+    force = force_fn(mobility_position, **step_kwargs)
+
+    if mobility_position.shape[1] >= 3:
+      current_box = box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
+    else:
+      current_box = box_of(gamma=curr_xy)
+
+    if pair_force_mag_fn is not None:
+      H = current_box
+      if fractional_position:
+        Rf = mobility_position
+      else:
+        Rf = space.transform(jnp.linalg.inv(H), mobility_position)
+      stress = _ik_stress_from_pairs(Rf, H, step_kwargs)
+    else:
+      stress = None
+
+    apply_with_brownian = getattr(ewald_apply, 'with_brownian', None)
+    if apply_with_brownian is not None:
+      key, brownian_key = random.split(key)
+      velocities, dB, ewald_state = apply_with_brownian(
+          ewald_state,
+          mobility_position,
+          force,
+          brownian_key,
+          kT=_kT,
+          dt=_dt,
+          mr_iters=_mr_iters,
+          **step_kwargs,
+      )
+    else:
+      velocities, ewald_state = ewald_apply(ewald_state, mobility_position, force, **step_kwargs)
+      key, noise_key = random.split(key)
+      dB = hydro_ewald.brownian_increment(
+          noise_key, ewald_state, mobility_position, kT=_kT, dt=_dt, mr_iters=_mr_iters
+      )
+    displacement = _dt * velocities + dB
+    mobility_position = shift_fn(mobility_position, displacement, **step_kwargs)
+    if fractional_position:
+      position_real = space.transform(current_box, mobility_position)
+    else:
+      position_real = mobility_position
+
+    return ShearedRPYState(position=position_real,
+                           mobility_position=mobility_position,
+                           ewald_state=ewald_state,
+                           rng=key,
+                           time=time + _dt,
+                           force=force,
+                           stress=stress)
+
   return init_fn, apply_fn
 
 
