@@ -18,7 +18,18 @@ from typing import Iterable, Union, Optional, Any
 
 import jax
 from jax.tree_util import register_pytree_node
-from jax.lib import xla_bridge
+try:
+  # Prefer the new JAX API if available (jax.extend.backend.get_backend).
+  # This import path exists in JAX >= 0.8.0.
+  from jax.extend import backend as _jax_backend_module
+except Exception:  # pragma: no cover - old JAXs
+  _jax_backend_module = None
+
+try:
+  # Fallback for older JAX versions.
+  from jax.lib import xla_bridge as _xla_bridge_module
+except Exception:  # pragma: no cover - very old JAX
+  _xla_bridge_module = None
 import jax.numpy as jnp
 from jax import jit
 
@@ -53,7 +64,21 @@ def check_custom_simulation_type(x: Any) -> bool:
 def static_cast(*xs):
   """Function to cast a value to the lowest dtype that can express it."""
   # NOTE(schsam): static_cast is so named because it cannot be jit.
-  if xla_bridge.get_backend().platform == 'tpu':
+  # Prefer the extend backend API when available, but keep compatibility.
+  def _get_backend():
+    if _jax_backend_module is not None:
+      try:
+        return _jax_backend_module.get_backend()
+      except Exception:
+        # Fall back to xla_bridge if the new getter fails.
+        pass
+    if _xla_bridge_module is not None:
+      return _xla_bridge_module.get_backend()
+
+    # If both new and old backend getters are unavailable, raise a clear error.
+    raise RuntimeError('Could not determine JAX backend')
+
+  if _get_backend().platform == 'tpu':
     return (jnp.array(x, jnp.float32) for x in xs)
   else:
     return (jnp.array(x, dtype=onp.min_scalar_type(x)) for x in xs)
