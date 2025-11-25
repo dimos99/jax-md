@@ -26,7 +26,8 @@ from jax import config as jax_config
 from typing import Callable, Optional, Tuple
 from functools import partial
 
-from jax_md import dataclasses, partition, space
+from jax_md import dataclasses, partition, space, smap
+from jax import ops
 
 
 # Reused constants
@@ -444,6 +445,7 @@ def _build_mr_core(
         receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
         senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
 
+        # Compute separations for all lattice images
         xi_vec = x_real[receivers][:, None, :]
         xj = x_real[senders][:, None, :]
         lattice = lattice_vecs[None, :, :]
@@ -470,7 +472,7 @@ def _build_mr_core(
 
         prefactor = jnp.asarray(1.0 / (6.0 * jnp.pi * eta * a), dtype=dtype)
 
-        # Fused mobility-force contraction to avoid materializing Mr_blocks tensor.
+        # Fused mobility-force contraction.
         # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
         #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
         forces_senders = forces[senders][:, None, :]
@@ -481,8 +483,9 @@ def _build_mr_core(
         )
         contrib_i = contrib_i.sum(axis=1)
 
+
         velocities = self_term * forces
-        velocities = velocities.at[receivers].add(contrib_i)
+        velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
 
         if include_ordered_backflow:
             forces_receivers = forces[receivers][:, None, :]
@@ -492,7 +495,7 @@ def _build_mr_core(
                 (F2 - F1)[..., None] * rhat_dot_f_back[..., None] * rhat
             )
             contrib_j = contrib_j.sum(axis=1)
-            velocities = velocities.at[senders].add(contrib_j)
+            velocities = velocities + ops.segment_sum(contrib_j, senders, N)
 
         return velocities
 
@@ -574,7 +577,6 @@ def build_Mr_apply(
         format=neighbor_format,
     )
 
-    neighbor_update = jax.jit(neighbor_fn.update)
     rcut2 = float(rcut * rcut)
     core_fn = _build_mr_core(a, xi, eta, rcut2, neighbor_format)
 
@@ -585,10 +587,23 @@ def build_Mr_apply(
             svals = np.linalg.svd(box_np, compute_uv=False)
             sigma_min = float(np.min(svals))
             safe_sigma = max(sigma_min, 1e-12)
-            extent_val = int(np.ceil(rcut / safe_sigma + lattice_extra))
+
+            # Ratio of cutoff to smallest box scale.
+            ratio = float(rcut) / safe_sigma
+
+            # Base extent from geometric ratio.
+            base_extent = int(np.ceil(ratio)) if ratio > 0.0 else 0
+
+            # For rcut much smaller than the box, a single shell of images is
+            # sufficient in typical periodic setups. Cap to at most one shell
+            # unless rcut is comparable to the box size.
+            if ratio < 1.0:
+                extent_val = min(base_extent, 1)
+            else:
+                extent_val = base_extent
         else:
             extent_val = int(lattice_extent)
-        extent_val = max(extent_val, 0)
+
         lattice_np, zero_idx = _generate_lattice_hypercube(dim, extent_val)
         lattice = jnp.asarray(lattice_np, dtype=jnp.int32)
         return lattice, zero_idx
@@ -640,39 +655,25 @@ def build_Mr_apply(
         if neighbor_override is None:
             if state.neighbors is None:
                 raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
-            updated = neighbor_update(positions_frac, state.neighbors, **neighbor_kwargs)
+            # Use the built-in NeighborList.update() method
+            updated = state.neighbors.update(positions_frac, **neighbor_kwargs)
 
-            overflow_flag = updated.did_buffer_overflow
-            cell_small_flag = updated.cell_size_too_small
-            malformed_flag = updated.malformed_box
-
+            # Check for errors using NeighborList properties
             try:
-                overflow_py = bool(np.asarray(overflow_flag))
-                cell_small_py = bool(np.asarray(cell_small_flag))
-                malformed_py = bool(np.asarray(malformed_flag))
+                overflow_py = bool(np.asarray(updated.did_buffer_overflow))
+                cell_small_py = bool(np.asarray(updated.cell_size_too_small))
+                malformed_py = bool(np.asarray(updated.malformed_box))
             except (TypeError, jax_errors.TracerArrayConversionError, jax_errors.TracerBoolConversionError):
-                failure = jnp.logical_or(
-                    jnp.logical_or(
-                        jnp.asarray(overflow_flag, dtype=bool),
-                        jnp.asarray(cell_small_flag, dtype=bool),
-                    ),
-                    jnp.asarray(malformed_flag, dtype=bool),
-                )
-
+                # In JIT context, can't reallocate; just use updated neighbor list
+                # The error flags will be set in the returned state for inspection
                 # DEBUG CALLBACK DISABLED FOR GPU COMPATIBILITY
                 # The callback causes GPU-to-CPU transfer issues
                 # Instead, we rely on silent overflow handling
-                # def _raise_if_failure(flag):
-                #     if bool(np.asarray(flag)):
-                #         raise RuntimeError(
-                #             "Neighbor list update overflowed capacity during JIT-compiled dynamics. "
-                #             "Increase extra_capacity or dr_threshold."
-                #         )
-                # jax.debug.callback(_raise_if_failure, failure)
                 neighbors = updated
             else:
+                # Outside JIT: reallocate if any error occurred
                 if overflow_py or cell_small_py or malformed_py:
-                    neighbors = neighbor_fn.allocate(positions_frac, int(extra_capacity), **kwargs)
+                    neighbors = neighbor_fn.allocate(positions_frac, int(extra_capacity), **neighbor_kwargs)
                 else:
                     neighbors = updated
         else:

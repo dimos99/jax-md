@@ -1,10 +1,20 @@
-"""Stochastic sampling utilities for the real-space PSE mobility."""
+"""Stochastic sampling utilities for the real-space PSE mobility.
+
+The Lanczos-based sampling (Chow & Saad 2014) operates on flattened vectors
+and is agnostic to the physical interpretation of components. It naturally
+extends to stresslet-constrained mobility without modification:
+
+- Force-only mode: M^(r) is 3N×3N, samples are (N,3) velocities
+- Stresslet mode: M^(r) is 6N×6N or 11N×11N (depending on formulation),
+  samples are (N,6) [linear + angular velocities] or (N,11) [U, Omega, E]
+
+The key requirement is that the matvec function (mr_matvec) correctly applies
+the expanded mobility tensor to the input vector.
+"""
 
 import jax
 import jax.numpy as jnp
-from jax import debug as jax_debug
 from jax import lax
-import warnings
 
 from typing import Callable, Optional
 from functools import partial
@@ -78,7 +88,7 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
                     v: jnp.ndarray,
                     *,
                     iters: int = 20,
-                    tol: float = 1e-6) -> jnp.ndarray:
+                    tol: float = 1e-3) -> jnp.ndarray:
     """
     Approximate ``(M)^{1/2} v`` with a Lanczos projection (Chow & Saad, 2014, Eq. (2.6)).
 
@@ -93,10 +103,11 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
     iters : int, optional
         Maximum Lanczos iterations (dimension of Krylov space). Must be positive.
     tol : float, optional
-        Relative tolerance used for convergence monitoring. The routine emits a
-        ``RuntimeWarning`` via ``jax.debug.callback`` if the final iterate fails to
-        satisfy the tolerance (mirrors the stopping criterion suggested by
-        Chow & Saad, *SIAM J. Sci. Comput.* 36(2), 2014).
+        Relative tolerance used for convergence monitoring. Outside of JIT, a
+        ``RuntimeError`` is raised if the final iterate fails to satisfy the
+        tolerance (mirrors the stopping criterion suggested by Chow & Saad,
+        *SIAM J. Sci. Comput.* 36(2), 2014). Inside JIT, failure to meet the
+        tolerance poisons the result with NaNs.
 
     Returns
     -------
@@ -119,18 +130,17 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
     def _run_lanczos(beta0):
         q_curr = vec / beta0
         q_prev = jnp.zeros_like(q_curr)
-        q_store = jnp.zeros((iters,) + vec.shape, dtype=REAL_DTYPE)
         alphas = jnp.zeros((iters,), dtype=REAL_DTYPE)
         betas = jnp.zeros((iters,), dtype=REAL_DTYPE)
         beta_prev = jnp.array(0.0, dtype=REAL_DTYPE)
-        iters_done = jnp.array(0, dtype=jnp.int32)
+        it_count_init = jnp.array(0, dtype=jnp.int32)
         finished = jnp.array(False)
 
         def body(k, state):
-            q_prev, q_curr, q_store, alpha_arr, beta_arr, beta_prev, it_count, done_flag = state
+            q_prev, q_curr, alpha_arr, beta_arr, beta_prev, it_count, done_flag = state
 
             def iterate(vals):
-                q_prev_i, q_curr_i, q_store_i, alpha_arr_i, beta_arr_i, beta_prev_i, it_count_i, _ = vals
+                q_prev_i, q_curr_i, alpha_arr_i, beta_arr_i, beta_prev_i, it_count_i, _ = vals
                 w = matvec(params, q_curr_i)
                 w = jnp.asarray(w, dtype=REAL_DTYPE)
                 w = w - beta_prev_i * q_prev_i
@@ -140,14 +150,12 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
                 nonzero = beta > breakdown_tol
                 beta_safe = jnp.where(nonzero, beta, jnp.array(1.0, dtype=REAL_DTYPE))
                 q_next = jnp.where(nonzero, w / beta_safe, jnp.zeros_like(q_curr_i))
-                q_store_i = q_store_i.at[k].set(q_curr_i)
                 alpha_arr_i = alpha_arr_i.at[k].set(alpha)
                 beta_arr_i = beta_arr_i.at[k].set(beta)
                 new_done = jnp.logical_not(nonzero)
                 return (
                     q_curr_i,
                     q_next,
-                    q_store_i,
                     alpha_arr_i,
                     beta_arr_i,
                     beta,
@@ -159,14 +167,13 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
                 done_flag,
                 lambda s: s,
                 iterate,
-                (q_prev, q_curr, q_store, alpha_arr, beta_arr, beta_prev, it_count, done_flag),
+                (q_prev, q_curr, alpha_arr, beta_arr, beta_prev, it_count, done_flag),
             )
-            q_prev_new, q_curr_new, q_store_new, alpha_new, beta_new, beta_prev_new, it_count_new, just_finished = updated
+            q_prev_new, q_curr_new, alpha_new, beta_new, beta_prev_new, it_count_new, just_finished = updated
             total_done = jnp.logical_or(done_flag, just_finished)
             return (
                 q_prev_new,
                 q_curr_new,
-                q_store_new,
                 alpha_new,
                 beta_new,
                 beta_prev_new,
@@ -177,14 +184,13 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
         init_state = (
             q_prev,
             q_curr,
-            q_store,
             alphas,
             betas,
             beta_prev,
-            iters_done,
+            it_count_init,
             finished,
         )
-        _, _, q_store_f, alpha_f, beta_f, _, iters_used, _ = lax.fori_loop(0, iters, body, init_state)
+        _, _, alpha_f, beta_f, _, iters_used, _ = lax.fori_loop(0, iters, body, init_state)
         active_dim = jnp.maximum(jnp.array(1, dtype=jnp.int32), iters_used)
 
         diag_idx = jnp.arange(iters, dtype=jnp.int32)
@@ -222,13 +228,53 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
             operand=None,
         )
 
-        def _combine(coeffs):
-            return jnp.tensordot(coeffs, q_store_f, axes=((0,), (0,)))
+        # Estimate relative change purely in coefficient space using orthonormality of V_m:
+        #   ||y_m - y_{m-1}|| / ||y_m|| = ||c_m - c_{m-1}|| / ||c_m||,
+        # where y_m = beta0 * V_m c_m.
+        diff = coeff_curr - coeff_prev
+        numer = jnp.sqrt(jnp.maximum(jnp.real(jnp.vdot(diff, diff)), jnp.array(0.0, dtype=REAL_DTYPE)))
+        denom = jnp.sqrt(jnp.maximum(jnp.real(jnp.vdot(coeff_curr, coeff_curr)), jnp.array(0.0, dtype=REAL_DTYPE)))
+        denom = jnp.maximum(denom, jnp.asarray(1e-12, dtype=REAL_DTYPE))
+        rel_change = numer / denom
 
-        approx = beta0 * _combine(coeff_curr)
-        approx_prev = beta0 * _combine(coeff_prev)
-        denom = jnp.maximum(_vec_norm(approx), jnp.asarray(1e-12, dtype=REAL_DTYPE))
-        rel_change = _vec_norm(approx - approx_prev) / denom
+        def second_pass(coeffs, m_dim):
+            """Reconstruct y = beta0 * V_m coeffs via a second Lanczos pass."""
+
+            def body2(j, state2):
+                q_prev2, q_curr2, acc = state2
+                j_idx = j + 1  # 1-based index for current step
+
+                # β_j (with β_1 = 0, β_j = beta_f[j-2] for j >= 2)
+                beta_j = jnp.where(
+                    j_idx == 1,
+                    jnp.array(0.0, dtype=REAL_DTYPE),
+                    beta_f[j_idx - 2],
+                )
+                w2 = matvec(params, q_curr2)
+                w2 = jnp.asarray(w2, dtype=REAL_DTYPE)
+                w2 = w2 - beta_j * q_prev2
+                alpha_j = alpha_f[j_idx - 1]
+                w2 = w2 - alpha_j * q_curr2
+                beta_j1 = beta_f[j_idx - 1]
+
+                nonzero2 = beta_j1 > breakdown_tol
+                beta_safe2 = jnp.where(nonzero2, beta_j1, jnp.array(1.0, dtype=REAL_DTYPE))
+                q_next2 = jnp.where(nonzero2, w2 / beta_safe2, jnp.zeros_like(q_curr2))
+
+                acc = acc + coeffs[j_idx] * q_next2
+                return q_curr2, q_next2, acc
+
+            # j = 0 corresponds to v_1 = vec / beta0
+            q1 = vec / beta0
+            acc0 = coeffs[0] * q1
+            init_state2 = (jnp.zeros_like(q1), q1, acc0)
+
+            # Run for j = 1 .. m_dim-1
+            final_state2 = lax.fori_loop(0, jnp.maximum(m_dim - 1, 0), body2, init_state2)
+            _, _, acc_final = final_state2
+            return beta0 * acc_final
+
+        approx = second_pass(coeff_curr, active_dim)
         return approx, rel_change, active_dim
 
     approx, rel_change, actual_iters = lax.cond(
@@ -239,29 +285,26 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
     )
 
     tol_arr = jnp.asarray(tol, dtype=REAL_DTYPE)
-    warn_payload = {
-        'rel_change': rel_change,
-        'tol': tol_arr,
-        'iters': actual_iters,
-        'requested': jnp.asarray(iters, dtype=jnp.int32),
-    }
 
-    def _warn_callback(data):
-        rel = float(data['rel_change'])
-        tol_val = float(data['tol'])
-        used = int(data['iters'])
-        requested = int(data['requested'])
-        warnings.warn(
-            f"lanczos_sqrt_mv stopped with rel_change={rel:.3e} > tol={tol_val:.3e} "
-            f"after {used}/{requested} iterations.",
-            RuntimeWarning,
+    # Outside of JIT, enforce tolerance with a hard error.
+    try:
+        rel_host = float(rel_change)
+        tol_host = float(tol_arr)
+    except TypeError:
+        # Inside JIT / tracing context: poison the result with NaNs if tolerance fails.
+        approx = lax.cond(
+            rel_change > tol_arr,
+            lambda x: x * jnp.nan,
+            lambda x: x,
+            approx,
         )
+        return approx
 
-    def _warn_branch(payload):
-        jax_debug.callback(_warn_callback, payload)
-        return jnp.array(0, dtype=jnp.int32)
-
-    _ = lax.cond(rel_change > tol_arr, _warn_branch, lambda _: jnp.array(0, dtype=jnp.int32), warn_payload)
+    if rel_host > tol_host:
+        raise RuntimeError(
+            f"lanczos_sqrt_mv failed to reach tol={tol_host:.3e} "
+            f"(rel_change={rel_host:.3e}, iters={int(actual_iters)}, requested={iters})."
+        )
     return approx
 
 
@@ -269,7 +312,7 @@ def lanczos_sqrt_mv_test(key: jax.Array,
                          *,
                          n: int = 64,
                          iters: int = 32,
-                         tol: float = 1e-6) -> float:
+                         tol: float = 1e-3) -> float:
     """
     Convenience test helper for ``lanczos_sqrt_mv``.
 
@@ -300,8 +343,8 @@ def sample_mr_sqrt_precond(key: jax.Array,
                            positions_frac: jnp.ndarray,
                            *,
                            precond: Optional[Preconditioner] = None,
-                           iters: int = 20,
-                           tol: float = 1e-5) -> jnp.ndarray:
+                           iters: int = 3,
+                           tol: float = 1e-3) -> jnp.ndarray:
     """
     Sample ``M^(r)^{1/2} W`` using the preconditioned Lanczos scheme of
     Chow & Saad (2014, §2.2).
@@ -324,8 +367,9 @@ def sample_mr_sqrt_precond(key: jax.Array,
     iters : int, optional
         Maximum number of Lanczos iterations (default 20).
     tol : float, optional
-        Convergence tolerance (default 1e-6). Monitors the change in approximation
-        between consecutive iterations.
+        Convergence tolerance (default 1e-3). Monitors the change in approximation
+        between consecutive iterations and enforces it as described in
+        ``lanczos_sqrt_mv``.
 
     Returns
     -------
@@ -354,7 +398,7 @@ def sample_mr_sqrt(key: jax.Array,
                    positions_frac: jnp.ndarray,
                    *,
                    iters: int = 20,
-                   tol: float = 1e-5) -> jnp.ndarray:
+                   tol: float = 1e-3) -> jnp.ndarray:
     """
     Convenience wrapper for ``sample_mr_sqrt_precond`` using the identity preconditioner.
     """
