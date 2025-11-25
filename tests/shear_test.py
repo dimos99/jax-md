@@ -77,7 +77,7 @@ def _make_pair_energy_and_forces(disp_fn, rc: float, k: float = 1.0, *, gamma=No
         Rb = R[pairs[:, 1]]
         dR = jax.vmap(_disp)(Ra, Rb)
         d = jnp.linalg.norm(dR, axis=1)
-        x = jnp.clip(rc - d, a_min=0.0)
+        x = jnp.clip(rc - d, min=0.0)
         return 0.5 * k * jnp.sum(x * x)
 
     def _forces(R, pairs):
@@ -720,7 +720,7 @@ def test_energy_continuity_across_flip_with_jitted_update():
     # Pair potential with compact support (quadratic well inside rc)
     def u_pair(dr, **kwargs):
         r = jnp.linalg.norm(dr, axis=-1)
-        x = jnp.clip(rc - r, 0.0)
+        x = jnp.clip(rc - r, min=0.0)
         return 0.5 * x * x
 
     # Energy that uses the sheared metric (disp) and the neighbor list
@@ -774,7 +774,7 @@ def test_energy_continuity_across_flip_with_jitted_update():
         # Use strictly upper triangle i<j
         iu = jnp.triu_indices(N, k=1)
         r = D[iu]
-        x = jnp.clip(rc - r, 0.0)
+        x = jnp.clip(rc - r, min=0.0)
         return 0.5 * jnp.sum(x * x)
 
     E_bf_minus = brute_force_energy(R, Hm)
