@@ -560,6 +560,12 @@ def shearing(box: Box,
   if not fractional_coordinates:
     print("Warning: shearing with fractional_coordinates=False is not tested much.")
 
+  # Delegate minimum-image logic to periodic_general; always pass the current box.
+  disp_pg, shift_pg = periodic_general(
+      base,
+      fractional_coordinates=fractional_coordinates,
+      wrapped=True)
+
   def _box_of(**kwargs) -> Box:
     """
     Compute a sheared box configuration from base box parameters and shear.
@@ -601,52 +607,40 @@ def shearing(box: Box,
 
   def displacement_fn(Ra, Rb, **kwargs):
 
-    if 'box' in kwargs:
+    kwargs_no_box = dict(kwargs)
+
+    if 'box' in kwargs_no_box:
       # Use the provided physical box as-is (except for vector->diag conversion).
-      H = _canonical_box(kwargs['box'])
+      H = _canonical_box(kwargs_no_box.pop('box'))
     else:
       # Compute the current sheared box from base and gamma.
-      H = _box_of(**kwargs)
+      H = _box_of(**kwargs_no_box)
 
-    Hinv = jnp.linalg.inv(H)
+    def _single(a, b):
+      return disp_pg(a, b, box=H, **kwargs_no_box)
 
-    if fractional_coordinates:
-      # positions in unit cube; minimum image there; map with current H
-      dRf = Ra - Rb
-      dRf = dRf - jnp.round(dRf)          # minimum image in unit cube
-      return transform(H, dRf)
-    else:
-      # positions in real, map to fractional → minimum image → back to real
-      Ra_f = transform(Hinv, Ra)
-      Rb_f = transform(Hinv, Rb)
-      dRf = Ra_f - Rb_f
-      dRf = dRf - jnp.round(dRf)
-      return transform(H, dRf)
+    if Ra.ndim == 1:
+      return _single(Ra, Rb)
+
+    # Allow batched inputs (e.g., shape [N, dim]) by vmapping over leading axes.
+    lead_shape = Ra.shape[:-1]
+    a_flat = jnp.reshape(Ra, (-1, Ra.shape[-1]))
+    b_flat = jnp.reshape(Rb, (-1, Rb.shape[-1]))
+    d_flat = jax.vmap(_single)(a_flat, b_flat)
+    return jnp.reshape(d_flat, lead_shape + (Ra.shape[-1],))
 
   def shift_fn(R, dR, **kwargs):
-    
-    if 'box' in kwargs:
+
+    kwargs_no_box = dict(kwargs)
+
+    if 'box' in kwargs_no_box:
       # Use the provided physical box as-is (except for vector->diag conversion).
-      H = _canonical_box(kwargs['box'])
+      H = _canonical_box(kwargs_no_box.pop('box'))
     else:
       # Compute the current sheared box from base and gamma.
-      H = _box_of(**kwargs)
-      
-    Hinv = jnp.linalg.inv(H)
-    ones = jnp.ones(R.shape[-1], dtype=R.dtype)
+      H = _box_of(**kwargs_no_box)
 
-    if fractional_coordinates:
-      # R fractional; convert real dR -> fractional and wrap in unit cube.
-      # Use component-wise wrapping here so that for small steps
-      # disp(shift(R, dR), R) ≈ dR exactly (no extra shear offsets).
-      dRf = transform(Hinv, dR)
-      return periodic_shift(ones, R, dRf)
-    else:
-      # R, dR real; map both to fractional, wrap, map back
-      Rf  = transform(Hinv, R)
-      dRf = transform(Hinv, dR)
-      Rf2 = periodic_shift(ones, Rf, dRf)
-      return transform(H, Rf2)
+    return shift_pg(R, dR, box=H, **kwargs_no_box)
 
   # Return the usual (displacement, shift), plus a helper to get the box at time t.
   return displacement_fn, shift_fn, _box_of
