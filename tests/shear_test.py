@@ -217,7 +217,7 @@ def test_box_time_remap_and_overrides(dim):
     L = [3.0, 2.0] if dim == 2 else [3.0, 2.0, 4.0]
     B = make_box(*L)
     gamma_dot = 0.1
-    _, _, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t, fractional_coordinates=True, remap=False)
+    _, _, box_of = space.shearing(B, shear_schedule=lambda t: gamma_dot * t, fractional_coordinates=True, remap=False)
 
     t1, t2 = 1.0, 3.5
     H1 = box_of(t=t1)
@@ -226,14 +226,14 @@ def test_box_time_remap_and_overrides(dim):
     np.testing.assert_allclose(sheared_xy(H2) - sheared_xy(H1), (t2 - t1) * gamma_dot * Ly, atol=1e-7)
 
     # remap=True wraps gamma
-    _, _, box_ofR = space.shearing(B, shear_fn=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
+    _, _, box_ofR = space.shearing(B, shear_schedule=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
     for t in [0.0, 0.49, 0.51, 1.49, -0.51]:
         H = box_ofR(t=t)
         delta_xy = sheared_xy(H) - sheared_xy(B)
         assert -0.5 * Ly - 1e-7 <= float(delta_xy) < 0.5 * Ly + 1e-7
 
-    # gamma override ignores shear_fn
-    _, _, box_override = space.shearing(B, shear_fn=lambda t: 123.0 * t, fractional_coordinates=True, remap=False)
+    # gamma override ignores shear_schedule
+    _, _, box_override = space.shearing(B, shear_schedule=lambda t: 123.0 * t, fractional_coordinates=True, remap=False)
     H_override = box_override(t=10.0, gamma=0.2)
     np.testing.assert_allclose(sheared_xy(H_override), sheared_xy(B) + 0.2 * Ly, atol=1e-7)
 
@@ -309,7 +309,7 @@ def test_periodicity_across_y_face_includes_shear_offset():
 def test_jit_and_vmap_ok():
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
-    disp, shift, box_of = space.shearing(B, shear_fn=lambda t: 0.2 * t, fractional_coordinates=True)
+    disp, shift, box_of = space.shearing(B, shear_schedule=lambda t: 0.2 * t, fractional_coordinates=True)
 
     Ra = jnp.array([[0.1, 0.2, 0.3],
                     [0.3, 0.0, 0.9]], dtype=jnp.float32)
@@ -326,10 +326,10 @@ def test_jit_and_vmap_ok():
 
 def test_invalid_box_errors():
     # Scalar boxes now canonicalize to isotropic 3D; ensure construction succeeds.
-    space.shearing(jnp.array(3.0), shear_fn=lambda t: 0.1 * t)
+    space.shearing(jnp.array(3.0), shear_schedule=lambda t: 0.1 * t)
     # 1D box should raise for space.shearing (needs at least 2D).
     with pytest.raises(Exception):
-        space.shearing(jnp.array([3.0]), shear_fn=lambda t: 0.1 * t)
+        space.shearing(jnp.array([3.0]), shear_schedule=lambda t: 0.1 * t)
         
         
 def test_lattice_invariance_fractional():
@@ -415,7 +415,7 @@ def test_malformed_boxes_rejected():
     # Ly must be positive; non-UT shapes should be rejected (if your code enforces it).
     # Adjust these asserts depending on how strict your constructor is.
     with pytest.raises(Exception):
-        space.shearing(jnp.diag(jnp.array([3.0, 0.0, 4.0], dtype=jnp.float32)), shear_fn=lambda t: 0.1 * t)
+        space.shearing(jnp.diag(jnp.array([3.0, 0.0, 4.0], dtype=jnp.float32)), shear_schedule=lambda t: 0.1 * t)
         
 def test_matches_periodic_general_at_fixed_gamma():
     B = make_box(3.0, 2.0, 4.0)
@@ -513,7 +513,7 @@ def test_zero_shear_metric_matches_periodic_general_metric(fractional):
     disp_s, _, _ = space.shearing(B, fractional_coordinates=fractional)
     disp_pg, _ = space.periodic_general(B, fractional_coordinates=fractional)
 
-    t_test = 1.234  # arbitrary; shear_fn=lambda t: 0 * t so gamma=0 regardless of t
+    t_test = 1.234  # arbitrary; shear_schedule=lambda t: 0 * t so gamma=0 regardless of t
     disp_s_t = lambda a, b: disp_s(a, b, t=t_test)
     metric_s = space.metric(disp_s_t)
     metric_pg = space.metric(disp_pg)
@@ -550,7 +550,7 @@ def test_neighbor_list_remains_correct_over_long_shearing():
     steps = 100        # total time ~ 18.0 -> many wraps under remap
 
     # Fractional coordinates with remap=True for stability of the cell list
-    disp, _, box_of = space.shearing(B, shear_fn=lambda t: gamma_dot * t,
+    disp, _, box_of = space.shearing(B, shear_schedule=lambda t: gamma_dot * t,
                                      fractional_coordinates=True,
                                      remap=True)
 
@@ -595,7 +595,7 @@ def test_neighbor_list_internal_remap_fractional():
     """Neighbor list stays correct if caller remaps fractional positions at wraps."""
     Lx, Ly, Lz = 3.0, 2.0, 4.0
     B = make_box(Lx, Ly, Lz)
-    disp, _, box_of = space.shearing(B, shear_fn=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
+    disp, _, box_of = space.shearing(B, shear_schedule=lambda t: 1.0 * t, fractional_coordinates=True, remap=True)
 
     # Two particles near contact in real space, represented fractionally.
     Rf = jnp.array([[0.1, 0.49, 0.2],

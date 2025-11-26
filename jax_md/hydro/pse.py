@@ -12,7 +12,7 @@
 #    >>> velocities, state = apply_fn(state, positions_fractional, forces)
 #
 # 2. Shearing box for NEMD/rheology (shearing):
-#    >>> space_fns = space.shearing(A, shear_fn=lambda t: gamma_dot * t, fractional_coordinates=True)
+#    >>> space_fns = space.shearing(A, shear_schedule=lambda t: gamma_dot * t, fractional_coordinates=True)
 #    >>> init_fn, apply_fn = pse.build_pse_mobility(space_fns, a=0.03, xi=10.0, eta=1.0, P=16, Mgrid=64)
 #    >>> state = init_fn(positions_fractional, t=0.0)
 #    >>> velocities, state = apply_fn(state, positions_fractional, forces, t=current_time)

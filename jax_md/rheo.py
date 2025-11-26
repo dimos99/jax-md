@@ -39,11 +39,106 @@ import numpy as np
 from scipy.optimize import minimize
 
 from jax_md import util
+from jax_md import space
+from jax_md import partition
+from jax_md import quantity
+from jax import grad, jit
 
 
 # Type aliases
 f32 = jnp.float32
 f64 = jnp.float64
+
+
+def make_pairwise_stress_fn(pair_energy_for_stress):
+    """
+    Return an Irving-Kirkwood stress function derived from a pair-energy callable.
+
+    The returned function expects positions (fractional or real), a box matrix,
+    and optional neighbor list, and produces an instantaneous stress tensor.
+    """
+    if pair_energy_for_stress is None:
+        raise ValueError("pair_energy_for_stress must be provided.")
+
+    def _sum_pair_energy(dr, **pkw):
+        return jnp.sum(pair_energy_for_stress(dr, **pkw))
+
+    pair_force_mag_fn = grad(_sum_pair_energy)
+
+    @functools.partial(jit, static_argnames=('fractional_coordinates',))
+    def stress_fn(R: Array,
+                  box: Array,
+                  *,
+                  neighbor=None,
+                  fractional_coordinates: bool = True,
+                  **kwargs) -> Array:
+        H = jnp.asarray(box, dtype=R.dtype)
+        vol = quantity.volume(H.shape[0], H)
+        Rf = R if fractional_coordinates else space.transform(jnp.linalg.inv(H), R)
+
+        if neighbor is None:
+            dSf = Rf[:, None, :] - Rf[None, :, :]
+            dSf = dSf - jnp.round(dSf)
+            dR = space.transform(H, dSf)
+            dr = space.distance(dR)
+
+            mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
+            dr = dr * mask
+
+            dUdR = pair_force_mag_fn(dr, **kwargs)
+            f_mag = -dUdR * mask
+
+            eps = jnp.array(1e-12, dtype=Rf.dtype)
+            f_hat = dR / (dr[..., None] + eps)
+            Fij = f_mag[..., None] * f_hat
+
+            virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
+            return -virial / vol
+
+        if partition.is_sparse(neighbor.format):
+            send, recv = neighbor.idx
+            pair_mask = partition.neighbor_list_mask(neighbor)
+
+            dSf = Rf[send] - Rf[recv]
+            dSf = dSf - jnp.round(dSf)
+            dR = space.transform(H, dSf)
+            dr = space.distance(dR)
+
+            dUdR = pair_force_mag_fn(dr, **kwargs)
+            f_mag = -dUdR * pair_mask
+
+            eps = jnp.array(1e-12, dtype=Rf.dtype)
+            f_hat = dR / (dr[:, None] + eps)
+            Fij = f_mag[:, None] * f_hat
+
+            norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
+            virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
+            return -virial / vol
+
+        if neighbor.format is partition.Dense:
+            idx = neighbor.idx
+            N = Rf.shape[0]
+            mask = (idx < N).astype(Rf.dtype)
+
+            Rn = Rf[idx]
+            dSf = Rf[:, None, :] - Rn
+            dSf = dSf - jnp.round(dSf)
+            dR = space.transform(H, dSf)
+            dr = space.distance(dR)
+
+            dUdR = pair_force_mag_fn(dr, **kwargs)
+            f_mag = -dUdR * mask
+
+            eps = jnp.array(1e-12, dtype=Rf.dtype)
+            f_hat = dR / (dr[..., None] + eps)
+            Fij = f_mag[..., None] * f_hat
+
+            virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
+            return -virial / vol
+
+        raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
+
+    return stress_fn
 
 
 @functools.partial(jax.jit, static_argnames=('normalize',))

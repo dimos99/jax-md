@@ -45,7 +45,8 @@ in a vectorized fashion. To do this we provide three functions: `map_product`,
     `[n, neighbors, spatial_dim]`.
 """
 
-from typing import Callable, Union, Tuple, Any, Optional
+from dataclasses import dataclass
+from typing import Callable, Union, Tuple, Any, Optional, Dict
 
 from jax.core import ShapedArray
 
@@ -415,209 +416,172 @@ def periodic_general(box: Box,
 
   return displacement_fn, shift_fn
 
+
+# Helpers for Shearing
+# --------------------------------------
+def _canonical_box_matrix(b: Box) -> Box:
+  """Convert a box specification (scalar/vector/matrix) into a matrix."""
+  b = jnp.asarray(b)
+  if jnp.ndim(b) == 0:
+    print("Warning: treating scalar 'box' as 3D by default; provide an explicit box to select 2D.")
+    dim = 3
+    return jnp.diag(jnp.ones((dim,), dtype=b.dtype) * b).astype(b.dtype)
+  if jnp.ndim(b) == 1:
+    return jnp.diag(b).astype(b.dtype)
+  if jnp.ndim(b) == 2:
+    return b
+  raise ValueError("Box must be a scalar, vector, or matrix.")
+
+
+def _shear_planes_for_dim(dim: int) -> Tuple[str, ...]:
+  if dim < 2:
+    raise ValueError("shearing requires a box of dimension >= 2 (2x2 or 3x3).")
+  return ('xy',) if dim == 2 else ('xy', 'xz', 'yz')
+
+
+@dataclass
+class ShearSchedule:
+  planes: Tuple[str, ...]
+  fn_map: Dict[str, Callable[[Array], Array]]
+
+
+def _canonicalize_shear_schedule(schedule, planes: Tuple[str, ...]) -> ShearSchedule:
+  """Normalize a user-provided shear schedule into a per-plane callable map."""
+  if schedule is None:
+    return ShearSchedule(planes=planes, fn_map={})
+  if callable(schedule):
+    return ShearSchedule(planes=planes, fn_map={'xy': schedule})
+  if isinstance(schedule, dict):
+    fn_map = {k: v for k, v in schedule.items() if k in planes and v is not None}
+    return ShearSchedule(planes=planes, fn_map=fn_map)
+  raise ValueError("shear_schedule must be a callable or a dict mapping planes to callables.")
+
+
+def _compute_gammas(schedule: ShearSchedule,
+                    *,
+                    t=None,
+                    gamma=None,
+                    gamma_xy=None,
+                    gamma_xz=None,
+                    gamma_yz=None,
+                    remap: bool = False) -> Dict[str, Array]:
+  """Return instantaneous shear values per plane with overrides and wrapping."""
+  planes = schedule.planes
+  g = {}
+
+  if gamma is not None:
+    if isinstance(gamma, dict):
+      for k in planes:
+        if k in gamma:
+          g[k] = f32(gamma[k])
+    else:
+      if 'xy' in planes:
+        g['xy'] = f32(gamma)
+
+  for k, val in (('xy', gamma_xy), ('xz', gamma_xz), ('yz', gamma_yz)):
+    if val is not None and k in planes:
+      g[k] = f32(val)
+
+  missing = [k for k in planes if k not in g]
+  if missing:
+    if t is None:
+      raise ValueError("Either gamma/gamma_* or t must be provided.")
+    t_val = f32(t)
+    for k in missing:
+      fn = schedule.fn_map.get(k, None)
+      g[k] = f32(fn(t_val)) if fn is not None else f32(0.0)
+  elif remap:
+    # No missing planes and remap requested: early return after wrapping.
+    return {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
+
+  if remap:
+    g = {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
+  return g
+# --------------------------------------
+
 def shearing(box: Box,
-             shear_fn: Optional[Callable[[Array], Array]] = None,
+             shear_schedule: Optional[Union[Callable[[Array], Array], dict]] = None,
              fractional_coordinates: bool = True,
              remap: bool = False,
-             keep_base_xy: bool = True,
-             shear_fns: Optional[dict] = None):
+             keep_base_xy: bool = True):
   """
-  Simple shear in one or more planes, each driven by its own schedule.
+  Time-dependent shear-periodic boundary conditions in 2D/3D.
 
-  Provide either a single function `shear_fn(t)` (applied to 'xy') or a dict
-  `shear_fns` mapping plane names ('xy','xz','yz') to functions of time. For
-  each plane `(i,j)` present (i<j), we set `H[i,j] = (keep? H[i,j] : 0) +
-  gamma_ij(t) * H[j,j]`.
+  Provide either a single function (applied to 'xy') or a dict
+  `{'xy': f_xy, 'xz': f_xz, 'yz': f_yz}`. For each plane `(i, j)` present,
+  `H[i, j] = (keep? H[i, j] : 0) + gamma_ij(t) * H[j, j]`.
 
   Args:
     box: Base box (scalar, vector, or upper-triangular matrix).
-    shear_fn: Optional function of time returning shear for 'xy' (convenience).
-    fractional_coordinates: If True, store positions in fractional coords and
-      return real displacements. If False, positions and displacements are real.
-    remap: If True, wrap gamma into [-0.5, 0.5) to keep the box well-conditioned.
-           Be careful when using this option: it changes the topology of the
-           simulation, and requires remapping fractional coordinates when the
-           box basis flips (see `remap_fractional_positions`).
-    keep_base_xy: If True, preserve the base box's existing off-diagonals for all planes.
-    shear_fns: Optional dict mapping 'xy','xz','yz' to functions of time.
+    shear_schedule: Function or dict of functions of time returning shear strain.
+    fractional_coordinates: If True, positions live in [0,1)^d and displacements
+      are REAL; if False, positions and displacements are REAL.
+    remap: If True, wrap gamma into [-0.5, 0.5) to keep the box conditioned
+      (requires remapping fractional coords when the basis flips).
+    keep_base_xy: If True, preserve existing off-diagonals of the base box.
 
   kwargs for displacement/shift/box_fn:
-    - t: time (float). Used as input to `shear_fn` when `gamma` is not provided.
-    - gamma: instantaneous shear (float). If provided, overrides `t`/`shear_fn`.
-    - box: optional override for the current physical box (scalar/vector/matrix).
+    - t: time (float) used with shear_schedule.
+    - gamma or gamma_xy/gamma_xz/gamma_yz: overrides that skip the schedule.
+    - box: optional physical box override (scalar/vector/matrix).
 
-  Coordinate conventions:
-    - If `fractional_coordinates=True`:
-        positions live in [0,1)^d; displacement returns REAL dR; shift expects
-        FRACTIONAL R and REAL dR and returns FRACTIONAL R (compatible with
-        e.g. `shift(R, force(R))`).
-    - If `fractional_coordinates=False`:
-        positions and dR are REAL; internally we map to fractional for
-        minimum-image, then map back.
-
-  Note: See Tuckerman, ch. 13 for background on shear-periodic BCs.
+  Examples:
+    shearing(box, shear_schedule=lambda t: rate * t)              # simple xy
+    shearing(box, shear_schedule={'xy': f_xy, 'xz': f_xz})        # multi-plane
   """
 
-  # Helper Functions
-  def _canonical_box(b: Box) -> Box:
-    """
-    Convert a box representation into a matrix.
+  base = _canonical_box_matrix(box)
+  dim = base.shape[0]
+  planes = _shear_planes_for_dim(dim)
+  schedule = _canonicalize_shear_schedule(shear_schedule, planes)
 
-    Supported inputs:
-      scalar -> [[L, 0], [0, L]] or [[L, 0, 0], [0, L, 0], [0, 0, L]]
-      vector -> [[Lx, 0], [0, Ly]] or [[Lx, 0, 0], [0, Ly, 0], [0, 0, Lz]]
-      matrix -> as-is
-    """
-    b = jnp.asarray(b)
-    if jnp.ndim(b) == 0:              # scalar -> isotropic matrix
-      # Infer spatial dimension using the outer `box` argument where possible.
-      # Use jnp.shape / jnp.ndim helpers which accept Python scalars safely.
-      print("Warning: treating scalar 'box' as 3D by default; provide an explicit box to select 2D.")
-      dim = 3
-      return jnp.diag(jnp.ones((dim,), dtype=b.dtype) * b).astype(b.dtype)
-    if jnp.ndim(b) == 1:              # orthorhombic -> diagonal matrix
-      return jnp.diag(b).astype(b.dtype)
-    if jnp.ndim(b) == 2:
-      return b
-    raise ValueError("Box must be a scalar, vector, or matrix.")
-  
-  def _gammas(**kwargs):
-    """Return dict of instantaneous shear values per plane.
-
-    Accepts any of:
-      - gamma: scalar -> {'xy': gamma}; or dict {'xy': ..., 'xz': ..., 'yz': ...}
-      - gamma_xy, gamma_xz, gamma_yz as separate scalars
-      - t (time) together with provided shear_fn / shear_fns to compute values
-    Applies wrapping to [-0.5, 0.5) per plane if `remap=True`.
-    """
-    planes = []
-    dim = base.shape[0]
-    if dim >= 2:
-      planes.append('xy')
-    if dim >= 3:
-      planes.extend(['xz', 'yz'])
-
-    g = {}
-    if 'gamma' in kwargs:
-      val = kwargs['gamma']
-      if isinstance(val, dict):
-        for k, v in val.items():
-          if k in planes:
-            g[k] = f32(v)
-      else:
-        # scalar provided, apply to xy only for compatibility
-        if 'xy' in planes:
-          g['xy'] = f32(val)
-    # Individual overrides
-    for k in ['xy', 'xz', 'yz']:
-      key = f'gamma_{k}'
-      if key in kwargs and k in planes:
-        g[k] = f32(kwargs[key])
-
-    # If still missing components and time provided, use functions
-    missing = [k for k in planes if k not in g]
-    if missing:
-      if 't' not in kwargs:
-        raise ValueError("Either gamma/gamma_* or t must be provided.")
-      t = f32(kwargs['t'])
-      fn_map = {}
-      if shear_fns is not None:
-        fn_map.update(shear_fns)
-      if shear_fn is not None:
-        # convenience: default xy if not present in map
-        fn_map.setdefault('xy', shear_fn)
-      for k in missing:
-        if k in fn_map and callable(fn_map[k]):
-          g[k] = f32(fn_map[k](t))
-        else:
-          g[k] = f32(0.0)
-
-    if remap:
-      g = {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
-    return g
-
-  # Convert and validate base box.
-  base = _canonical_box(box)
-  # Early validation: must be at least 2D box (2x2 or 3x3).
-  if base.ndim != 2 or base.shape[0] < 2:
-    raise ValueError("shearing requires a box of dimension >= 2 (2x2 or 3x3).")
-  # Validate diagonal lengths for planes in use (if specified via functions).
-  used_planes = set()
-  if shear_fns is not None:
-    used_planes.update([p for p in shear_fns.keys() if p in ('xy','xz','yz')])
-  if shear_fn is not None:
-    used_planes.add('xy')
+  used_planes = set(schedule.fn_map.keys())
   if 'xy' in used_planes and base[1, 1] <= 0.0:
     raise ValueError("shearing requires positive length along y (base[1,1] > 0).")
-  if base.shape[0] >= 3 and any(p in used_planes for p in ('xz','yz')) and base[2, 2] <= 0.0:
+  if dim >= 3 and any(p in used_planes for p in ('xz', 'yz')) and base[2, 2] <= 0.0:
     raise ValueError("shearing requires positive length along z (base[2,2] > 0) for xz/yz planes.")
-  # The box should be square or cubic. Variations are not supported yet (TODO).
-  # if base.shape[0] >= 3 and not jnp.isclose(base[2, 2], base[1, 1]):
-    # raise ValueError("shearing currently requires a cubic box.")
-  # if not jnp.isclose(base[0, 0], base[1, 1]):
-    # raise ValueError("shearing currently requires a square box.")
-  # TODO: properly test fractional_coordinates=False case.
+
   if not fractional_coordinates:
     print("Warning: shearing with fractional_coordinates=False is not tested much.")
 
-  # Delegate minimum-image logic to periodic_general; always pass the current box.
+  def _box_of(**kwargs) -> Box:
+    """Current sheared box from base parameters and schedule/overrides."""
+    b = _canonical_box_matrix(kwargs.get('box', base))
+    b = b.astype(jnp.result_type(b, f32))
+    gammas = _compute_gammas(
+        schedule,
+        t=kwargs.get('t', None),
+        gamma=kwargs.get('gamma', None),
+        gamma_xy=kwargs.get('gamma_xy', None),
+        gamma_xz=kwargs.get('gamma_xz', None),
+        gamma_yz=kwargs.get('gamma_yz', None),
+        remap=remap)
+
+    updates = [((0, 1), 'xy'), ((0, 2), 'xz'), ((1, 2), 'yz')]
+    for (i, j), key in updates:
+      if key in gammas and b.shape[0] > j:
+        base_off = b[i, j] if keep_base_xy else f32(0.0)
+        b = b.at[i, j].set(base_off + gammas[key] * b[j, j])
+    return b
+
   disp_pg, shift_pg = periodic_general(
       base,
       fractional_coordinates=fractional_coordinates,
       wrapped=True)
 
-  def _box_of(**kwargs) -> Box:
-    """
-    Compute a sheared box configuration from base box parameters and shear.
-    This function creates a box matrix by applying shear deformation to a base box
-    configuration. The shear is applied in the xy direction, modifying the off-diagonal
-    element b[0,1] of the box matrix.
-    Args:
-      **kwargs: Keyword arguments that may include:
-        - box: Base box matrix to apply shear to. If not provided, uses the 
-             default 'base' box.
-        - gamma: Shear strain parameter, or
-        - t: Time parameter (used with shear_rate to compute gamma)
-        - shear_rate: Rate of shear (used with t to compute gamma)
-    Returns:
-      Box: A box matrix with applied shear deformation. The xy component b[0,1]
-         is set to (base_xy + gamma * Ly), where Ly is the y-dimension length
-         and base_xy is either the original xy component (if keep_base_xy is True)
-         or 0.0.
-    Note:
-      The function relies on module-level variables 'base' and 'keep_base_xy',
-      and helper functions '_canonical_box' and '_gamma'.
-    """
-    # Compute the current sheared box from base and gamma.
-    b = _canonical_box(kwargs.get('box', base))
-    b = b.astype(jnp.result_type(b, f32))
-    gammas = _gammas(**kwargs)  # dict per plane
-    # Apply in upper-triangular convention: (i<j)
-    if b.shape[0] >= 2 and 'xy' in gammas:
-      base_off = b[0, 1] if keep_base_xy else f32(0.0)
-      b = b.at[0, 1].set(base_off + gammas['xy'] * b[1, 1])
-    if b.shape[0] >= 3:
-      if 'xz' in gammas:
-        base_off = b[0, 2] if keep_base_xy else f32(0.0)
-        b = b.at[0, 2].set(base_off + gammas['xz'] * b[2, 2])
-      if 'yz' in gammas:
-        base_off = b[1, 2] if keep_base_xy else f32(0.0)
-        b = b.at[1, 2].set(base_off + gammas['yz'] * b[2, 2])
-    return b
+  def _current_box(kwargs: dict) -> Tuple[Box, dict]:
+    """Resolve the physical box from kwargs, canonicalizing overrides."""
+    kw = dict(kwargs)
+    if 'box' in kw:
+      return _canonical_box_matrix(kw.pop('box')), kw
+    return _box_of(**kw), kw
 
   def displacement_fn(Ra, Rb, **kwargs):
 
-    kwargs_no_box = dict(kwargs)
-
-    if 'box' in kwargs_no_box:
-      # Use the provided physical box as-is (except for vector->diag conversion).
-      H = _canonical_box(kwargs_no_box.pop('box'))
-    else:
-      # Compute the current sheared box from base and gamma.
-      H = _box_of(**kwargs_no_box)
+    H, kwargs_no_box = _current_box(kwargs)
 
     def _single(a, b):
-      return disp_pg(a, b, box=H, **kwargs_no_box)
+      return disp_pg(a, b, box=H, **kwargs_no_box) #type: ignore
 
     if Ra.ndim == 1:
       return _single(Ra, Rb)
@@ -631,16 +595,9 @@ def shearing(box: Box,
 
   def shift_fn(R, dR, **kwargs):
 
-    kwargs_no_box = dict(kwargs)
+    H, kwargs_no_box = _current_box(kwargs)
 
-    if 'box' in kwargs_no_box:
-      # Use the provided physical box as-is (except for vector->diag conversion).
-      H = _canonical_box(kwargs_no_box.pop('box'))
-    else:
-      # Compute the current sheared box from base and gamma.
-      H = _box_of(**kwargs_no_box)
-
-    return shift_pg(R, dR, box=H, **kwargs_no_box)
+    return shift_pg(R, dR, box=H, **kwargs_no_box) #type: ignore
 
   # Return the usual (displacement, shift), plus a helper to get the box at time t.
   return displacement_fn, shift_fn, _box_of
@@ -648,7 +605,7 @@ def shearing(box: Box,
 
 def metric(displacement: DisplacementFn) -> MetricFn:
   """Takes a displacement function and creates a metric."""
-  return lambda Ra, Rb, **kwargs: distance(displacement(Ra, Rb, **kwargs))
+  return lambda Ra, Rb, **kwargs: distance(displacement(Ra, Rb, **kwargs)) # type: ignore
 
 
 def map_product(metric_or_displacement: DisplacementOrMetricFn

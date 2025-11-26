@@ -394,8 +394,8 @@ def nose_hoover_chain(dt: float,
   we follow the Suzuki-Yoshida scheme. Specifically, we subdivide our chain
   simulation into :math:`n_c` substeps. These substeps are further subdivided
   into :math:`n_sy` steps. Each :math:`n_sy` step has length
-  :math:`\delta_i = \Delta t w_i / n_c` where :math:`w_i` are constants such
-  that :math:`\sum_i w_i = 1`. See the table of Suzuki-Yoshida weights above
+  :math:`\\delta_i = \\Delta t w_i / n_c` where :math:`w_i` are constants such
+  that :math:`\\sum_i w_i = 1`. See the table of Suzuki-Yoshida weights above
   for specific values. The number of substeps and the number of Suzuki-Yoshida
   steps are set using the `chain_steps` and `sy_steps` arguments.
 
@@ -1096,7 +1096,7 @@ def nvt_langevin(energy_or_force_fn: Callable[..., Array],
 
 
 def _normalize_shear_schedule(
-    shear_spec: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None]
+    shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None]
 ) -> Tuple[Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]]:
   """Return per-plane shear callables for xy/xz/yz with zero fallbacks."""
   def _wrap(fn):
@@ -1104,95 +1104,15 @@ def _normalize_shear_schedule(
       return lambda t: f32(0.0)
     return lambda t: f32(fn(t))
 
-  if isinstance(shear_spec, dict):
+  if isinstance(shear_schedule, dict):
     return (
-        _wrap(shear_spec.get('xy')),
-        _wrap(shear_spec.get('xz')),
-        _wrap(shear_spec.get('yz')),
+        _wrap(shear_schedule.get('xy')),
+        _wrap(shear_schedule.get('xz')),
+        _wrap(shear_schedule.get('yz')),
     )
-  return _wrap(shear_spec), _wrap(None), _wrap(None)
-
-
-def _build_pair_force_helpers(
-    pair_energy_for_stress: Optional[Callable[..., Array]],
-    vol: float,
-) -> Tuple[Optional[Callable[..., Array]], Optional[Callable[[Array, Array, Dict[str, Any]], Array]]]:
-  """Return (pair_force_magnitude_fn, ik_stress_fn) helpers when stress is requested."""
-  if pair_energy_for_stress is None:
-    return None, None
-
-  def _sum_pair_energy(dr, **pkw):
-    return jnp.sum(pair_energy_for_stress(dr, **pkw))
-
-  pair_force_mag_fn = grad(_sum_pair_energy)
-
-  @jit
-  def _ik_stress_from_pairs(Rf: Array, H: Array, kwargs: Dict[str, Any]) -> Array:
-    neighbor = kwargs.get('neighbor', None)
-
-    if neighbor is None:
-      dSf = Rf[:, None, :] - Rf[None, :, :]
-      dSf = dSf - jnp.round(dSf)
-      dR = space.transform(H, dSf)
-      dr = space.distance(dR)
-
-      mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
-      dr = dr * mask
-
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * mask
-
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[..., None] + eps)
-      Fij = f_mag[..., None] * f_hat
-
-      virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
-      return virial / vol
-
-    if partition.is_sparse(neighbor.format):
-      send, recv = neighbor.idx
-      pair_mask = partition.neighbor_list_mask(neighbor)
-
-      dSf = Rf[send] - Rf[recv]
-      dSf = dSf - jnp.round(dSf)
-      dR = space.transform(H, dSf)
-      dr = space.distance(dR)
-
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * pair_mask
-
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[:, None] + eps)
-      Fij = f_mag[:, None] * f_hat
-
-      norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
-      virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
-      return virial / vol
-
-    if neighbor.format is partition.Dense:
-      idx = neighbor.idx
-      N = Rf.shape[0]
-      mask = (idx < N).astype(Rf.dtype)
-
-      Rn = Rf[idx]
-      dSf = Rf[:, None, :] - Rn
-      dSf = dSf - jnp.round(dSf)
-      dR = space.transform(H, dSf)
-      dr = space.distance(dR)
-
-      dUdR = pair_force_mag_fn(dr, **kwargs)
-      f_mag = -dUdR * mask
-
-      eps = jnp.array(1e-12, dtype=Rf.dtype)
-      f_hat = dR / (dr[..., None] + eps)
-      Fij = f_mag[..., None] * f_hat
-
-      virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
-      return virial / vol
-
-    raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
-
-  return pair_force_mag_fn, _ik_stress_from_pairs
+  if callable(shear_schedule):
+    return _wrap(shear_schedule), _wrap(None), _wrap(None)
+  return _wrap(None), _wrap(None), _wrap(None)
 
 
 @dataclasses.dataclass
@@ -1289,37 +1209,30 @@ class ShearedBrownianState:
     position: The current position of the particles. An ndarray of floats with
       shape `[n, spatial_dimension]`.
     mobility: The mobility of particles. Will either be a float or an ndarray
-  time: The current simulation time (float).
+    time: The current simulation time (float).
     rng: The current state of the random number generator.
     force: Deterministic force on each particle; shape `[n, spatial_dimension]`.
-    stress: Instantaneous stress tensor. If configured with
-      `pair_energy_for_stress`, uses Irving–Kirkwood (pairwise) form; otherwise
-      uses the virial-like form sum_i F_i ⊗ x_i with real positions.
-      Shape `[spatial_dimension, spatial_dimension]`.
   """
   position: Array
   mobility: Array
   rng: Array
   time: float
   force: Array
-  stress: Array
 
 
 def brownian_with_shear(energy_or_force: Callable[..., Array],
-                          shift: ShiftFn,
-                          dt: float,
-                          kT: float,
-                          mobility,
-                          shear_fn: Callable[[Array], Array],
-                          box_of: Optional[Callable[..., Box]],
-                          t0: float = 0.0,
-                          fractional_position: bool = True,
-                          remap = True,
-                          pair_energy_for_stress: Optional[Callable[..., Array]] = None) -> Simulator:
+                        shift: ShiftFn,
+                        dt: float,
+                        kT: float,
+                        mobility,
+                        shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None],
+                        t0: float = 0.0,
+                        fractional_position: bool = True,
+                        remap = True) -> Simulator:
   """Overdamped Langevin (Brownian) dynamics under simple shear with PBCs.
 
   This integrator advances positions using Euler-Maruyama in the presence of a
-  time-dependent simple shear defined by a user-specified `shear_fn(t)`.
+  time-dependent simple shear defined by a user-specified schedule.
   The update is:
 
     R_{t+dt} = shift(R_t, μ ∘ F(R_t) dt + sqrt(2 μ kT dt) ∘ ξ; gamma)
@@ -1332,9 +1245,6 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
   This routine also maintains useful diagnostics in the returned state:
   - `time`: the simulation clock.
   - `force`: the deterministic force used at the step.
-  - `stress`: instantaneous stress. If `pair_energy_for_stress` is provided,
-    uses the Irving-Kirkwood pairwise form; otherwise uses the virial-like
-    tensor sum_i F_i ⊗ x_i (real positions), divided by the box volume.
 
   Expected geometry setup: construct `displacement`, `shift`, and `box_of`
   using `jax_md.space.shearing(...)` so that all components share a consistent
@@ -1356,14 +1266,10 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
       `[n]` or `[n, 1]` (the latter broadcasts cleanly over coordinates). The
       value is stored in the state and can be overridden at initialization via
       `init_fn(..., mobility=...)`.
-    shear_fn: Either a single function returning the reduced shear `gamma(t)`
+    shear_schedule: Either a single function returning the reduced shear `gamma(t)`
       (applied to the 'xy' tilt), or a dict mapping plane names ('xy','xz','yz')
       to functions of time. The geometry is determined by the provided
       `space.shearing` configuration.
-    box_of: Function returning the current triclinic box. Use the one returned
-      by `space.shearing(...)`. It should accept either `t=` or `gamma=` and
-      return a box matrix compatible with `space.transform`. Required to compute
-      stress and volume diagnostics.
     t0: Initial time.
     fractional_position: If True, `R` are interpreted as fractional coordinates
       inside the unit cell; real positions are obtained via
@@ -1371,11 +1277,6 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     remap: If True, apply a nearest-integer remap so that `gamma` is kept in
       `[-0.5, 0.5)` and, when using fractional positions, apply the exact
       unimodular change-of-basis to keep coordinates inside the base cell.
-    pair_energy_for_stress: Optional callable mapping pairs of positions
-      (displacements) to pair energies. If provided, the Irving-Kirkwood
-      expression is used to compute stress; otherwise, stress will not be
-      computed. Its presence implies the computation of stress.
-      TODO: add support for non-pairwise forces.
 
   Returns:
     A pair `(init_fn, apply_fn)`:
@@ -1387,49 +1288,36 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
         `state.time` is advanced by `dt` each call.
 
   Example:
-    disp, shift, box_of = space.shearing(box=H0, shear_fn=sr_fn,
+    disp, shift, box_of = space.shearing(box=H0, shear_schedule=sr_fn,
                                          remap=True, fractional_coordinates=True)
     pair_fn = smap.pair_neighbor_list(..., displacement_or_metric=disp, ...)
     init_fn, apply_fn = simulate.brownian_with_shear(pair_fn, shift, dt, kT,
                                                      mobility=1.0,
-                                                     shear_fn=sr_fn,
-                                                     box_of=box_of,
+                                                     shear_schedule=sr_fn,
                                                      fractional_position=True,
                                                      remap=True)
     state = init_fn(key, R0)
     state = apply_fn(state, neighbor=nbrs)  # kwargs forwarded as needed
+    stress_fn = rheo.make_pairwise_stress_fn(pair_energy_for_stress)
+    stress = stress_fn(state.position, box_of(t=state.time),
+                       neighbor=nbrs, fractional_coordinates=True)
 
   Notes:
     - The mobility stored in the state is canonicalized for broadcasting.
-    - The stress tensor computed here is an instantaneous, non-symmetrized
-      quantity for diagnostics; post-processing may be needed for rheology.
-    - If `pair_energy_for_stress` is provided, stress is computed using the
-      Irving-Kirkwood expression: σ = (1/(2V)) Σ_{i,j} r_ij ⊗ f_ij where
-      f_ij = -∂U_pair/∂r_ij r̂_ij. A neighbor list passed via `apply_fn(..., neighbor=...)`
-      is used when available; otherwise a dense O(N^2) computation is used.
-    - If `box_of` is None, a `ValueError` is raised because stress requires
-      the box to compute real positions and volume.
+    - Stress is no longer accumulated inside the integrator; derive a stress
+      function with `rheo.make_pairwise_stress_fn(pair_energy_for_stress)` and
+      evaluate it outside the integration loop using the current positions and
+      box (e.g., `box_of(t=state.time)` when using sheared boxes).
   """
   
   force_fn = quantity.canonicalize_force(energy_or_force)
-    
-  if box_of is not None:
-    box = box_of(t=t0)
-  else:
-    raise ValueError("box_of must be provided to compute stress.")
-
-  vol = quantity.volume(box.shape[0], box)
 
   # Ensure `dt` is a static JAX scalar with the right dtype.
   _dt = f32(dt)
   t0 = f32(t0)
 
 
-  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_fn)
-  pair_force_mag_fn, _ik_stress_from_pairs = _build_pair_force_helpers(
-      pair_energy_for_stress,
-      vol,
-  )
+  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
 
   @jit
   def init_fn(key, R, **kwargs):
@@ -1459,20 +1347,8 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
       init_kwargs['gamma'] = curr_xy
     F0 = force_fn(R, **init_kwargs)
 
-    # Compute stress at init: IK when configured, otherwise keep it None.
-    if pair_force_mag_fn is not None:
-      H0 = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
-            if R.shape[1] >= 3 else box_of(gamma=curr_xy))
-      if fractional_position:
-        Rf0 = R
-      else:
-        Rf0 = space.transform(jnp.linalg.inv(H0), R)
-      stress0 = _ik_stress_from_pairs(Rf0, H0, init_kwargs)
-    else:
-      stress0 = None
-
     state = ShearedBrownianState(position=R, mobility=mu, rng=key,  #type: ignore
-                                 time=t0, force=F0, stress=stress0) #type: ignore
+                                 time=t0, force=F0) #type: ignore
     
     # Reshape μ for broadcasting with positions (e.g., [n] -> [n,1]).
     state = canonicalize_mobility(state)
@@ -1483,7 +1359,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     # Allow temperature to be overridden at step time.
     _kT = kwargs.get('kT', kT)
 
-    R, mu, key, time, _, _ = dataclasses.astuple(state)
+    R, mu, key, time, _ = dataclasses.astuple(state)
 
     if remap:
       # --- Shear handling: compute reduced gamma and optional integer remap ---
@@ -1552,18 +1428,6 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     # Compute deterministic force.
     F = force_fn(R, **kwargs)
 
-    # Compute stress via Irving–Kirkwood if configured; else return None.
-    if pair_force_mag_fn is not None:
-      H = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
-           if R.shape[1] >= 3 else box_of(gamma=curr_xy))
-      if fractional_position:
-        Rf = R
-      else:
-        Rf = space.transform(jnp.linalg.inv(H), R)
-      stress = _ik_stress_from_pairs(Rf, H, kwargs)
-    else:
-      stress = None
-      
     # Now, advance time.
     # Draw i.i.d. standard normal noise per coordinate.
     key, split = random.split(key)
@@ -1577,7 +1441,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     R  = shift(R, dR, **kwargs)
     # Package updated state, canonicalize mobility broadcasting, and return.
     new_state = ShearedBrownianState(position=R, mobility=mu, rng=key, #type: ignore
-                                     time=time + _dt, force=F, stress=stress) #type: ignore
+                                     time=time + _dt, force=F) #type: ignore
     new_state = canonicalize_mobility(new_state)
     return new_state
   
@@ -1602,7 +1466,6 @@ class ShearedRPYState:
   rng: Array
   time: float
   force: Array
-  stress: Optional[Array] = None
 
 
 def rpy(space_fns: Tuple[Callable, ...],
@@ -1713,7 +1576,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                    a: float,
                    xi: float,
                    eta: float,
-                   shear_fn: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]]],
+                   shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None],
                    t0: float = 0.0,
                    fractional_position: bool = True,
                    remap: bool = True,
@@ -1726,7 +1589,12 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                    theta: Optional[float] = None,
                    mr_iters: int = 10,
                    real_space_first: bool = True) -> Simulator:
-  """Spectral-Ewald RPY dynamics with the shearing box utilities."""
+  """Spectral-Ewald RPY dynamics with the shearing box utilities.
+
+  Stress diagnostics are not accumulated inside the integrator; derive a stress
+  callable with `rheo.make_pairwise_stress_fn` and evaluate it externally if
+  required.
+  """
   if len(space_fns) < 3:
     raise ValueError(
         "rpy_with_shear expects (displacement, shift, box_of) from space.shearing."
@@ -1739,14 +1607,9 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
   t0 = f32(t0)
 
   box = box_of(t=t0)
-  vol = quantity.volume(box.shape[0], box)
   dim = box.shape[0]
 
-  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_fn)
-  pair_force_mag_fn, _ik_stress_from_pairs = _build_pair_force_helpers(
-      pair_energy_for_stress,
-      vol,
-  )
+  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
 
   Mw_params_local = dict(Mw_params) if Mw_params is not None else {}
   if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
@@ -1810,17 +1673,6 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     pse_state = pse_init(mobility_position, **shear_kwargs)
     F0 = force_fn(mobility_position, **shear_kwargs)
 
-    if pair_force_mag_fn is not None:
-      H0 = (box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
-            if dim >= 3 else box_of(gamma=curr_xy))
-      if fractional_position:
-        Rf0 = mobility_position
-      else:
-        Rf0 = space.transform(jnp.linalg.inv(H0), mobility_position)
-      stress0 = _ik_stress_from_pairs(Rf0, H0, shear_kwargs)
-    else:
-      stress0 = None
-
     if fractional_position:
       box_matrix0 = pse_state.real.box_matrix
       position_real0 = space.transform(box_matrix0, mobility_position)
@@ -1832,8 +1684,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                            pse_state=pse_state,
                            rng=key,
                            time=t0,
-                           force=F0,
-                           stress=stress0)
+                           force=F0)
 
   def apply_fn(state, **kwargs):
     step_kwargs = dict(kwargs)
@@ -1909,16 +1760,6 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     else:
       current_box = box_of(gamma=curr_xy)
 
-    if pair_force_mag_fn is not None:
-      H = current_box
-      if fractional_position:
-        Rf = mobility_position
-      else:
-        Rf = space.transform(jnp.linalg.inv(H), mobility_position)
-      stress = _ik_stress_from_pairs(Rf, H, step_kwargs)
-    else:
-      stress = None
-
     apply_with_brownian = getattr(pse_apply, 'with_brownian', None)
     if apply_with_brownian is not None:
       key, brownian_key = random.split(key)
@@ -1950,8 +1791,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                            pse_state=pse_state,
                            rng=key,
                            time=time + _dt,
-                           force=force,
-                           stress=stress)
+                           force=force)
 
   return init_fn, apply_fn
 
