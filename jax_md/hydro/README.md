@@ -25,7 +25,8 @@ High-level functions for building complete Pse mobility operators:
 ### `pse_real.py` - Real-Space Mobility
 Implements M^(r) using Fiore's closed-form F1,F2 coefficients:
 - `build_Mr_apply()`: Returns `(init_fn, apply_fn)` that manage neighbor lists automatically
-- `F1F2_closed_form()`: Fiore Appendix A formulas for monodisperse spheres
+- `F1F2_closed_form()`: Viscosity-independent geometric coefficients F1(r; a, ξ) and F2(r; a, ξ) from Fiore Appendix A
+- `Mr_self()`: Eta-independent self-mobility factor; multiply by 1/(6πηa) for Cartesian self-mobility
 
 ### `pse_wave.py` - Wave-Space Mobility  
 Implements M^(w) using Spectral Pse method:

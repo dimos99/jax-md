@@ -1,25 +1,68 @@
-"""
-Real-space PSE mobility (M^r) with closed-form kernels
+"""Real-space PSE mobility (M^r) with closed-form kernels
 
 Real-space mobility M^(r) uses closed-form F1,F2 coefficients for
-monodisperse spheres of radius a, with Pse splitting parameter ξ.
+monodisperse spheres of radius a, with Ewald splitting parameter ξ.
 
 For a pair at separation r:
-  M^r_ij = (1/(6πηa)) * [F1(r) * (I - r̂⊗r̂) + F2(r) * r̂⊗r̂]
+  M^r_ij = (1/(6πηa)) * [F1(r; a, ξ) * (I - r̂⊗r̂) + F2(r; a, ξ) * r̂⊗r̂]
 
 Self term (r=0):
-  M^r_ii = (1/(6πηa)) * [1/(4√π ξ a)] * [1 - exp(-4a²ξ²) + 4√π a ξ erfc(2aξ)]
+  M^r_ii = (1/(6πηa)) * f_self(a, ξ)
+  
+where f_self(a, ξ) = [1/(4√π ξ a)] * [1 - exp(-4a²ξ²) + 4√π a ξ erfc(2aξ)]
+is the eta-independent self-mobility factor computed by Mr_self(a, ξ).
+
+Lattice Image Summation
+-----------------------
+In periodic boundary conditions, hydrodynamic interactions extend across periodic
+images of the simulation cell. To correctly evaluate the real-space mobility, we
+must sum contributions from particles and their periodic images:
+
+  M^r_ij = ∑_L M^r(r_ij + L)
+
+where L iterates over lattice vectors representing periodic cell translations.
+
+The lattice indices generation serves two critical purposes:
+
+1. **Completeness**: Ensures all relevant periodic images within the real-space
+   cutoff radius r_cut are included in the mobility calculation. Missing images
+   would break translational invariance and introduce artificial boundaries.
+
+2. **Efficiency**: Limits the sum to a finite set of nearby images. The Ewald
+   splitting causes real-space contributions to decay exponentially beyond r_cut,
+   so distant images (|L| >> r_cut) contribute negligibly and can be omitted.
+
+**Lattice Construction Algorithm**:
+- Generate a symmetric hypercube of integer shifts: L ∈ {-N, ..., N}^d where d
+  is the spatial dimension (typically 3).
+- N (lattice extent) is chosen such that the smallest box dimension spans at
+  least r_cut when mapped to real space: N ≥ ceil(r_cut / σ_min(Box)).
+- The zero lattice vector (L=0, primary cell) is explicitly tracked because
+  self-interactions (i=j, L=0) require special treatment via the analytic
+  self-mobility term.
+- A post-processing step trims lattice vectors that cannot contribute within
+  r_cut to reduce computational overhead, while always preserving L=0.
+
+**Example**: For a cubic box with side length 10 and r_cut=3, we generate lattice
+shifts in {-1, 0, 1}^3, yielding 27 images (including the primary cell). Images at
+corners (e.g., L=[1,1,1]) map to real-space distances ~17.3, well beyond r_cut,
+so they are pruned, leaving fewer active images for the mobility calculation.
+
+This approach balances accuracy (all interactions within r_cut are captured) with
+performance (distant images are excluded), making real-space mobility evaluation
+tractable for typical simulation box sizes.
   
 References
 ----------
-[1] Fiore, Andrew M., Florencio Balboa Usabiaga, Aleksandar Donev, and James W. Swan. “Rapid Sampling of Stochastic Displacements in Brownian Dynamics Simulations.” The Journal of Chemical Physics 146, no. 12 (2017): 124116. https://doi.org/10.1063/1.4978242.
-[2] Fiore, Andrew M. “Fast Simulation Methods for Soft Matter Hydrodynamics.” PhD Thesis, Massachusetts Institute of Technology, 2019.
+[1] Fiore, Andrew M., Florencio Balboa Usabiaga, Aleksandar Donev, and James W. Swan. "Rapid Sampling of Stochastic Displacements in Brownian Dynamics Simulations." The Journal of Chemical Physics 146, no. 12 (2017): 124116. https://doi.org/10.1063/1.4978242.
+[2] Fiore, Andrew M. "Fast Simulation Methods for Soft Matter Hydrodynamics." PhD Thesis, Massachusetts Institute of Technology, 2019.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import errors as jax_errors
+from functools import partial
 
 from typing import Callable, Optional, Tuple
 
@@ -29,10 +72,16 @@ from jax_md.hydro.pse_real_det_helpers import (
     REAL_DTYPE,
     F1F2_closed_form,
     Mr_self,
+    current_box_matrix,
+    generate_lattice_hypercube,
 )
 
+# Backward-compatible aliases for helper utilities.
+_current_box_matrix = current_box_matrix
+_generate_lattice_hypercube = generate_lattice_hypercube
 
-I3 = jnp.eye(3, dtype=REAL_DTYPE)
+
+I3 = jnp.eye(3, dtype=REAL_DTYPE) # 3x3 identity matrix
 
 
 @dataclasses.dataclass
@@ -45,7 +94,7 @@ class RealSpaceState:
     box_matrix: jnp.ndarray
     core_fn: Callable = dataclasses.field(metadata={'static': True})
 
-@jax.jit
+@partial(jax.jit, static_argnums=(1,2,3))
 def Mr_pair_block(r_vec, a, xi, eta):
     """
     Given separation vector r_vec (R^3), return 3x3 block M^r_ij.
@@ -66,51 +115,18 @@ def Mr_pair_block(r_vec, a, xi, eta):
     Mr : (3,3) array
         Real-space mobility block
     """
+    # Compute separation related quantities
     r2 = jnp.dot(r_vec, r_vec)
     r = jnp.sqrt(r2 + 1e-300)
     rhat = r_vec / r
+    rhat_outer = jnp.outer(rhat, rhat)
+    # Get mobility coefficients (Appx. A of Fiore et al.)
     F1, F2 = F1F2_closed_form(r, a, xi)
     
     prefactor = 1.0 / (6.0 * jnp.pi * eta * a)
-    rhat_outer = jnp.outer(rhat, rhat)
     Mr = prefactor * (F1 * (I3 - rhat_outer) + F2 * rhat_outer)
+    
     return Mr
-
-
-def _current_box_matrix(
-    displacement_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
-    box_fn: Optional[Callable[..., jnp.ndarray]],
-    dim: int,
-    **kwargs,
-) -> jnp.ndarray:
-    """Infer the physical box matrix for a fractional-coordinate space."""
-
-    if box_fn is not None:
-        return jnp.asarray(box_fn(**kwargs))
-
-    closure = getattr(displacement_fn, "__closure__", None)
-    if closure is not None:
-        for cell in closure:
-            val = cell.cell_contents
-            if hasattr(val, "shape") and val.shape == (dim, dim):
-                return jnp.asarray(val)
-
-    origin = jnp.zeros((dim,), dtype=REAL_DTYPE)
-    basis = jnp.eye(dim, dtype=REAL_DTYPE)
-    cols = [displacement_fn(origin, basis[i], **kwargs) for i in range(dim)]
-    return jnp.stack(cols, axis=1)
-
-
-def _generate_lattice_hypercube(dim: int, extent: int) -> Tuple[np.ndarray, int]:
-    """Generate integer lattice indices on the symmetric hypercube [-extent, extent]^dim."""
-    extent = max(int(extent), 0)
-    ranges = [np.arange(-extent, extent + 1, dtype=np.int32) for _ in range(dim)]
-    mesh = np.stack(np.meshgrid(*ranges, indexing="ij"), axis=-1).reshape(-1, dim)
-    zero_mask = np.all(mesh == 0, axis=1)
-    if not zero_mask.any():
-        raise RuntimeError("Lattice hypercube generation failed to include the zero vector.")
-    zero_idx = int(np.argmax(zero_mask))
-    return mesh.astype(np.int32, copy=False), zero_idx
 
 
 def _build_mr_core(
@@ -120,7 +136,57 @@ def _build_mr_core(
     rcut2: float,
     neighbor_format: partition.NeighborListFormat,
 ) -> Callable[..., jnp.ndarray]:
-    """Create the JIT-ed core that evaluates the real-space mobility."""
+    """
+    Create the JIT-ed core that evaluates the real-space mobility.
+    
+    This factory function builds a specialized JIT-compiled kernel for computing
+    real-space mobility matrix-vector products M^r @ f, where M^r is the real-space
+    component of the Ewald-split mobility operator. The returned function supports
+    both dense and sparse neighbor list formats and applies memory-efficient fused
+    contractions to avoid materializing the full mobility tensor.
+    
+    The mobility kernel computes:
+        v_i = M^r_ii·f_i + Σ_{j≠i} Σ_{images} M^r_ij·f_j
+    
+    where M^r_ij are 3×3 mobility blocks constructed from the closed-form F1, F2
+    coefficients (see F1F2_closed_form in pse_real_det_helpers).
+    
+    Parameters
+    ----------
+    a : float
+        Sphere radius (in real units). Determines hydrodynamic size and self-mobility.
+    xi : float
+        Ewald splitting parameter (inverse length units). Controls the real/wave space
+        decomposition; larger xi means faster real-space decay but more wave modes needed.
+    eta : float
+        Fluid dynamic viscosity. Sets the overall mobility scale (1/(6πηa)).
+    rcut2 : float
+        Squared real-space cutoff radius. Pairs with r² > rcut2 are excluded from
+        the real-space sum (their contribution is handled in wave space).
+    neighbor_format : partition.NeighborListFormat
+        Neighbor list storage format. Dense format is fastest but uses more memory;
+        Sparse or OrderedSparse reduce memory at the cost of scatter-gather overhead.
+        OrderedSparse additionally includes symmetric backflow contributions (M_ji·f_i).
+    
+    Returns
+    -------
+    Callable[..., jnp.ndarray]
+        A JIT-compiled function with signature:
+            core(positions_frac, forces, neighbor_idx, neighbor_mask,
+                 box_matrix, lattice_indices, zero_image_index) -> velocities
+        
+        The returned callable evaluates M^r @ forces using the neighbor list and
+        lattice image sums, applying cutoff and self-term corrections.
+    
+    Notes
+    -----
+    - The core uses fused mobility-force contractions to avoid materializing the
+      full (N, neighbors, images, 3, 3) mobility tensor, saving ~60% memory.
+    - For OrderedSparse format, symmetric backflow M_ji·f_i is included to ensure
+      the mobility operator remains symmetric when used in iterative solvers.
+    - Self-interactions (i=j, primary cell) are replaced by the analytic self-mobility
+      computed via Mr_self(a, xi).
+    """
 
     self_factor = Mr_self(a, xi)
     prefactor_scalar = 1.0 / (6.0 * np.pi * eta * a)
@@ -149,9 +215,9 @@ def _build_mr_core(
         Parameters
         ----------
         positions_frac : (N, 3) array
-            Fractional particle positions
+            FRACTIONAL particle positions
         forces : (N, 3) array
-            Forces in real coordinates
+            Forces in REAL units
         neighbor_idx : array
             Neighbor list indices (format depends on neighbor_format)
         neighbor_mask : array
@@ -168,6 +234,7 @@ def _build_mr_core(
         (N, 3) array
             Velocities from real-space mobility evaluation
         """
+        # Ensure inputs are JAX arrays with correct dtypes
         positions_frac = jnp.asarray(positions_frac)
         forces = jnp.asarray(forces)
         neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
@@ -176,7 +243,10 @@ def _build_mr_core(
         lattice_indices = jnp.asarray(lattice_indices, dtype=jnp.int32)
         zero_image_index = jnp.int32(zero_image_index)
 
+        # Transform fractional positions to real coordinates
         x_real = space.transform(box_matrix, positions_frac)
+        
+        # Precompute lattice vectors in real space
         lattice_vecs = lattice_indices @ box_matrix.T
         N = x_real.shape[0]
         n_images = lattice_vecs.shape[0]
@@ -216,32 +286,39 @@ def _build_mr_core(
             primary_self = is_self[:, :, None] & zero_mask[None, None, :]
 
             valid_pairs = neighbor_mask[:, :, None] & (~primary_self) & within_rcut
+            valid_any = jnp.any(valid_pairs)
 
-            eps = jnp.finfo(dtype).tiny
-            safe_r = jnp.sqrt(r2 + eps)
-            safe_r = jnp.where(valid_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
+            def _no_pairs(_):
+                return self_term * forces
 
-            # Normalize separation vectors; drop invalid entries to avoid NaNs.
-            rhat = jnp.where(valid_pairs[..., None], rij / safe_r[..., None], 0.0)
+            def _with_pairs(_):
+                eps = jnp.finfo(dtype).tiny
+                safe_r = jnp.sqrt(r2 + eps)
+                safe_r = jnp.where(valid_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
 
-            F1, F2 = F1F2_closed_form(safe_r, a, xi)
-            F1 = jnp.where(valid_pairs, F1, 0.0)
-            F2 = jnp.where(valid_pairs, F2, 0.0)
+                # Normalize separation vectors; drop invalid entries to avoid NaNs.
+                rhat = jnp.where(valid_pairs[..., None], rij / safe_r[..., None], 0.0)
 
-            # Fused mobility-force contraction to avoid materializing Mr_blocks tensor.
-            # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
-            #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
-            # This eliminates the (edges, images, 3, 3) tensor, saving ~60% memory.
-            forces_neighbors = forces[neighbor_idx_masked][:, :, None, :]
-            rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_neighbors)
-            contrib = prefactor * (
-                F1[..., None] * forces_neighbors +
-                (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
-            )
-            contrib = contrib.sum(axis=2)
-            contrib = contrib.sum(axis=1)
+                F1, F2 = F1F2_closed_form(safe_r, a, xi)
+                F1 = jnp.where(valid_pairs, F1, 0.0)
+                F2 = jnp.where(valid_pairs, F2, 0.0)
 
-            return self_term * forces + contrib
+                # Fused mobility-force contraction to avoid materializing Mr_blocks tensor.
+                # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
+                #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
+                # This eliminates the (edges, images, 3, 3) tensor, saving ~60% memory.
+                forces_neighbors = forces[neighbor_idx_masked][:, :, None, :]
+                rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_neighbors)
+                contrib = prefactor * (
+                    F1[..., None] * forces_neighbors +
+                    (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
+                )
+                contrib = contrib.sum(axis=2)
+                contrib = contrib.sum(axis=1)
+
+                return self_term * forces + contrib
+
+            return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
 
         # Sparse or ordered-sparse neighbor lists.
         if neighbor_idx.ndim == 1:
@@ -270,43 +347,50 @@ def _build_mr_core(
         primary_self = is_self_edge & zero_mask
 
         mask_pairs = neighbor_mask[:, None] & (~primary_self) & within_rcut
+        valid_any = jnp.any(mask_pairs)
 
-        eps = jnp.finfo(dtype).tiny
-        safe_r = jnp.sqrt(r2 + eps)
-        safe_r = jnp.where(mask_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
+        def _no_pairs(_):
+            return self_term * forces
 
-        rhat = jnp.where(mask_pairs[..., None], rij / safe_r[..., None], 0.0)
+        def _with_pairs(_):
+            eps = jnp.finfo(dtype).tiny
+            safe_r = jnp.sqrt(r2 + eps)
+            safe_r = jnp.where(mask_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
 
-        F1, F2 = F1F2_closed_form(safe_r, a, xi)
-        F1 = jnp.where(mask_pairs, F1, 0.0)
-        F2 = jnp.where(mask_pairs, F2, 0.0)
+            rhat = jnp.where(mask_pairs[..., None], rij / safe_r[..., None], 0.0)
 
-        # Fused mobility-force contraction.
-        # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
-        #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
-        forces_senders = forces[senders][:, None, :]
-        rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_senders)
-        contrib_i = prefactor * (
-            F1[..., None] * forces_senders +
-            (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
-        )
-        contrib_i = contrib_i.sum(axis=1)
+            F1, F2 = F1F2_closed_form(safe_r, a, xi)
+            F1 = jnp.where(mask_pairs, F1, 0.0)
+            F2 = jnp.where(mask_pairs, F2, 0.0)
 
-
-        velocities = self_term * forces
-        velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
-
-        if include_ordered_backflow:
-            forces_receivers = forces[receivers][:, None, :]
-            rhat_dot_f_back = jnp.einsum("...i,...i->...", rhat, forces_receivers)
-            contrib_j = prefactor * (
-                F1[..., None] * forces_receivers +
-                (F2 - F1)[..., None] * rhat_dot_f_back[..., None] * rhat
+            # Fused mobility-force contraction.
+            # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
+            #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
+            forces_senders = forces[senders][:, None, :]
+            rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_senders)
+            contrib_i = prefactor * (
+                F1[..., None] * forces_senders +
+                (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
             )
-            contrib_j = contrib_j.sum(axis=1)
-            velocities = velocities + ops.segment_sum(contrib_j, senders, N)
+            contrib_i = contrib_i.sum(axis=1)
 
-        return velocities
+            velocities = self_term * forces
+            velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
+
+            if include_ordered_backflow: # For OrderedSparse format
+                # Compute backflow contributions M_ji·f_i
+                forces_receivers = forces[receivers][:, None, :]
+                rhat_dot_f_back = jnp.einsum("...i,...i->...", rhat, forces_receivers)
+                contrib_j = prefactor * (
+                    F1[..., None] * forces_receivers +
+                    (F2 - F1)[..., None] * rhat_dot_f_back[..., None] * rhat
+                )
+                contrib_j = contrib_j.sum(axis=1)
+                velocities = velocities + ops.segment_sum(contrib_j, senders, N)
+
+            return velocities # = M^r @ forces
+
+        return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
 
     return core
 
@@ -318,7 +402,7 @@ def build_Mr_apply(
     eta,
     rcut,
     *,
-    dr_threshold=0.0,
+    dr_threshold=None,
     capacity_multiplier=1.25,
     disable_cell_list=False,
     neighbor_format=partition.NeighborListFormat.Dense,
@@ -364,6 +448,11 @@ def build_Mr_apply(
     if rcut <= 0.0:
         raise ValueError("rcut must be positive.")
 
+    # Set reasonable default for dr_threshold if not provided
+    # Use 10% of rcut as a safe update threshold
+    if dr_threshold is None:
+        dr_threshold = 0.1 * rcut
+
     if len(space_fns) < 2:
         raise ValueError("space_fns must contain at least displacement and shift functions.")
     displacement_fn, _ = space_fns[:2]
@@ -390,22 +479,71 @@ def build_Mr_apply(
     core_fn = _build_mr_core(a, xi, eta, rcut2, neighbor_format)
 
     def _compute_lattice_indices(box_matrix: jnp.ndarray) -> Tuple[jnp.ndarray, int]:
+        """
+        Compute lattice vectors for periodic image summation in real-space mobility.
+        
+        This function generates the set of integer lattice shifts L = (n_x, n_y, n_z)
+        needed to evaluate hydrodynamic interactions across periodic boundaries:
+        
+            M^r_ij = ∑_L M^r(r_ij + L·Box)
+        
+        The lattice extent is chosen to ensure all images within the real-space cutoff
+        r_cut are included, while excluding distant images that contribute negligibly
+        due to exponential decay from Ewald splitting.
+        
+        Algorithm
+        ---------
+        1. **Extent Estimation**: If not user-specified, compute the lattice extent N
+           from the ratio r_cut / σ_min(Box), where σ_min is the smallest singular
+           value of the box matrix. This ensures coverage in the 'thinnest' box direction.
+           
+        2. **Hypercube Generation**: Create a symmetric grid of integer shifts in
+           {-N, ..., N}^d, yielding (2N+1)^d candidate lattice vectors.
+           
+        3. **Pruning**: Map lattice shifts to real space (L·Box^T) and discard those
+           with |L| > r_cut, as they cannot contribute to any particle pair within r_cut.
+           This reduces the active lattice from ~O(N^3) to ~O(N^2) images for typical boxes.
+           
+        4. **Zero Image Preservation**: Ensure the primary cell (L=0) is always included,
+           even if pruning would remove it (degenerate edge case). Track its index for
+           self-interaction masking in the mobility kernel.
+        
+        Parameters
+        ----------
+        box_matrix : (d, d) array
+            Box transformation matrix mapping fractional to real coordinates.
+            
+        Returns
+        -------
+        lattice : (n_images, d) array of int32
+            Integer lattice vectors to sum over, with |L·Box| ≲ r_cut.
+        zero_idx : int
+            Index of the zero lattice vector (L=0, primary cell) in the returned array.
+            
+        Notes
+        -----
+        - For non-cubic or shearing boxes, the SVD-based extent estimate adapts to the
+          box geometry, ensuring sufficient coverage without excessive oversampling.
+        - The r_cut pruning threshold ensures any image L with |L·Box| ≥ r_cut cannot
+          contribute to interactions, as even the closest pair (r_ij ≈ 0) would exceed cutoff.
+        - Degenerate boxes (σ_min → 0) are protected by the safe_sigma clamp to 1e-12.
+        """
         box_np = np.asarray(box_matrix, dtype=np.float64)
         dim = box_np.shape[0]
         if lattice_extent is None:
+            # Compute smallest singular value to estimate 'thinnest' box dimension.
             svals = np.linalg.svd(box_np, compute_uv=False)
             sigma_min = float(np.min(svals))
             safe_sigma = max(sigma_min, 1e-12)
 
-            # Ratio of cutoff to smallest box scale.
+            # Ratio of cutoff to smallest box scale determines required lattice extent.
             ratio = float(rcut) / safe_sigma
 
-            # Base extent from geometric ratio.
+            # Base extent from geometric ratio: N ≥ ceil(r_cut / σ_min).
             base_extent = int(np.ceil(ratio)) if ratio > 0.0 else 0
 
-            # For rcut much smaller than the box, a single shell of images is
-            # sufficient in typical periodic setups. Cap to at most one shell
-            # unless rcut is comparable to the box size.
+            # For r_cut << box size (ratio < 1), a single shell of images suffices.
+            # This avoids over-allocating lattice vectors for large boxes.
             if ratio < 1.0:
                 extent_val = min(base_extent, 1)
             else:
@@ -413,25 +551,47 @@ def build_Mr_apply(
         else:
             extent_val = int(lattice_extent)
 
-        lattice_np, zero_idx = _generate_lattice_hypercube(dim, extent_val)
+        # Generate symmetric hypercube: L ∈ {-N, ..., N}^d.
+        lattice_np, zero_idx = generate_lattice_hypercube(dim, extent_val)
+        
+        # Prune lattice images beyond r_cut in real space.
+        # Any image with |A·L| ≥ r_cut cannot contribute to any pair interaction.
+        lattice_real = lattice_np @ box_np.T
+        lattice_norm2 = np.sum(lattice_real * lattice_real, axis=1)
+        lattice_mask = lattice_norm2 < (rcut * rcut)  # |L| < r_cut
+        
+        # Ensure at least one image survives (edge case: very small cutoffs).
+        if not np.any(lattice_mask):
+            lattice_mask = np.ones_like(lattice_norm2, dtype=bool)
+        lattice_np = lattice_np[lattice_mask]
+        
+        # Verify primary cell (L=0) is present after pruning.
+        zero_candidates = np.where(np.all(lattice_np == 0, axis=1))[0]
+        if len(zero_candidates) == 0:
+            # Re-insert zero lattice if missing (should not occur in practice).
+            lattice_np = np.concatenate([lattice_np, np.zeros((1, dim), dtype=np.int32)], axis=0)
+            zero_idx = lattice_np.shape[0] - 1
+        else:
+            zero_idx = int(zero_candidates[0])
+
         lattice = jnp.asarray(lattice_np, dtype=jnp.int32)
         return lattice, zero_idx
 
     def init_fn(positions_frac, *, extra_capacity_override=None, **kwargs):
         positions_frac = jnp.asarray(positions_frac)
         dim = int(positions_frac.shape[1])
-        box_matrix = _current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
+        box_matrix = current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
         lattice_indices, zero_idx = _compute_lattice_indices(box_matrix)
         cap_value = extra_capacity if extra_capacity_override is None else extra_capacity_override
         neighbor_kwargs = dict(kwargs)
         neighbor_kwargs.setdefault("box", box_matrix)
-        neighbors = neighbor_fn.allocate(positions_frac, int(cap_value), **neighbor_kwargs)
+        neighbors = neighbor_fn.allocate(positions_frac, int(cap_value), **neighbor_kwargs) # type: ignore
         return RealSpaceState(
-            neighbors=neighbors,
-            lattice_indices=lattice_indices,
-            zero_image_index=zero_idx,
-            box_matrix=box_matrix,
-            core_fn=core_fn,
+            neighbors=neighbors, # type: ignore
+            lattice_indices=lattice_indices, # type: ignore
+            zero_image_index=zero_idx, # type: ignore
+            box_matrix=box_matrix, # type: ignore
+            core_fn=core_fn, # type: ignore
         )
 
     def apply_fn(state: RealSpaceState, positions_frac, forces, **kwargs):
@@ -441,6 +601,7 @@ def build_Mr_apply(
         if positions_frac.shape != forces.shape:
             raise ValueError("positions and forces must have the same shape.")
 
+        # Overrides from kwargs
         dim = int(positions_frac.shape[1])
         neighbor_override = kwargs.pop("neighbor", None)
         lattice_override = kwargs.pop("lattice_indices", None)
@@ -448,7 +609,7 @@ def build_Mr_apply(
         box_override = kwargs.pop("box_matrix", None)
 
         if box_override is None:
-            box_matrix = _current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
+            box_matrix = current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
         else:
             box_matrix = jnp.asarray(box_override, dtype=REAL_DTYPE)
 
@@ -482,7 +643,7 @@ def build_Mr_apply(
             else:
                 # Outside JIT: reallocate if any error occurred
                 if overflow_py or cell_small_py or malformed_py:
-                    neighbors = neighbor_fn.allocate(positions_frac, int(extra_capacity), **neighbor_kwargs)
+                    neighbors = neighbor_fn.allocate(positions_frac, int(extra_capacity), **neighbor_kwargs) # type: ignore
                 else:
                     neighbors = updated
         else:
@@ -505,11 +666,11 @@ def build_Mr_apply(
         )
 
         next_state = RealSpaceState(
-            neighbors=neighbors,
-            lattice_indices=lattice_indices,
-            zero_image_index=zero_idx,
-            box_matrix=box_matrix,
-            core_fn=core_fn,
+            neighbors=neighbors, # type: ignore
+            lattice_indices=lattice_indices, # type: ignore
+            zero_image_index=zero_idx, # type: ignore
+            box_matrix=box_matrix, # type: ignore
+            core_fn=core_fn, # type: ignore
         )
         return velocities_real, next_state
 
@@ -536,7 +697,9 @@ def mr_matvec(state: RealSpaceState,
     positions_frac : (N,3) array
         Current fractional particle positions.
     vec : (N,3) array
-        Vector to which the mobility is applied (force-like, in fractional basis).
+        Vector to which the mobility is applied (in real coordinates).
+    neighbor : Optional[partition.NeighborList]
+        Optional neighbor list to use instead of the one stored in ``state``.
 
     Returns
     -------

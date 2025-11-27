@@ -1,12 +1,13 @@
 """Scalar helpers for deterministic real-space PSE kernels."""
 
 from functools import partial
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 from jax import config as jax_config
 from jax.scipy.special import erfc
+import numpy as np
 
 
 # Reused constants
@@ -192,3 +193,39 @@ def Mr_self(a, xi):
       4.0 * jnp.sqrt(jnp.pi) * a * xi * erfc(2.0 * a * xi)
   )
   return val
+
+
+def current_box_matrix(
+    displacement_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+    box_fn: Optional[Callable[..., jnp.ndarray]],
+    dim: int,
+    **kwargs,
+) -> jnp.ndarray:
+  """Infer the physical box matrix for a fractional-coordinate space."""
+
+  if box_fn is not None:
+    return jnp.asarray(box_fn(**kwargs))
+
+  closure = getattr(displacement_fn, "__closure__", None)
+  if closure is not None:
+    for cell in closure:
+      val = cell.cell_contents
+      if hasattr(val, "shape") and val.shape == (dim, dim):
+        return jnp.asarray(val)
+
+  origin = jnp.zeros((dim,), dtype=REAL_DTYPE)
+  basis = jnp.eye(dim, dtype=REAL_DTYPE)
+  cols = [displacement_fn(origin, basis[i], **kwargs) for i in range(dim)]
+  return jnp.stack(cols, axis=1)
+
+
+def generate_lattice_hypercube(dim: int, extent: int) -> Tuple[np.ndarray, int]:
+  """Generate integer lattice indices on the symmetric hypercube [-extent, extent]^dim."""
+  extent = max(int(extent), 0)
+  ranges = [np.arange(-extent, extent + 1, dtype=np.int32) for _ in range(dim)]
+  mesh = np.stack(np.meshgrid(*ranges, indexing="ij"), axis=-1).reshape(-1, dim)
+  zero_mask = np.all(mesh == 0, axis=1)
+  if not zero_mask.any():
+    raise RuntimeError("Lattice hypercube generation failed to include the zero vector.")
+  zero_idx = int(np.argmax(zero_mask))
+  return mesh.astype(np.int32, copy=False), zero_idx
