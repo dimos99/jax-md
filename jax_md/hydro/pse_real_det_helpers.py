@@ -195,27 +195,67 @@ def Mr_self(a, xi):
   return val
 
 
+def canonicalize_box_matrix(box_like, dim: int):
+  """Normalize a box specification (scalar / vector / matrix) to a matrix."""
+  if box_like is None:
+    return None
+  arr = jnp.asarray(box_like, dtype=REAL_DTYPE)
+  if arr.ndim == 0:
+    return jnp.eye(dim, dtype=REAL_DTYPE) * arr
+  if arr.ndim == 1:
+    if arr.shape[0] != dim:
+      raise ValueError(f"Box vector has dim {arr.shape[0]}, expected {dim}.")
+    return jnp.diag(arr).astype(REAL_DTYPE)
+  if arr.ndim == 2:
+    if arr.shape[0] != dim or arr.shape[1] != dim:
+      raise ValueError(f"Box matrix must be ({dim},{dim}); got {arr.shape}.")
+    return arr.astype(REAL_DTYPE)
+  return None
+
+
 def current_box_matrix(
     displacement_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
     box_fn: Optional[Callable[..., jnp.ndarray]],
     dim: int,
+    *,
+    fractional_coordinates: bool = True,
     **kwargs,
 ) -> jnp.ndarray:
-  """Infer the physical box matrix for a fractional-coordinate space."""
+  """Infer the physical box matrix for the current space."""
 
+  if "box" in kwargs:
+    candidate = canonicalize_box_matrix(kwargs["box"], dim)
+    if candidate is not None:
+      return candidate
   if box_fn is not None:
-    return jnp.asarray(box_fn(**kwargs))
+    candidate = canonicalize_box_matrix(box_fn(**kwargs), dim)
+    if candidate is not None:
+      return candidate
 
   closure = getattr(displacement_fn, "__closure__", None)
+  freevars = getattr(getattr(displacement_fn, "__code__", None), "co_freevars", None)
   if closure is not None:
+    if freevars is not None:
+      for name, cell in zip(freevars, closure):
+        if name in ("box", "_box"):
+          candidate = canonicalize_box_matrix(cell.cell_contents, dim)
+          if candidate is not None:
+            return candidate
     for cell in closure:
-      val = cell.cell_contents
-      if hasattr(val, "shape") and val.shape == (dim, dim):
-        return jnp.asarray(val)
+      candidate = canonicalize_box_matrix(cell.cell_contents, dim)
+      if candidate is not None:
+        return candidate
 
+  if not fractional_coordinates:
+    raise ValueError(
+        "Real-coordinate spaces require a physical `box` (scalar, vector, or matrix); "
+        "provide one via the space or `box` kwargs.")
+
+  # Probe fractional displacement with a small, non-wrapping step to recover box cols.
   origin = jnp.zeros((dim,), dtype=REAL_DTYPE)
   basis = jnp.eye(dim, dtype=REAL_DTYPE)
-  cols = [displacement_fn(origin, basis[i], **kwargs) for i in range(dim)]
+  eps = jnp.asarray(1e-3, dtype=REAL_DTYPE)
+  cols = [displacement_fn(origin, eps * basis[i], **kwargs) / eps for i in range(dim)]
   return jnp.stack(cols, axis=1)
 
 

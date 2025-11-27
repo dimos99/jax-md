@@ -73,6 +73,7 @@ from jax_md.hydro.pse_real_det_helpers import (
     F1F2_closed_form,
     Mr_self,
     current_box_matrix,
+    canonicalize_box_matrix,
     generate_lattice_hypercube,
 )
 
@@ -86,13 +87,46 @@ I3 = jnp.eye(3, dtype=REAL_DTYPE) # 3x3 identity matrix
 
 @dataclasses.dataclass
 class RealSpaceState:
-    """State for the real-space mobility operator."""
+    """State for the real-space mobility operator.
+
+    This container threads the bookkeeping needed to apply the real-space
+    mobility across timesteps without rebuilding everything. It stores:
+
+    - ``neighbors``: the neighbor list (Dense/Sparse/OrderedSparse).
+    - ``lattice_indices`` / ``zero_image_index``: periodic image shifts for the
+      real-space Ewald sum.
+    - ``box_matrix``: current box transform used for real↔fractional conversion.
+    - ``fractional_coordinates``: whether incoming positions are fractional
+      (``True``) or already in real space (``False``); the matvec converts using
+      this flag.
+    - ``core_fn``: JIT-compiled matvec that consumes the above.
+    """
 
     neighbors: Optional[partition.NeighborList]
     lattice_indices: jnp.ndarray
     zero_image_index: int
     box_matrix: jnp.ndarray
-    core_fn: Callable = dataclasses.field(metadata={'static': True})
+    fractional_coordinates: bool = dataclasses.field(default=True, metadata={'static': True})
+    core_fn: Optional[Callable] = dataclasses.field(default=None, metadata={'static': True})
+
+
+def _positions_to_real(positions: jnp.ndarray,
+                       box_matrix: jnp.ndarray,
+                       fractional_coordinates: bool) -> jnp.ndarray:
+    """Convert positions to real coordinates when provided in fractional form."""
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    if fractional_coordinates:
+        return space.transform(box_matrix, positions)
+    return positions
+
+
+def _neighbor_box_from_matrix(box_matrix: jnp.ndarray,
+                              fractional_coordinates: bool) -> jnp.ndarray:
+    """Box argument passed to neighbor_list depending on coordinate convention."""
+    if fractional_coordinates:
+        return box_matrix
+    # Neighbor lists in real coordinates disallow `box` kwargs; rely on the space.
+    return None
 
 @partial(jax.jit, static_argnums=(1,2,3))
 def Mr_pair_block(r_vec, a, xi, eta):
@@ -135,6 +169,7 @@ def _build_mr_core(
     eta: float,
     rcut2: float,
     neighbor_format: partition.NeighborListFormat,
+    fractional_coordinates: bool,
 ) -> Callable[..., jnp.ndarray]:
     """
     Create the JIT-ed core that evaluates the real-space mobility.
@@ -172,7 +207,7 @@ def _build_mr_core(
     -------
     Callable[..., jnp.ndarray]
         A JIT-compiled function with signature:
-            core(positions_frac, forces, neighbor_idx, neighbor_mask,
+            core(positions, forces, neighbor_idx, neighbor_mask,
                  box_matrix, lattice_indices, zero_image_index) -> velocities
         
         The returned callable evaluates M^r @ forces using the neighbor list and
@@ -195,7 +230,7 @@ def _build_mr_core(
 
     @jax.jit
     def core(
-        positions_frac: jnp.ndarray,
+        positions: jnp.ndarray,
         forces: jnp.ndarray,
         neighbor_idx: jnp.ndarray,
         neighbor_mask: jnp.ndarray,
@@ -214,8 +249,8 @@ def _build_mr_core(
         
         Parameters
         ----------
-        positions_frac : (N, 3) array
-            FRACTIONAL particle positions
+        positions : (N, 3) array
+            Particle positions (fractional if ``fractional_coordinates=True``)
         forces : (N, 3) array
             Forces in REAL units
         neighbor_idx : array
@@ -235,7 +270,7 @@ def _build_mr_core(
             Velocities from real-space mobility evaluation
         """
         # Ensure inputs are JAX arrays with correct dtypes
-        positions_frac = jnp.asarray(positions_frac)
+        positions = jnp.asarray(positions)
         forces = jnp.asarray(forces)
         neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
         neighbor_mask = jnp.asarray(neighbor_mask, dtype=bool)
@@ -243,8 +278,8 @@ def _build_mr_core(
         lattice_indices = jnp.asarray(lattice_indices, dtype=jnp.int32)
         zero_image_index = jnp.int32(zero_image_index)
 
-        # Transform fractional positions to real coordinates
-        x_real = space.transform(box_matrix, positions_frac)
+        # Convert to real coordinates if needed
+        x_real = _positions_to_real(positions, box_matrix, fractional_coordinates)
         
         # Precompute lattice vectors in real space
         lattice_vecs = lattice_indices @ box_matrix.T
@@ -402,6 +437,7 @@ def build_Mr_apply(
     eta,
     rcut,
     *,
+    fractional_coordinates: bool = True,
     dr_threshold=None,
     capacity_multiplier=1.25,
     disable_cell_list=False,
@@ -416,11 +452,16 @@ def build_Mr_apply(
     ----------
     space_fns : tuple
         Typically the tuple returned by ``space.periodic_general`` or
-        ``space.shearing`` with ``fractional_coordinates=True``.
+        ``space.shearing``. Set ``fractional_coordinates`` to match the space.
     a, xi, eta : float
         Hydrodynamic parameters (sphere radius, splitting parameter, viscosity).
     rcut : float
         Real-space cutoff radius (in real units).
+    fractional_coordinates : bool
+        Whether the provided positions are fractional (default) or real. When
+        using real coordinates, the physical box must be supplied (scalar/vector
+        for orthogonal boxes or a matrix) so lattice sums can be constructed. For
+        triclinic boxes, prefer fractional coordinates to keep neighbor lists consistent.
     dr_threshold, capacity_multiplier, disable_cell_list : float / bool
         Passed through to the JAX-MD neighbor-list builder.
     neighbor_format : partition.NeighborListFormat
@@ -439,9 +480,10 @@ def build_Mr_apply(
     Returns
     -------
     init_fn, apply_fn : Callable
-        ``init_fn(positions_frac, **kwargs) -> RealSpaceState`` allocates the
-        neighbor list and lattice indices for the provided fractional positions.
-        ``apply_fn(state, positions_frac, forces, **kwargs)`` returns the real-space
+        ``init_fn(positions, **kwargs) -> RealSpaceState`` allocates the
+        neighbor list and lattice indices for the provided positions (fractional
+        if ``fractional_coordinates`` is True, otherwise real).
+        ``apply_fn(state, positions, forces, **kwargs)`` returns the real-space
         velocity together with the updated state.
     """
 
@@ -458,11 +500,10 @@ def build_Mr_apply(
     displacement_fn, _ = space_fns[:2]
     box_fn = space_fns[2] if len(space_fns) > 2 else None
 
-    # When using fractional coordinates the neighbor list requires a box
-    # parameter at construction time. We don't know the physical box yet
-    # here (it will be threaded in to `allocate`/`update` as kwargs), so
-    # pass a neutral scalar placeholder (1.0). The real box_matrix is
-    # provided later via `neighbor_kwargs.setdefault("box", box_matrix)`.
+    # The neighbor list requires a box parameter at construction time. We don't
+    # know the physical box yet (it will be threaded into `allocate`/`update`
+    # via kwargs), so pass a neutral scalar placeholder (1.0). The real box is
+    # provided later via `neighbor_kwargs.setdefault("box", ...)`.
     neighbor_fn = partition.neighbor_list(
         displacement_fn,
         box=1.0,
@@ -471,12 +512,12 @@ def build_Mr_apply(
         capacity_multiplier=capacity_multiplier,
         disable_cell_list=disable_cell_list,
         mask_self=False,
-        fractional_coordinates=True,
+        fractional_coordinates=fractional_coordinates,
         format=neighbor_format,
     )
 
     rcut2 = float(rcut * rcut)
-    core_fn = _build_mr_core(a, xi, eta, rcut2, neighbor_format)
+    core_fn = _build_mr_core(a, xi, eta, rcut2, neighbor_format, fractional_coordinates)
 
     def _compute_lattice_indices(box_matrix: jnp.ndarray) -> Tuple[jnp.ndarray, int]:
         """
@@ -577,41 +618,50 @@ def build_Mr_apply(
         lattice = jnp.asarray(lattice_np, dtype=jnp.int32)
         return lattice, zero_idx
 
-    def init_fn(positions_frac, *, extra_capacity_override=None, **kwargs):
-        positions_frac = jnp.asarray(positions_frac)
-        dim = int(positions_frac.shape[1])
-        box_matrix = current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
+    def init_fn(positions, *, extra_capacity_override=None, **kwargs):
+        positions = jnp.asarray(positions)
+        dim = int(positions.shape[1])
+        box_matrix = current_box_matrix(
+            displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
         lattice_indices, zero_idx = _compute_lattice_indices(box_matrix)
         cap_value = extra_capacity if extra_capacity_override is None else extra_capacity_override
         neighbor_kwargs = dict(kwargs)
-        neighbor_kwargs.setdefault("box", box_matrix)
-        neighbors = neighbor_fn.allocate(positions_frac, int(cap_value), **neighbor_kwargs) # type: ignore
+        neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
+        if neighbor_box is not None:
+            neighbor_kwargs.setdefault("box", neighbor_box)
+        else:
+            neighbor_kwargs.pop("box", None)
+        neighbors = neighbor_fn.allocate(positions, int(cap_value), **neighbor_kwargs) # type: ignore
         return RealSpaceState(
             neighbors=neighbors, # type: ignore
             lattice_indices=lattice_indices, # type: ignore
             zero_image_index=zero_idx, # type: ignore
             box_matrix=box_matrix, # type: ignore
+            fractional_coordinates=fractional_coordinates, # type: ignore
             core_fn=core_fn, # type: ignore
         )
 
-    def apply_fn(state: RealSpaceState, positions_frac, forces, **kwargs):
-        positions_frac = jnp.asarray(positions_frac)
+    def apply_fn(state: RealSpaceState, positions, forces, **kwargs):
+        positions = jnp.asarray(positions)
         forces = jnp.asarray(forces)
 
-        if positions_frac.shape != forces.shape:
+        if positions.shape != forces.shape:
             raise ValueError("positions and forces must have the same shape.")
 
         # Overrides from kwargs
-        dim = int(positions_frac.shape[1])
+        dim = int(positions.shape[1])
         neighbor_override = kwargs.pop("neighbor", None)
         lattice_override = kwargs.pop("lattice_indices", None)
         zero_override = kwargs.pop("zero_image_index", None)
         box_override = kwargs.pop("box_matrix", None)
 
         if box_override is None:
-            box_matrix = current_box_matrix(displacement_fn, box_fn, dim, **kwargs)
+            box_matrix = current_box_matrix(
+                displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
         else:
-            box_matrix = jnp.asarray(box_override, dtype=REAL_DTYPE)
+            box_matrix = canonicalize_box_matrix(box_override, dim)
+            if box_matrix is None:
+                raise ValueError("box_matrix must be a scalar, vector, or matrix.")
 
         if lattice_override is not None:
             lattice_indices = jnp.asarray(lattice_override, dtype=jnp.int32)
@@ -621,12 +671,16 @@ def build_Mr_apply(
             zero_idx = state.zero_image_index
 
         neighbor_kwargs = dict(kwargs)
-        neighbor_kwargs.setdefault("box", box_matrix)
+        neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
+        if neighbor_box is not None:
+            neighbor_kwargs.setdefault("box", neighbor_box)
+        else:
+            neighbor_kwargs.pop("box", None)
         if neighbor_override is None:
             if state.neighbors is None:
                 raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
             # Use the built-in NeighborList.update() method
-            updated = state.neighbors.update(positions_frac, **neighbor_kwargs)
+            updated = state.neighbors.update(positions, **neighbor_kwargs)
 
             # Check for errors using NeighborList properties
             try:
@@ -643,7 +697,7 @@ def build_Mr_apply(
             else:
                 # Outside JIT: reallocate if any error occurred
                 if overflow_py or cell_small_py or malformed_py:
-                    neighbors = neighbor_fn.allocate(positions_frac, int(extra_capacity), **neighbor_kwargs) # type: ignore
+                    neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
                 else:
                     neighbors = updated
         else:
@@ -656,7 +710,7 @@ def build_Mr_apply(
 
         # Apply core in real units
         velocities_real = core_fn(
-            positions_frac,
+            positions,
             forces_real,
             neighbors.idx,
             mask,
@@ -670,6 +724,7 @@ def build_Mr_apply(
             lattice_indices=lattice_indices, # type: ignore
             zero_image_index=zero_idx, # type: ignore
             box_matrix=box_matrix, # type: ignore
+            fractional_coordinates=fractional_coordinates, # type: ignore
             core_fn=core_fn, # type: ignore
         )
         return velocities_real, next_state
@@ -679,7 +734,7 @@ def build_Mr_apply(
 
 @jax.jit
 def mr_matvec(state: RealSpaceState,
-              positions_frac: jnp.ndarray,
+              positions: jnp.ndarray,
               vec: jnp.ndarray,
               *,
               neighbor: Optional[partition.NeighborList] = None) -> jnp.ndarray:
@@ -694,8 +749,9 @@ def mr_matvec(state: RealSpaceState,
     ----------
     state : RealSpaceState
         Real-space state returned by ``build_Mr_apply``.
-    positions_frac : (N,3) array
-        Current fractional particle positions.
+    positions : (N,3) array
+        Current particle positions (fractional if ``state.fractional_coordinates``
+        is True, otherwise real).
     vec : (N,3) array
         Vector to which the mobility is applied (in real coordinates).
     neighbor : Optional[partition.NeighborList]
@@ -709,7 +765,7 @@ def mr_matvec(state: RealSpaceState,
     if state.core_fn is None:
         raise ValueError("RealSpaceState is missing core_fn; build_Mr_apply must be used.")
 
-    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
     vec = jnp.asarray(vec, dtype=REAL_DTYPE)
     neighbors = neighbor if neighbor is not None else state.neighbors
     if neighbors is None:
@@ -721,7 +777,7 @@ def mr_matvec(state: RealSpaceState,
 
     # Apply real-space mobility in real units
     v_real = state.core_fn(
-        positions_frac,
+        positions,
         forces_real,
         neighbors.idx,
         mask,
