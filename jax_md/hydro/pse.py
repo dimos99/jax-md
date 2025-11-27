@@ -320,9 +320,13 @@ def build_pse_mobility(space_fns, a, xi, eta,
         mw_sqrt_next = state.mw_sqrt_sampler
 
         # Draw stochastic increments from each split (both in real coordinates).
-        real_noise_real = sample_mr_sqrt_precond(
-            key_real, real_state, positions_frac, 
-            precond=precond, iters=mr_iters
+        real_noise_real, rel_change, iters_used, converged = sample_mr_sqrt_precond(
+            key_real,
+            real_state,
+            positions_frac,
+            precond=precond,
+            iters=mr_iters,
+            return_info=True,
         )
         total_noise = jnp.sqrt(2.0 * kT * dt) * (real_noise_real + wave_noise)
 
@@ -337,7 +341,7 @@ def build_pse_mobility(space_fns, a, xi, eta,
             preconditioner=state.preconditioner,
         )
 
-        return total_velocity, total_noise, next_state
+        return total_velocity, total_noise, next_state, rel_change, iters_used, converged
 
     apply_fn.with_brownian = apply_with_brownian
 

@@ -1,15 +1,10 @@
 """Stochastic sampling utilities for the real-space PSE mobility.
 
-The Lanczos-based sampling (Chow & Saad 2014) operates on flattened vectors
-and is agnostic to the physical interpretation of components. It naturally
-extends to stresslet-constrained mobility without modification:
-
-- Force-only mode: M^(r) is 3N×3N, samples are (N,3) velocities
-- Stresslet mode: M^(r) is 6N×6N or 11N×11N (depending on formulation),
-  samples are (N,6) [linear + angular velocities] or (N,11) [U, Omega, E]
-
-The key requirement is that the matvec function (mr_matvec) correctly applies
-the expanded mobility tensor to the input vector.
+The current implementation is force-only: ``mr_matvec`` applies a 3Nx3N mobility
+and the sampler draws/returns arrays of shape ``(N, 3)`` in real coordinates.
+The Lanczos machinery itself is agnostic to the underlying physics, so stresslet
+or higher-order modes would require an expanded ``mr_matvec`` plus matching
+noise/return shapes, which are not wired up here.
 """
 
 import jax
@@ -26,7 +21,7 @@ from jax_md.hydro.pse_real_det import REAL_DTYPE, RealSpaceState, mr_matvec
 
 @dataclasses.dataclass
 class Preconditioner:
-    """Linear-operator preconditioner G for Chow–Saad-style sampling.
+    """Linear-operator preconditioner G for Chow-Saad-style sampling.
 
     We assume GT G \approx M^{-1} so that \bar{M} = G M G^T is better conditioned.
     Only operator applications are required; G and G^T need not be formed explicitly.
@@ -87,8 +82,9 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
                     mv_params,
                     v: jnp.ndarray,
                     *,
-                    iters: int = 20,
-                    tol: float = 1e-3) -> jnp.ndarray:
+                    iters: int = 10,
+                    tol: float = 1e-3,
+                    return_info: bool = False):
     """
     Approximate ``(M)^{1/2} v`` with a Lanczos projection (Chow & Saad, 2014, Eq. (2.6)).
 
@@ -106,13 +102,20 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
         Relative tolerance used for convergence monitoring. Outside of JIT, a
         ``RuntimeError`` is raised if the final iterate fails to satisfy the
         tolerance (mirrors the stopping criterion suggested by Chow & Saad,
-        *SIAM J. Sci. Comput.* 36(2), 2014). Inside JIT, failure to meet the
-        tolerance poisons the result with NaNs.
+        *SIAM J. Sci. Comput.* 36(2), 2014). Inside JIT, the function returns
+        the best-effort approximation; callers can request diagnostics via
+        ``return_info`` to monitor convergence.
+    return_info : bool, optional
+        If ``True``, also return ``(rel_change, iters_used, converged)`` for
+        convergence monitoring (useful inside JIT where exceptions are disallowed).
 
     Returns
     -------
-    array
-        Approximation of ``sqrt(M) @ v`` with the same shape/dtype as ``v``.
+    array or tuple
+        If ``return_info`` is ``False`` (default), the approximation of
+        ``sqrt(M) @ v`` with the same shape/dtype as ``v``. Otherwise returns
+        ``(approx, rel_change, iters_used, converged)`` where ``converged`` is
+        ``rel_change <= tol`` evaluated in device precision.
     """
     if iters <= 0:
         raise ValueError("iters must be positive.")
@@ -286,26 +289,28 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
 
     tol_arr = jnp.asarray(tol, dtype=REAL_DTYPE)
 
+    converged = rel_change <= tol_arr
+
+    def _pack(result):
+        if return_info:
+            return result, rel_change, actual_iters, converged
+        return result
+
     # Outside of JIT, enforce tolerance with a hard error.
     try:
         rel_host = float(rel_change)
         tol_host = float(tol_arr)
     except TypeError:
-        # Inside JIT / tracing context: poison the result with NaNs if tolerance fails.
-        approx = lax.cond(
-            rel_change > tol_arr,
-            lambda x: x * jnp.nan,
-            lambda x: x,
-            approx,
-        )
-        return approx
+        # Inside JIT / tracing context: return best-effort approximation along
+        # with diagnostics if requested.
+        return _pack(approx)
 
     if rel_host > tol_host:
         raise RuntimeError(
             f"lanczos_sqrt_mv failed to reach tol={tol_host:.3e} "
             f"(rel_change={rel_host:.3e}, iters={int(actual_iters)}, requested={iters})."
         )
-    return approx
+    return _pack(approx)
 
 
 def lanczos_sqrt_mv_test(key: jax.Array,
@@ -337,14 +342,15 @@ def lanczos_sqrt_mv_test(key: jax.Array,
     return float(rel_err)
 
 
-@partial(jax.jit, static_argnames=('iters', 'tol'))
+@partial(jax.jit, static_argnames=('iters', 'tol', 'return_info'))
 def sample_mr_sqrt_precond(key: jax.Array,
                            state: RealSpaceState,
-                           positions_frac: jnp.ndarray,
+                           positions: jnp.ndarray,
                            *,
                            precond: Optional[Preconditioner] = None,
                            iters: int = 3,
-                           tol: float = 1e-3) -> jnp.ndarray:
+                           tol: float = 1e-3,
+                           return_info: bool = False):
     """
     Sample ``M^(r)^{1/2} W`` using the preconditioned Lanczos scheme of
     Chow & Saad (2014, §2.2).
@@ -360,26 +366,30 @@ def sample_mr_sqrt_precond(key: jax.Array,
         Random key for the Gaussian draw.
     state : RealSpaceState
         Current real-space state (after updating with ``Mr_apply``).
-    positions_frac : (N,3) array
-        Fractional positions corresponding to ``state``.
+    positions : (N,3) array
+        Positions corresponding to ``state`` (fractional if
+        ``state.fractional_coordinates`` is True, otherwise real).
     precond : Preconditioner, optional
         Linear operator ``G`` used for preconditioning. Defaults to the identity.
     iters : int, optional
-        Maximum number of Lanczos iterations (default 20).
+        Maximum number of Lanczos iterations (default 3).
     tol : float, optional
         Convergence tolerance (default 1e-3). Monitors the change in approximation
         between consecutive iterations and enforces it as described in
         ``lanczos_sqrt_mv``.
+    return_info : bool, optional
+        If True, also return convergence diagnostics from ``lanczos_sqrt_mv``.
 
     Returns
     -------
     (N,3) array
-        Sample from the real-space stochastic increment (in real coordinates).
+        Sample from the real-space stochastic increment (in real coordinates). If
+        ``return_info`` is True, returns ``(sample, rel_change, iters_used, converged)``.
     """
-    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
     precond = _IDENTITY_PRECONDITIONER if precond is None else precond
 
-    noise = jax.random.normal(key, shape=positions_frac.shape, dtype=REAL_DTYPE)
+    noise = jax.random.normal(key, shape=positions.shape, dtype=REAL_DTYPE)
 
     def mv(mv_params, x):
         st, pos, pc = mv_params
@@ -387,26 +397,36 @@ def sample_mr_sqrt_precond(key: jax.Array,
         m_x = mr_matvec(st, pos, x_phys)
         return pc.apply(m_x)
 
-    mv_params = (state, positions_frac, precond)
-    precond_sample = lanczos_sqrt_mv(mv, mv_params, noise, iters=iters, tol=tol)
+    mv_params = (state, positions, precond)
+    lanczos_out = lanczos_sqrt_mv(
+        mv, mv_params, noise, iters=iters, tol=tol, return_info=return_info)
+
+    if return_info:
+        precond_sample, rel_change, iters_used, converged = lanczos_out
+        sample = precond.solve(precond_sample)
+        return sample, rel_change, iters_used, converged
+
+    precond_sample = lanczos_out
     return precond.solve(precond_sample)
 
 
-@partial(jax.jit, static_argnames=('iters', 'tol'))
+@partial(jax.jit, static_argnames=('iters', 'tol', 'return_info'))
 def sample_mr_sqrt(key: jax.Array,
                    state: RealSpaceState,
-                   positions_frac: jnp.ndarray,
+                   positions: jnp.ndarray,
                    *,
                    iters: int = 20,
-                   tol: float = 1e-3) -> jnp.ndarray:
+                   tol: float = 1e-3,
+                   return_info: bool = False):
     """
     Convenience wrapper for ``sample_mr_sqrt_precond`` using the identity preconditioner.
     """
     return sample_mr_sqrt_precond(
         key,
         state,
-        positions_frac,
+        positions,
         precond=_IDENTITY_PRECONDITIONER,
         iters=iters,
         tol=tol,
+        return_info=return_info,
     )
