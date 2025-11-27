@@ -72,7 +72,7 @@ from jax_md.hydro import pse
 # Define shearing box
 gamma_dot = 0.1  # shear rate
 shear_fn = lambda t: gamma_dot * t
-space_fns = space.shearing(box, shear_fn=shear_fn, fractional_coordinates=True)
+space_fns = space.shearing(box, shear_schedule=shear_fn, fractional_coordinates=True)
 
 # Build mobility operator (same pattern)
 init_fn, apply_fn = pse.build_pse_mobility(space_fns, a=0.03, xi=10.0, eta=1.0, P=16, Mgrid=64)

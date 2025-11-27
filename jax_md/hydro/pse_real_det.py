@@ -18,21 +18,20 @@ References
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import erfc
 import numpy as np
 from jax import errors as jax_errors
-from jax import config as jax_config
 
 from typing import Callable, Optional, Tuple
-from functools import partial
 
-from jax_md import dataclasses, partition, space, smap
+from jax_md import dataclasses, partition, space
 from jax import ops
+from jax_md.hydro.pse_real_det_helpers import (
+    REAL_DTYPE,
+    F1F2_closed_form,
+    Mr_self,
+)
 
 
-# Reused constants
-REAL_DTYPE = jnp.float64 if jax_config.jax_enable_x64 else jnp.float32  # type: ignore
-SQRT_PI = jnp.sqrt(jnp.array(jnp.pi, dtype=REAL_DTYPE))
 I3 = jnp.eye(3, dtype=REAL_DTYPE)
 
 
@@ -46,168 +45,7 @@ class RealSpaceState:
     box_matrix: jnp.ndarray
     core_fn: Callable = dataclasses.field(metadata={'static': True})
 
-# --- Closed-form F1,F2 (Fiore Appx. A) ---
-
-@partial(jax.jit, static_argnums=(1,2,3))
-def _F1F2_case_r_gt_2a(r, a, xi, eta):
-    """Fiore Appx. A, Case 1: r > 2a (monodisperse)"""
-    # Common scalars
-    xi2 = xi * xi
-    xi3 = xi2 * xi
-    xi4 = xi2 * xi2
-    r2 = r * r
-    r3 = r2 * r
-    twoa = 2.0 * a
-    ap = twoa + r
-    am = twoa - r
-    ap2 = ap * ap
-    am2 = am * am
-    ap3 = twoa + 3.0 * r
-    am3 = twoa - 3.0 * r
-    p_quad = 4.0 * a * a + 4.0 * a * r + 9.0 * r2
-    m_quad = 4.0 * a * a - 4.0 * a * r + 9.0 * r2
-
-    # Precompute exponentials and erfc's
-    r_xi = r * xi
-    rm2_xi = (r - twoa) * xi
-    rp2_xi = (r + twoa) * xi
-    ex_r   = jnp.exp(-(r_xi) * (r_xi))
-    ex_rm2 = jnp.exp(-(rm2_xi) * (rm2_xi))
-    ex_rp2 = jnp.exp(-(rp2_xi) * (rp2_xi))
-    erfc_r   = erfc(r_xi)
-    erfc_rm2 = erfc(rm2_xi)
-    erfc_rp2 = erfc(rp2_xi)
-
-    # Coefficients for F1:
-    f10 = 0.0
-    f11 = (18.0 * r2 * xi2 + 3.0) / (64.0 * SQRT_PI * a * r2 * xi3)
-    f12 = ( 2.0 * xi2 * am * p_quad - ap3 ) / (128.0 * SQRT_PI * a * r3 * xi3)
-    f13 = ( -2.0 * xi2 * ap * m_quad + am3 ) / (128.0 * SQRT_PI * a * r3 * xi3)
-    f14 = (3.0 - 36.0 * r2 * r2 * xi4) / (128.0 * a * r3 * xi4)
-    f15 = (4.0 * xi4 * (r - twoa) * (r - twoa) * p_quad - 3.0) / (256.0 * a * r3 * xi4)
-    f16 = (4.0 * xi4 * ap2 * m_quad - 3.0) / (256.0 * a * r3 * xi4)
-
-    # Coefficients for F2:
-    f20 = 0.0
-    f21 = (6.0 * r2 * xi2 - 3.0) / (32.0 * SQRT_PI * a * r2 * xi3)
-    f22 = ( -2.0 * xi2 * am2 * ap3 + ap3 ) / (64.0 * SQRT_PI * a * r3 * xi3)
-    f23 = (  2.0 * xi2 * ap2 * am3 - am3 ) / (64.0  * SQRT_PI * a * r3 * xi3)
-    f24 = -3.0 * (4.0 * r2 * r2 * xi4 + 1.0) / (64.0 * a * r3 * xi4)
-    f25 = (3.0 - 4.0 * xi4 * am * am * am * ap3) / (128.0 * a * r3 * xi4)
-    f26 = (3.0 - 4.0 * xi4 * am3 * ap * ap * ap) / (128.0 * a * r3 * xi4)
-
-    F1 = (f10
-        + f11*ex_r + f12*ex_rm2 + f13*ex_rp2
-        + f14*erfc_r + f15*erfc_rm2 + f16*erfc_rp2)
-
-    F2 = (f20
-        + f21*ex_r + f22*ex_rm2 + f23*ex_rp2
-        + f24*erfc_r + f25*erfc_rm2 + f26*erfc_rp2)
-
-    return F1, F2
-
-
-@partial(jax.jit, static_argnums=(1,2,3))
-def _F1F2_case_r_le_2a(r, a, xi, eta):
-    """Fiore Appx. A, Case 2: r <= 2a (monodisperse)"""
-    # Common scalars
-    xi2 = xi * xi
-    xi3 = xi2 * xi
-    xi4 = xi2 * xi2
-    r2 = r * r
-    r3 = r2 * r
-    twoa = 2.0 * a
-    ap = twoa + r
-    am = twoa - r
-    ap2 = ap * ap
-    am2 = am * am
-    ap3 = twoa + 3.0 * r
-    am3 = twoa - 3.0 * r
-    p_quad = 4.0 * a * a + 4.0 * a * r + 9.0 * r2
-    m_quad = 4.0 * a * a - 4.0 * a * r + 9.0 * r2
-
-    # Precompute exponentials and erfc's
-    r_xi = r * xi
-    rm2_xi = (r - twoa) * xi
-    rp2_xi = (r + twoa) * xi
-    ex_r   = jnp.exp(-(r_xi) * (r_xi))
-    ex_rm2 = jnp.exp(-(rm2_xi) * (rm2_xi))
-    ex_rp2 = jnp.exp(-(rp2_xi) * (rp2_xi))
-    erfc_r   = erfc(r_xi)
-    erfc_rm2 = erfc(rm2_xi)
-    erfc_rp2 = erfc(rp2_xi)
-
-    # Coefficients for F1:
-    f10 = -((r - twoa) * (r - twoa) * p_quad) / (32.0 * a * r3)
-    f11 = (18.0 * r2 * xi2 + 3.0) / (64.0 * SQRT_PI * a * r2 * xi3)
-    f12 = ( 2.0 * xi2 * am * p_quad - ap3 ) / (128.0 * SQRT_PI * a * r3 * xi3)
-    f13 = ( -2.0 * xi2 * ap * m_quad + am3 ) / (128.0 * SQRT_PI * a * r3 * xi3)
-    f14 = (3.0 - 36.0 * r2 * r2 * xi4) / (128.0 * a * r3 * xi4)
-    f15 = (4.0 * xi4 * (r - twoa) * (r - twoa) * p_quad - 3.0) / (256.0 * a * r3 * xi4)
-    f16 = (4.0 * xi4 * ap2 * m_quad - 3.0) / (256.0 * a * r3 * xi4)
-
-    # Coefficients for F2:
-    f20 = (am * am * am * ap3) / (16.0 * a * r3)
-    f21 = (6.0 * r2 * xi2 - 3.0) / (32.0 * SQRT_PI * a * r2 * xi3)
-    f22 = ( -2.0 * xi2 * am2 * ap3 + ap3 ) / (64.0  * SQRT_PI * a * r3 * xi3)
-    f23 = (  2.0 * xi2 * ap2 * am3 - am3 ) / (64.0   * SQRT_PI * a * r3 * xi3)
-    f24 = -3.0 * (4.0 * r2 * r2 * xi4 + 1.0) / (64.0 * a * r3 * xi4)
-    f25 = (3.0 - 4.0 * xi4 * am * am * am * ap3) / (128.0 * a * r3 * xi4)
-    f26 = (3.0 - 4.0 * xi4 * am3 * ap * ap * ap) / (128.0 * a * r3 * xi4)
-
-    F1 = (f10
-        + f11*ex_r + f12*ex_rm2 + f13*ex_rp2
-        + f14*erfc_r + f15*erfc_rm2 + f16*erfc_rp2)
-
-    F2 = (f20
-        + f21*ex_r + f22*ex_rm2 + f23*ex_rp2
-        + f24*erfc_r + f25*erfc_rm2 + f26*erfc_rp2)
-
-    return F1, F2
-
-
-@partial(jax.jit, static_argnums=(1,2,3))
-def F1F2_closed_form(r, a, xi, eta):
-    """
-    Return (F1,F2) for all r >= 0 using Fiore's closed forms (monodisperse).
-    
-    Parameters
-    ----------
-    r : array_like
-        Separation distance(s)
-    a : float
-        Sphere radius
-    xi : float
-        Pse splitting parameter
-    eta : float
-        Fluid viscosity
-        
-    Returns
-    -------
-    F1, F2 : arrays
-        Mobility coefficients (same shape as r)
-    """
-    r = jnp.asarray(r)
-    twoa = 2.0 * a
-
-    # Evaluate only the required branch per element using lax.cond
-    def f1f2_one(ri):
-        return jax.lax.cond(
-            ri > twoa,
-            lambda rv: _F1F2_case_r_gt_2a(rv, a, xi, eta),
-            lambda rv: _F1F2_case_r_le_2a(rv, a, xi, eta),
-            ri,
-        )
-
-    if r.ndim == 0:
-        return f1f2_one(r)
-    else:
-        r_flat = r.reshape(-1)
-        F1_flat, F2_flat = jax.vmap(f1f2_one)(r_flat)
-        return F1_flat.reshape(r.shape), F2_flat.reshape(r.shape)
-
-
-@partial(jax.jit, static_argnums=(1,2,3)) #UNUSED
+@jax.jit
 def Mr_pair_block(r_vec, a, xi, eta):
     """
     Given separation vector r_vec (R^3), return 3x3 block M^r_ij.
@@ -229,40 +67,14 @@ def Mr_pair_block(r_vec, a, xi, eta):
         Real-space mobility block
     """
     r2 = jnp.dot(r_vec, r_vec)
-    r  = jnp.sqrt(r2 + 1e-300)
+    r = jnp.sqrt(r2 + 1e-300)
     rhat = r_vec / r
-    F1, F2 = F1F2_closed_form(r, a, xi, eta)
+    F1, F2 = F1F2_closed_form(r, a, xi)
     
-    # Compute outer product and scaling together
     prefactor = 1.0 / (6.0 * jnp.pi * eta * a)
     rhat_outer = jnp.outer(rhat, rhat)
     Mr = prefactor * (F1 * (I3 - rhat_outer) + F2 * rhat_outer)
     return Mr
-
-
-@partial(jax.jit, static_argnums=(1,2))
-def Mr_self(a, xi, eta):
-    """
-    Self-mobility diagonal factor (Fiore Appx. A, Eq. A4).
-    
-    Parameters
-    ----------
-    a : float
-        Sphere radius
-    xi : float
-        Pse splitting parameter
-    eta : float
-        Fluid viscosity
-        
-    Returns
-    -------
-    float
-        Self-mobility coefficient (applies to each Cartesian component)
-    """
-    val = (1.0/(4.0*jnp.sqrt(jnp.pi)*xi*a)) * (
-        1.0 - jnp.exp(-4.0*a*a*xi*xi) + 4.0*jnp.sqrt(jnp.pi)*a*xi*erfc(2.0*a*xi)
-    )
-    return val / (6.0 * jnp.pi * eta * a)
 
 
 def _current_box_matrix(
@@ -310,7 +122,8 @@ def _build_mr_core(
 ) -> Callable[..., jnp.ndarray]:
     """Create the JIT-ed core that evaluates the real-space mobility."""
 
-    self_term = Mr_self(a, xi, eta)
+    self_factor = Mr_self(a, xi)
+    prefactor_scalar = 1.0 / (6.0 * np.pi * eta * a)
     include_ordered_backflow = neighbor_format is partition.NeighborListFormat.OrderedSparse
     uses_sparse = partition.is_sparse(neighbor_format)
 
@@ -367,14 +180,14 @@ def _build_mr_core(
         lattice_vecs = lattice_indices @ box_matrix.T
         N = x_real.shape[0]
         n_images = lattice_vecs.shape[0]
-        dim = x_real.shape[1]
+
+        dtype = x_real.dtype
+        prefactor = jnp.asarray(prefactor_scalar, dtype=dtype)
+        self_term = prefactor * jnp.asarray(self_factor, dtype=dtype)
 
         # Early exit when no neighbors or lattice images are present.
         if n_images == 0:
             return self_term * forces
-
-        dtype = x_real.dtype
-        zero_vec = jnp.zeros((dim,), dtype=dtype)
 
         if not uses_sparse:
             if neighbor_idx.ndim == 1:
@@ -411,11 +224,9 @@ def _build_mr_core(
             # Normalize separation vectors; drop invalid entries to avoid NaNs.
             rhat = jnp.where(valid_pairs[..., None], rij / safe_r[..., None], 0.0)
 
-            F1, F2 = F1F2_closed_form(safe_r, a, xi, eta)
+            F1, F2 = F1F2_closed_form(safe_r, a, xi)
             F1 = jnp.where(valid_pairs, F1, 0.0)
             F2 = jnp.where(valid_pairs, F2, 0.0)
-
-            prefactor = jnp.asarray(1.0 / (6.0 * jnp.pi * eta * a), dtype=dtype)
 
             # Fused mobility-force contraction to avoid materializing Mr_blocks tensor.
             # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
@@ -466,11 +277,9 @@ def _build_mr_core(
 
         rhat = jnp.where(mask_pairs[..., None], rij / safe_r[..., None], 0.0)
 
-        F1, F2 = F1F2_closed_form(safe_r, a, xi, eta)
+        F1, F2 = F1F2_closed_form(safe_r, a, xi)
         F1 = jnp.where(mask_pairs, F1, 0.0)
         F2 = jnp.where(mask_pairs, F2, 0.0)
-
-        prefactor = jnp.asarray(1.0 / (6.0 * jnp.pi * eta * a), dtype=dtype)
 
         # Fused mobility-force contraction.
         # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
