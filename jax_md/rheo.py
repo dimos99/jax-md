@@ -50,15 +50,26 @@ f32 = jnp.float32
 f64 = jnp.float64
 
 
-def make_pairwise_stress_fn(pair_energy_for_stress):
+def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
     """
     Return an Irving-Kirkwood stress function derived from a pair-energy callable.
 
     The returned function expects positions (fractional or real), a box matrix,
     and optional neighbor list, and produces an instantaneous stress tensor.
+    
+    The `pair_energy_for_stress` function should accept pairwise distances `dr`
+    and any parameters specified in `kwargs`. Parameters are automatically 
+    broadcast/combined following the same conventions as `smap` functions.
+    
+    Args:
+        pair_energy_for_stress: A function that computes the pairwise energy.
+        **kwargs: Arguments providing parameters to the mapped function, 
+            including combinators. See `smap.pair` for details.
     """
     if pair_energy_for_stress is None:
         raise ValueError("pair_energy_for_stress must be provided.")
+        
+    params, combinators = smap._split_params_and_combinators(kwargs)
 
     def _sum_pair_energy(dr, **pkw):
         return jnp.sum(pair_energy_for_stress(dr, **pkw))
@@ -71,10 +82,14 @@ def make_pairwise_stress_fn(pair_energy_for_stress):
                   *,
                   neighbor=None,
                   fractional_coordinates: bool = True,
-                  **kwargs) -> Array:
+                  **dynamic_kwargs) -> Array:
         H = jnp.asarray(box, dtype=R.dtype)
         vol = quantity.volume(H.shape[0], H)
         Rf = R if fractional_coordinates else space.transform(jnp.linalg.inv(H), R)
+        
+        # Merge static and dynamic parameters
+        merged_kwargs = util.merge_dicts(params, dynamic_kwargs)
+        species = merged_kwargs.pop('species', None)
 
         if neighbor is None:
             dSf = Rf[:, None, :] - Rf[None, :, :]
@@ -85,7 +100,13 @@ def make_pairwise_stress_fn(pair_energy_for_stress):
             mask = f32(1.0) - jnp.eye(Rf.shape[0], dtype=Rf.dtype)
             dr = dr * mask
 
-            dUdR = pair_force_mag_fn(dr, **kwargs)
+            # Use smap helper to broadcast parameters to [N, N] (if possible)
+            # Expand per-particle params (e.g., charge[i]) to pairwise params
+            # (charge[i,j]) using smap combinators.
+            mapped_kwargs = smap._kwargs_to_parameters(species, merged_kwargs, combinators)
+
+            dUdR = pair_force_mag_fn(dr, **mapped_kwargs)
+
             f_mag = -dUdR * mask
 
             eps = jnp.array(1e-12, dtype=Rf.dtype)
@@ -104,7 +125,13 @@ def make_pairwise_stress_fn(pair_energy_for_stress):
             dR = space.transform(H, dSf)
             dr = space.distance(dR)
 
-            dUdR = pair_force_mag_fn(dr, **kwargs)
+            # Use smap helper to get per-bond parameters
+            # Map per-particle params to per-bond params in neighbor list order.
+            mapped_kwargs = smap._neighborhood_kwargs_to_params(
+                neighbor.format, neighbor.idx, species, merged_kwargs, combinators
+            )
+
+            dUdR = pair_force_mag_fn(dr, **mapped_kwargs)
             f_mag = -dUdR * pair_mask
 
             eps = jnp.array(1e-12, dtype=Rf.dtype)
@@ -126,7 +153,13 @@ def make_pairwise_stress_fn(pair_energy_for_stress):
             dR = space.transform(H, dSf)
             dr = space.distance(dR)
 
-            dUdR = pair_force_mag_fn(dr, **kwargs)
+            # Use smap helper to get per-neighbor parameters
+            # Map per-particle params to per-bond params in neighbor list order.
+            mapped_kwargs = smap._neighborhood_kwargs_to_params(
+                neighbor.format, neighbor.idx, species, merged_kwargs, combinators
+            )
+
+            dUdR = pair_force_mag_fn(dr, **mapped_kwargs)
             f_mag = -dUdR * mask
 
             eps = jnp.array(1e-12, dtype=Rf.dtype)
