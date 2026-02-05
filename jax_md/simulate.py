@@ -2292,3 +2292,960 @@ def temp_csvr(energy_or_force_fn: Callable[..., Array],
     state = velocity_verlet(force_fn, shift_fn, dt, state, **kwargs)
     return state
   return init_fn, apply_fn
+
+
+@dataclasses.dataclass
+class HardSphereBrownianState:
+  """State for hard-sphere Brownian dynamics.
+
+  Attributes:
+    position: The current position of the particles.
+    mobility: The mobility of particles.
+    rng: Key for random number generation.
+    time: Current simulation time.
+    stress: Collisional stress tensor from hard-sphere constraints at the
+      latest step (shape [dim, dim], excludes ideal term).
+    collided: Boolean mask of particles that collided during the latest step.
+  """
+  position: Array
+  mobility: Array
+  rng: Array
+  time: float
+  stress: Array
+  collided: Array
+  reached_max_collision_loops: Array
+
+
+def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
+                         displacement_fn: space.DisplacementFn,
+                         shift_fn: ShiftFn,
+                         dt: float,
+                         kT: float,
+                         diameter: float,
+                         mobility: Union[float, Array] = 1.0,
+                         max_collision_loops: int = 100,
+                         event_time_tol: Optional[float] = None,
+                         dense_neighbor_update: bool = False,
+                         shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None] = None,
+                         t0: float = 0.0,
+                         fractional_coordinates: bool = True,
+                         remap: bool = True,
+                         box: Optional[Box] = None,
+                         box_fn: Optional[Callable[..., Box]] = None) -> Simulator:
+  """Hard-sphere Brownian dynamics via Strating's event-driven method under shear.
+
+  Args:
+    energy_or_force_fn: Function to calculate energy or force.
+    displacement_fn: Function to compute displacements.
+    shift_fn: Function to shift positions.
+    dt: Time step.
+    kT: Thermal energy.
+    diameter: Hard sphere diameter (sigma).
+    mobility: Mobility coefficient.
+    max_collision_loops: Safety cap on collision events per step.
+    event_time_tol: Absolute tolerance for treating near-zero collision times
+      as immediate events (to avoid zero-time stalls). If None, defaults to
+      1e-9 and is capped by `dt`.
+    shear_schedule: Shear schedule function or dict.
+    t0: Initial time.
+    fractional_coordinates: If True, positions are fractional coordinates in [0, 1).
+    remap: If True, use reduced shear (gamma in [-0.5, 0.5)) and remap coords at
+      half-integer crossings when using fractional positions.
+    dense_neighbor_update: If True and a dense neighbor list is provided,
+      use local event-table updates. This assumes the displacement function is
+      time-independent (e.g., no shear or other explicit time dependence).
+    box: Optional constant box used to compute the collisional stress tensor.
+    box_fn: Optional callable returning the box (e.g. `box_of` from
+      `space.shearing`). If provided, stress is normalized by the box volume.
+      Note: if you pass a `neighbor` kwarg to `apply_fn`, it may be `Dense`,
+      `Sparse`, or `OrderedSparse` (from `partition.neighbor_list`). For
+      time-dependent displacement (e.g., shear), keep
+      `dense_neighbor_update=False` to use the global pair-time recomputation
+      path.
+      Important: when `neighbor` is provided, collisions are checked only for
+      the listed pairs; to guarantee no overlaps, ensure the neighbor list's
+      cutoff/skin is large enough to include any pair that could reach contact
+      within one `dt` (or omit `neighbor` to check all pairs).
+
+  Returns:
+    A pair `(init_fn, apply_fn)`.
+
+  Notes:
+    - If `fractional_coordinates=True`, positions are stored in fractional
+      coordinates in `[0, 1)^d`, but displacements / forces / velocities are
+      in real space.
+    - Within each `dt`, the Brownian increment is interpreted as a constant
+      peculiar velocity (Strating), and overlaps are removed by processing
+      elastic binary collisions in temporal order using the total relative
+      velocity (peculiar + affine-from-shear).
+    - With `space.shearing(..., remap=True)`, reduced shear is discontinuous at
+      half-integer gamma. When using fractional coordinates, the corresponding
+      unimodular coordinate remap must be applied at the crossing time to keep
+      real-space trajectories continuous and avoid missed collisions.
+    - The returned state includes `stress`, the collisional hard-sphere stress
+      over the last step computed from collision-induced velocity kicks as
+        σ = -(1 / (V dt)) Σ ((Δv_i dt) ⊗ r_c),
+      where r_c = diameter * n is the separation vector at contact and
+      Δv_i = v_i^* - v_i is the collision-induced jump in the peculiar velocity
+      of one particle. For equal masses, Δv_rel = (v_i^* - v_j^*) - (v_i - v_j)
+      satisfies Δv_rel = 2 Δv_i, so if you only track the relative change you
+      should use 0.5 * Δv_rel. If no `box`/`box_fn` is provided, `stress` is
+      returned as zeros.
+  """
+  force_fn = quantity.canonicalize_force(energy_or_force_fn)
+  dt = jnp.asarray(dt)
+  diameter = jnp.asarray(diameter)
+  diameter_sq = diameter ** 2
+  t0 = jnp.asarray(t0, dtype=dt.dtype)
+
+  if box is not None and box_fn is not None:
+    raise ValueError(
+        "brownian_hard_sphere: specify at most one of box and box_fn.")
+
+  if box is not None:
+    box_const = jnp.asarray(box)
+
+    def _box_at_time(**kwargs):
+      return box_const
+  else:
+    _box_at_time = box_fn
+
+  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
+  shear_at = _make_shear_at(sf_xy, sf_xz, sf_yz)
+
+  def _affine_velocity(R, g_dot_xy, g_dot_xz, g_dot_yz):
+    """Affine velocity u(R) for simple shear in 2D/3D."""
+    dim = R.shape[-1]
+    vx = g_dot_xy * R[..., 1]
+    if dim == 2:
+      zeros = jnp.zeros_like(vx)
+      return jnp.stack([vx, zeros], axis=-1)
+    vz = R[..., 2]
+    vx = vx + g_dot_xz * vz
+    vy = g_dot_yz * vz
+    zeros = jnp.zeros_like(vx)
+    return jnp.stack([vx, vy, zeros], axis=-1)
+
+  def _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz):
+    """Relative affine velocity u_i - u_j expressed via separation dr = r_i - r_j."""
+    return _affine_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
+
+  @jit
+  def init_fn(key, R, **kwargs):
+    mu = kwargs.get('mobility', mobility)
+    time0 = jnp.array(t0, dtype=R.dtype)
+    stress0 = jnp.zeros((R.shape[1], R.shape[1]), dtype=R.dtype)
+    collided0 = jnp.zeros((R.shape[0],), dtype=bool)
+    reached_max0 = jnp.array(False)
+    state = HardSphereBrownianState(R, mu, key, time0, stress0, collided0, reached_max0)
+    state = canonicalize_mobility(state)
+    return state
+
+  def _pair_indices_and_mask(neighbor, n_particles):
+    """Return (i_idx, j_idx, mask) for all candidate collision pairs."""
+    def _sort_pairs(i_idx, j_idx, mask):
+      sent = jnp.asarray(n_particles, dtype=i_idx.dtype)
+      i_safe = jnp.where(mask, i_idx, sent)
+      j_safe = jnp.where(mask, j_idx, sent)
+      key = i_safe * (n_particles + 1) + j_safe
+      order = jnp.argsort(key)
+      return i_idx[order], j_idx[order], mask[order]
+
+    if neighbor is None:
+      i_idx, j_idx = jnp.triu_indices(n_particles, 1)
+      mask = jnp.ones_like(i_idx, dtype=bool)
+      return i_idx, j_idx, mask
+
+    idx = neighbor.idx
+    if partition.is_sparse(neighbor.format):
+      if idx.ndim != 2 or idx.shape[0] != 2:
+        raise ValueError(
+            "brownian_hard_sphere: sparse neighbor.idx must have shape "
+            "[2, max_neighbors].")
+      i_idx = idx[0]
+      j_idx = idx[1]
+      mask = i_idx < n_particles
+      i_idx = jnp.where(mask, i_idx, 0)
+      j_idx = jnp.where(mask, j_idx, 0)
+      return _sort_pairs(i_idx, j_idx, mask)
+
+    if idx.ndim != 2 or idx.shape[0] != n_particles:
+      raise ValueError(
+          "brownian_hard_sphere: dense neighbor.idx must have shape "
+          "[N, max_occupancy].")
+    i_broad = jnp.broadcast_to(jnp.arange(n_particles)[:, None], idx.shape)
+    i_idx = i_broad.reshape(-1)
+    j_idx = idx.reshape(-1)
+    mask = (j_idx < n_particles) & (j_idx > i_idx)
+    j_idx = jnp.where(mask, j_idx, 0)
+    return _sort_pairs(i_idx, j_idx, mask)
+
+  if event_time_tol is None:
+    time_tol = jnp.asarray(1e-9, dtype=dt.dtype)
+  else:
+    time_tol = jnp.asarray(event_time_tol, dtype=dt.dtype)
+  time_tol = jnp.minimum(time_tol, dt)
+  # Used to prevent pathological near-zero event times from stalling the loop.
+  NO_EVENT_TIME = jnp.asarray(1e8, dtype=dt.dtype)
+
+  if dense_neighbor_update and shear_schedule is not None:
+    raise ValueError(
+        "brownian_hard_sphere: dense_neighbor_update assumes time-independent "
+        "displacement; disable or remove shear_schedule.")
+
+  def _supports_batched_displacement(dim):
+    # Many displacement fns (e.g. space.periodic) accept only vector inputs,
+    # while `space.shearing` explicitly supports batched inputs. We detect this
+    # once at construction time so collision prediction can use the fast path.
+    try:
+      dummy = jax.ShapeDtypeStruct((2, dim), jnp.float32)
+      out = jax.eval_shape(lambda a, b: displacement_fn(a, b, t=f32(0.0)), dummy, dummy)
+      return out.shape == (2, dim)
+    except Exception:
+      return False
+
+  _batched_disp_2d = _supports_batched_displacement(2)
+  _batched_disp_3d = _supports_batched_displacement(3)
+
+  @jit
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    _kT = step_kwargs.pop('kT', kT)
+
+    R_start, mu, key, time, _, _, _ = dataclasses.astuple(state)
+    dim = R_start.shape[1]
+    N = R_start.shape[0]
+    t_zero = jnp.asarray(0.0, dtype=dt.dtype)
+
+    neighbor = step_kwargs.get('neighbor', None)
+
+    # --- Shear rate (unwrapped, for affine velocity) ---
+    gamma_xy_0, gamma_xz_0, gamma_yz_0 = shear_at(time, dim)
+    gamma_xy_1, gamma_xz_1, gamma_yz_1 = shear_at(time + dt, dim)
+    g_dot_xy = (gamma_xy_1 - gamma_xy_0) / dt
+    g_dot_xz = (gamma_xz_1 - gamma_xz_0) / dt
+    g_dot_yz = (gamma_yz_1 - gamma_yz_0) / dt
+
+    # --- Reduced shear (for force kernels / consistency with shearing remap) ---
+    if remap:
+      curr_xy, curr_xz, curr_yz, m_prev_xy, m_prev_xz, m_prev_yz = _reduce_shear_strain(
+          gamma_xy_0, gamma_xz_0, gamma_yz_0, dim)
+      _, _, _, m_curr_xy, m_curr_xz, m_curr_yz = _reduce_shear_strain(
+          gamma_xy_1, gamma_xz_1, gamma_yz_1, dim)
+      m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
+      m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
+      m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
+    else:
+      curr_xy, curr_xz, curr_yz = gamma_xy_0, gamma_xz_0, gamma_yz_0
+      m_xy = m_xz = m_yz = jnp.array(0, dtype=jnp.int32)
+
+    # Guard against multiple remap crossings in a single step. This is rare and
+    # can be avoided by reducing dt (or disabling remap).
+    if remap and fractional_coordinates:
+      too_many = (jnp.abs(m_xy) > 1) | (jnp.abs(m_xz) > 1) | (jnp.abs(m_yz) > 1)
+
+      def _remap_error(flag):
+        if flag:
+          raise RuntimeError(
+              "brownian_hard_sphere: dt crosses multiple shear remap boundaries; "
+              "reduce dt or set remap=False.")
+
+      jax.debug.callback(_remap_error, too_many)
+
+    # Setup kwargs for force/energy at the start of the step.
+    force_kwargs = dict(step_kwargs)
+    if dim >= 3:
+      force_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
+    else:
+      force_kwargs['gamma'] = curr_xy
+    force_kwargs['t'] = time
+    
+    # --- Construct Strating "velocity" from force + noise over dt ---
+    F = force_fn(R_start, **force_kwargs)
+    mobility_arr = jnp.asarray(mu, dtype=R_start.dtype)
+
+    key, split = random.split(key)
+    xi = random.normal(split, R_start.shape, R_start.dtype)
+    dR_noise = jnp.sqrt(f32(2) * mobility_arr * _kT * dt) * xi
+    v_peculiar = (mobility_arr * F * dt + dR_noise) / dt
+
+    # --- Collisional stress bookkeeping ---
+    box_for_volume = step_kwargs.get('box', None)
+    if box_for_volume is None and _box_at_time is not None:
+      box_for_volume = _box_at_time(t=time)
+
+    compute_stress = box_for_volume is not None
+    if compute_stress:
+      box_for_volume = jnp.asarray(box_for_volume, dtype=R_start.dtype)
+      volume = quantity.volume(dim, box_for_volume)
+    else:
+      volume = f32(1.0)
+
+    stress_zero = jnp.zeros((dim, dim), dtype=R_start.dtype)
+    collided_zero = jnp.zeros((N,), dtype=bool)
+
+    # --- Shear-remap discontinuities (fractional positions only) ---
+    if remap and fractional_coordinates:
+      remap_eps = f32(1e-12)
+
+      def _remap_cross_time(g0, gdot, m_prev, m_step):
+        # Crossing occurs when floor(g + 0.5) changes, i.e. at half-integers.
+        m_step_f = jnp.asarray(m_step, dtype=g0.dtype)
+        sign = jnp.sign(m_step_f)
+        g_cross = jnp.asarray(m_prev, dtype=g0.dtype) + f32(0.5) * sign
+        safe_gdot = jnp.where(jnp.abs(gdot) > f32(0.0), gdot, f32(1.0))
+        t_cross = (g_cross - g0) / safe_gdot
+        t_cross = jnp.clip(t_cross, f32(0.0), dt)
+        return jnp.where(m_step != 0, t_cross, NO_EVENT_TIME)
+
+      t_cross_xy = _remap_cross_time(gamma_xy_0, g_dot_xy, m_prev_xy, m_xy)
+      if dim >= 3:
+        t_cross_xz = _remap_cross_time(gamma_xz_0, g_dot_xz, m_prev_xz, m_xz)
+        t_cross_yz = _remap_cross_time(gamma_yz_0, g_dot_yz, m_prev_yz, m_yz)
+      else:
+        t_cross_xz = t_cross_yz = NO_EVENT_TIME
+
+      pending_xy = m_xy != 0
+      pending_xz = (dim >= 3) & (m_xz != 0)
+      pending_yz = (dim >= 3) & (m_yz != 0)
+    else:
+      remap_eps = f32(0.0)
+      t_cross_xy = t_cross_xz = t_cross_yz = NO_EVENT_TIME
+      pending_xy = jnp.array(False)
+      pending_xz = jnp.array(False)
+      pending_yz = jnp.array(False)
+
+    # --- Event-driven collision loop ---
+    # Dense neighbor lists enable local time-table updates; sparse/none fall
+    # back to the global pair-time recomputation path.
+    use_dense_neighbor = (
+        dense_neighbor_update and
+        (neighbor is not None) and
+        (not partition.is_sparse(neighbor.format))
+    )
+    use_batched_disp = _batched_disp_3d if dim >= 3 else _batched_disp_2d
+
+    def _predict_times(Ra, Rb, Va, Vb, abs_t):
+      shape = Ra.shape[:-1]
+      ra_flat = Ra.reshape(-1, dim)
+      rb_flat = Rb.reshape(-1, dim)
+      va_flat = Va.reshape(-1, dim)
+      vb_flat = Vb.reshape(-1, dim)
+
+      if use_batched_disp:
+        dr_flat = displacement_fn(ra_flat, rb_flat, t=abs_t)
+      else:
+        dr_flat = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(ra_flat, rb_flat)
+
+      dv_flat = (va_flat - vb_flat) + _affine_relative_velocity(
+          dr_flat, g_dot_xy, g_dot_xz, g_dot_yz)
+
+      a = jnp.sum(dv_flat * dv_flat, axis=-1)
+      b = 2 * jnp.sum(dr_flat * dv_flat, axis=-1)
+      c = jnp.sum(dr_flat * dr_flat, axis=-1) - diameter_sq
+      delta = b**2 - 4 * a * c
+
+      is_overlapping = c < 0
+      is_approaching = b < 0
+      valid_quad = (delta >= 0) & (a > f32(1e-12))
+
+      safe_delta = jnp.where(valid_quad, delta, f32(1.0))
+      safe_a = jnp.where(valid_quad, a, f32(1.0))
+      t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
+      t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
+      t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
+
+      resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
+      t_event = jnp.where(resolve_now, time_tol, t_hit)
+      t_event = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
+      return t_event.reshape(shape)
+
+    def _advance_no_collision(loop_init):
+      def loop_cond(loop_state):
+        t_curr, _, _, _, _, count, *_ = loop_state
+        return (t_curr < dt - time_tol) & (count < max_collision_loops)
+
+      def loop_body(loop_state):
+        t_curr, R_curr, V_curr, stress_accum, collided_accum, count, pend_xy, pend_xz, pend_yz = loop_state
+
+        pend_any = pend_xy | pend_xz | pend_yz
+        t_next_remap = jnp.minimum(
+            jnp.minimum(
+                jnp.where(pend_xy, t_cross_xy, NO_EVENT_TIME),
+                jnp.where(pend_xz, t_cross_xz, NO_EVENT_TIME),
+            ),
+            jnp.where(pend_yz, t_cross_yz, NO_EVENT_TIME),
+        )
+
+        do_remap_now = pend_any & (t_curr >= t_next_remap - remap_eps)
+
+        def _apply_remap_event(_):
+          apply_xy = pend_xy & (jnp.abs(t_cross_xy - t_next_remap) <= remap_eps)
+          apply_xz = pend_xz & (jnp.abs(t_cross_xz - t_next_remap) <= remap_eps)
+          apply_yz = pend_yz & (jnp.abs(t_cross_yz - t_next_remap) <= remap_eps)
+
+          m_apply_xy = jnp.where(apply_xy, m_xy, jnp.array(0, dtype=jnp.int32))
+          m_apply_xz = jnp.where(apply_xz, m_xz, jnp.array(0, dtype=jnp.int32))
+          m_apply_yz = jnp.where(apply_yz, m_yz, jnp.array(0, dtype=jnp.int32))
+
+          R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
+          t_new = jnp.minimum(t_next_remap + remap_eps, dt)
+
+          return (
+              t_new,
+              R_remap,
+              V_curr,
+              stress_accum,
+              collided_accum,
+              count + 1,
+              pend_xy & (~apply_xy),
+              pend_xz & (~apply_xz),
+              pend_yz & (~apply_yz),
+          )
+
+        def _advance_linear(_):
+          step_limit_remap = jnp.where(pend_any, t_next_remap - remap_eps, dt)
+          step = jnp.minimum(dt - t_curr, step_limit_remap - t_curr)
+          step = jnp.maximum(step, f32(0.0))
+
+          dR_step = V_curr * step
+          if not fractional_coordinates:
+            dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
+
+          kwargs_step = dict(step_kwargs)
+          kwargs_step.pop('gamma', None)
+          kwargs_step.pop('gamma_xy', None)
+          kwargs_step.pop('gamma_xz', None)
+          kwargs_step.pop('gamma_yz', None)
+          kwargs_step['t'] = time + t_curr + step
+
+          R_next = shift_fn(R_curr, dR_step, **kwargs_step)
+
+          return (
+              t_curr + step,
+              R_next,
+              V_curr,
+              stress_accum,
+              collided_accum,
+              count + 1,
+              pend_xy,
+              pend_xz,
+              pend_yz,
+          )
+
+        return lax.cond(do_remap_now, _apply_remap_event, _advance_linear, operand=None)
+
+      return lax.while_loop(loop_cond, loop_body, loop_init)
+
+    if use_dense_neighbor and neighbor.idx.shape[1] == 0:
+      use_dense_neighbor = False
+
+    if use_dense_neighbor:
+      neighbor_idx = neighbor.idx
+      if neighbor_idx.ndim != 2 or neighbor_idx.shape[0] != N:
+        raise ValueError(
+            "brownian_hard_sphere: dense neighbor.idx must have shape "
+            "[N, max_occupancy].")
+      max_occupancy = neighbor_idx.shape[1]
+      neighbor_mask = neighbor_idx < N
+      self_idx = jnp.arange(N)[:, None]
+      neighbor_mask = neighbor_mask & (neighbor_idx != self_idx)
+      neighbor_idx = jnp.where(neighbor_mask, neighbor_idx, 0)
+
+      def _build_event_tables(R_curr, V_curr, abs_t, t_curr, stamps):
+        Rj = R_curr[neighbor_idx]
+        Vj = V_curr[neighbor_idx]
+        Ri = jnp.broadcast_to(R_curr[:, None, :], Rj.shape)
+        Vi = jnp.broadcast_to(V_curr[:, None, :], Vj.shape)
+        times_rel = _predict_times(Ri, Rj, Vi, Vj, abs_t)
+        times_abs = jnp.where(neighbor_mask, t_curr + times_rel, NO_EVENT_TIME)
+        invalid_stamp = jnp.array(-1, dtype=stamps.dtype)
+        neigh_stamp = jnp.where(neighbor_mask, stamps[neighbor_idx], invalid_stamp)
+        return times_abs, neigh_stamp
+
+      def _update_rows(rows, R_curr, V_curr, abs_t, t_curr, stamps, times, neigh_stamp):
+        nbrs = neighbor_idx[rows]
+        mask = neighbor_mask[rows]
+        nbrs_safe = jnp.where(mask, nbrs, 0)
+        Rb = R_curr[nbrs_safe]
+        Vb = V_curr[nbrs_safe]
+        Ra = jnp.broadcast_to(R_curr[rows][:, None, :], Rb.shape)
+        Va = jnp.broadcast_to(V_curr[rows][:, None, :], Vb.shape)
+        times_rel = _predict_times(Ra, Rb, Va, Vb, abs_t)
+        times_abs = jnp.where(mask, t_curr + times_rel, NO_EVENT_TIME)
+        invalid_stamp = jnp.array(-1, dtype=stamps.dtype)
+        neigh_rows = jnp.where(mask, stamps[nbrs_safe], invalid_stamp)
+        times = times.at[rows].set(times_abs)
+        neigh_stamp = neigh_stamp.at[rows].set(neigh_rows)
+        return times, neigh_stamp
+
+      stamps0 = jnp.zeros((N,), dtype=jnp.int32)
+      times0, neigh_stamp0 = _build_event_tables(R_start, v_peculiar, time, t_zero, stamps0)
+
+      loop_init = (
+          t_zero,
+          R_start,
+          v_peculiar,
+          stress_zero,
+          collided_zero,
+          0,
+          pending_xy,
+          pending_xz,
+          pending_yz,
+          stamps0,
+          times0,
+          neigh_stamp0,
+      )
+
+      def loop_cond(loop_state):
+        t_curr, _, _, _, _, count, *_ = loop_state
+        return (t_curr < dt - time_tol) & (count < max_collision_loops)
+
+      def loop_body(loop_state):
+        (t_curr, R_curr, V_curr, stress_accum, collided_accum, count,
+         pend_xy, pend_xz, pend_yz, stamps, times, neigh_stamp) = loop_state
+
+        pend_any = pend_xy | pend_xz | pend_yz
+        t_next_remap = jnp.minimum(
+            jnp.minimum(
+                jnp.where(pend_xy, t_cross_xy, NO_EVENT_TIME),
+                jnp.where(pend_xz, t_cross_xz, NO_EVENT_TIME),
+            ),
+            jnp.where(pend_yz, t_cross_yz, NO_EVENT_TIME),
+        )
+
+        do_remap_now = pend_any & (t_curr >= t_next_remap - remap_eps)
+
+        def _apply_remap_event(_):
+          apply_xy = pend_xy & (jnp.abs(t_cross_xy - t_next_remap) <= remap_eps)
+          apply_xz = pend_xz & (jnp.abs(t_cross_xz - t_next_remap) <= remap_eps)
+          apply_yz = pend_yz & (jnp.abs(t_cross_yz - t_next_remap) <= remap_eps)
+
+          m_apply_xy = jnp.where(apply_xy, m_xy, jnp.array(0, dtype=jnp.int32))
+          m_apply_xz = jnp.where(apply_xz, m_xz, jnp.array(0, dtype=jnp.int32))
+          m_apply_yz = jnp.where(apply_yz, m_yz, jnp.array(0, dtype=jnp.int32))
+
+          R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
+
+          t_new = jnp.minimum(t_next_remap + remap_eps, dt)
+          times_new, neigh_stamp_new = _build_event_tables(
+              R_remap, V_curr, time + t_new, t_new, stamps)
+
+          return (
+              t_new,
+              R_remap,
+              V_curr,
+              stress_accum,
+              collided_accum,
+              count,
+              pend_xy & (~apply_xy),
+              pend_xz & (~apply_xz),
+              pend_yz & (~apply_yz),
+              stamps,
+              times_new,
+              neigh_stamp_new,
+          )
+
+        def _advance_to_next_event(_):
+          abs_t = time + t_curr
+
+          neighbor_stamp = stamps[neighbor_idx]
+          valid = neighbor_mask & (neigh_stamp == neighbor_stamp)
+          time_ok = times >= (t_curr + time_tol)
+          times_valid = jnp.where(valid & time_ok, times, NO_EVENT_TIME)
+
+          min_t_abs = jnp.min(times_valid)
+          flat_idx = jnp.argmin(times_valid)
+          coll_i = flat_idx // max_occupancy
+          coll_k = flat_idx - coll_i * max_occupancy
+          coll_j = neighbor_idx[coll_i, coll_k]
+
+          step_limit_remap = jnp.where(pend_any, t_next_remap - remap_eps, dt)
+          t_target = jnp.minimum(min_t_abs, jnp.minimum(step_limit_remap, dt))
+          step = jnp.maximum(t_target - t_curr, f32(0.0))
+
+          dR_step = V_curr * step
+          if not fractional_coordinates:
+            dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
+
+          kwargs_step = dict(step_kwargs)
+          kwargs_step.pop('gamma', None)
+          kwargs_step.pop('gamma_xy', None)
+          kwargs_step.pop('gamma_xz', None)
+          kwargs_step.pop('gamma_yz', None)
+          kwargs_step['t'] = abs_t + step
+
+          R_next = shift_fn(R_curr, dR_step, **kwargs_step)
+          t_next = t_curr + step
+
+          is_coll = ((min_t_abs <= dt + time_tol) &
+                     (min_t_abs <= step_limit_remap + time_tol) &
+                     (min_t_abs <= t_next + time_tol))
+
+          def _apply_elastic_collision(v_arr):
+            ii = coll_i
+            jj = coll_j
+            p_i = R_next[ii]
+            p_j = R_next[jj]
+            v_i = v_arr[ii]
+            v_j = v_arr[jj]
+
+            t_coll = abs_t + step
+            dr = displacement_fn(p_i, p_j, t=t_coll)
+            dist = space.distance(dr)
+            n = dr / (dist + f32(1e-7))
+
+            dv_aff = _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
+            dv_dot_n = jnp.dot((v_i - v_j) + dv_aff, n)
+            impulse = jnp.where(dv_dot_n < 0, dv_dot_n, f32(0.0))
+
+            v_i_new = v_i - impulse * n
+            v_j_new = v_j + impulse * n
+            v_next = v_arr.at[ii].set(v_i_new).at[jj].set(v_j_new)
+
+            overlap = diameter - dist
+
+            def _correct_positions(Rin):
+              corr = f32(0.5) * overlap * n
+              Ri_new = shift_fn(Rin[ii], corr, **kwargs_step)
+              Rj_new = shift_fn(Rin[jj], -corr, **kwargs_step)
+              return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
+
+            if compute_stress:
+              # Use the single-particle collision kick (not the relative change)
+              # and accumulate as (Δv ⊗ r) to match σ_xy ∝ Δv_x Δr_y.
+              dv_ij = v_i_new - v_i
+              r_contact = diameter * n
+              impulse = dv_ij * dt
+              stress_inc = jnp.einsum('i,j->ij', impulse, r_contact)
+            else:
+              stress_inc = stress_zero
+
+            R_corr = lax.cond(overlap > 0, _correct_positions, lambda Rin: Rin, R_next)
+            return v_next, R_corr, stress_inc, ii, jj
+
+          zero_idx = jnp.array(0, dtype=neighbor_idx.dtype)
+          V_next, R_step_next, stress_inc, ii, jj = lax.cond(
+              is_coll,
+              _apply_elastic_collision,
+              lambda v_arr: (v_arr, R_next, stress_zero, zero_idx, zero_idx),
+              V_curr,
+          )
+
+          collided_next = lax.cond(
+              is_coll,
+              lambda c: c.at[ii].set(True).at[jj].set(True),
+              lambda c: c,
+              collided_accum,
+          )
+
+          def _update_after_collision(args):
+            v_arr, R_arr, stamps_in, times_in, neigh_in = args
+            stamps_next = stamps_in.at[ii].add(1).at[jj].add(1)
+            # Update rows for the collided particles and their neighbors.
+            # This is required because pairs (k, ii)/(k, jj) live in row k and
+            # are invalidated when ii/jj collide.
+            rows_i = jnp.where(neighbor_mask[ii], neighbor_idx[ii], ii)
+            rows_j = jnp.where(neighbor_mask[jj], neighbor_idx[jj], jj)
+            rows = jnp.concatenate(
+                [jnp.array([ii, jj], dtype=neighbor_idx.dtype), rows_i, rows_j],
+                axis=0,
+            )
+            times_next, neigh_next = _update_rows(
+                rows, R_arr, v_arr, time + t_next, t_next, stamps_next, times_in, neigh_in)
+            return stamps_next, times_next, neigh_next
+
+          stamps_next, times_next, neigh_next = lax.cond(
+              is_coll,
+              _update_after_collision,
+              lambda args: (args[2], args[3], args[4]),
+              operand=(V_next, R_step_next, stamps, times, neigh_stamp),
+          )
+
+          return (
+              t_next,
+              R_step_next,
+              V_next,
+              stress_accum + stress_inc,
+              collided_next,
+              count + 1,
+              pend_xy,
+              pend_xz,
+              pend_yz,
+              stamps_next,
+              times_next,
+              neigh_next,
+          )
+
+        return lax.cond(do_remap_now, _apply_remap_event, _advance_to_next_event, operand=None)
+
+      (
+          t_final,
+          R_final,
+          _,
+          stress_accum,
+          collided_accum,
+          loop_count,
+          pend_xy_f,
+          pend_xz_f,
+          pend_yz_f,
+          _,
+          _,
+          _,
+      ) = lax.while_loop(loop_cond, loop_body, loop_init)
+    else:
+      # Fallback: global pair-time recomputation.
+      i_idx, j_idx, pair_mask = _pair_indices_and_mask(neighbor, N)
+      if i_idx.size == 0:
+        loop_init = (
+            t_zero,
+            R_start,
+            v_peculiar,
+            stress_zero,
+            collided_zero,
+            0,
+            pending_xy,
+            pending_xz,
+            pending_yz,
+        )
+        (
+            t_final,
+            R_final,
+            _,
+            stress_accum,
+            collided_accum,
+            loop_count,
+            pend_xy_f,
+            pend_xz_f,
+            pend_yz_f,
+        ) = _advance_no_collision(loop_init)
+      else:
+
+        loop_init = (
+            t_zero,
+            R_start,
+            v_peculiar,
+            stress_zero,
+            collided_zero,
+            0,
+            pending_xy,
+            pending_xz,
+            pending_yz,
+        )
+
+        def loop_cond(loop_state):
+          t_curr, _, _, _, _, count, *_ = loop_state
+          return (t_curr < dt - time_tol) & (count < max_collision_loops)
+
+        def loop_body(loop_state):
+          t_curr, R_curr, V_curr, stress_accum, collided_accum, count, pend_xy, pend_xz, pend_yz = loop_state
+
+          pend_any = pend_xy | pend_xz | pend_yz
+          t_next_remap = jnp.minimum(
+              jnp.minimum(
+                  jnp.where(pend_xy, t_cross_xy, NO_EVENT_TIME),
+                  jnp.where(pend_xz, t_cross_xz, NO_EVENT_TIME),
+              ),
+              jnp.where(pend_yz, t_cross_yz, NO_EVENT_TIME),
+          )
+
+          do_remap_now = pend_any & (t_curr >= t_next_remap - remap_eps)
+
+          def _apply_remap_event(_):
+            apply_xy = pend_xy & (jnp.abs(t_cross_xy - t_next_remap) <= remap_eps)
+            apply_xz = pend_xz & (jnp.abs(t_cross_xz - t_next_remap) <= remap_eps)
+            apply_yz = pend_yz & (jnp.abs(t_cross_yz - t_next_remap) <= remap_eps)
+
+            m_apply_xy = jnp.where(apply_xy, m_xy, jnp.array(0, dtype=jnp.int32))
+            m_apply_xz = jnp.where(apply_xz, m_xz, jnp.array(0, dtype=jnp.int32))
+            m_apply_yz = jnp.where(apply_yz, m_yz, jnp.array(0, dtype=jnp.int32))
+
+            R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
+
+            t_new = jnp.minimum(t_next_remap + remap_eps, dt)
+
+            return (
+                t_new,
+                R_remap,
+                V_curr,
+                stress_accum,
+                collided_accum,
+                count,
+                pend_xy & (~apply_xy),
+                pend_xz & (~apply_xz),
+                pend_yz & (~apply_yz),
+            )
+
+          def _advance_to_next_event(_):
+            dt_rem = dt - t_curr
+            abs_t = time + t_curr
+
+            Ri = R_curr[i_idx]
+            Rj = R_curr[j_idx]
+            Vi = V_curr[i_idx]
+            Vj = V_curr[j_idx]
+
+            if use_batched_disp:
+              dr = displacement_fn(Ri, Rj, t=abs_t)
+            else:
+              dr = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(Ri, Rj)
+
+            dv = (Vi - Vj) + _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
+
+            a = jnp.sum(dv * dv, axis=-1)
+            b = 2 * jnp.sum(dr * dv, axis=-1)
+            c = jnp.sum(dr * dr, axis=-1) - diameter_sq
+            delta = b**2 - 4 * a * c
+
+            is_overlapping = c < 0
+            is_approaching = b < 0
+            valid_quad = (delta >= 0) & (a > f32(1e-12))
+
+            safe_delta = jnp.where(valid_quad, delta, f32(1.0))
+            safe_a = jnp.where(valid_quad, a, f32(1.0))
+            t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
+            t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
+            t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
+
+            resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
+            t_event = jnp.where(resolve_now, time_tol, t_hit)
+            times = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
+            times = jnp.where(pair_mask, times, NO_EVENT_TIME)
+
+            min_t_rel = jnp.min(times)
+            coll_idx = jnp.argmin(times)
+
+            step_limit_remap = jnp.where(pend_any, (t_next_remap - remap_eps) - t_curr, dt_rem)
+            step = jnp.minimum(min_t_rel, jnp.minimum(dt_rem, step_limit_remap))
+
+            dR_step = V_curr * step
+            if not fractional_coordinates:
+              dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
+
+            kwargs_step = dict(step_kwargs)
+            kwargs_step.pop('gamma', None)
+            kwargs_step.pop('gamma_xy', None)
+            kwargs_step.pop('gamma_xz', None)
+            kwargs_step.pop('gamma_yz', None)
+            kwargs_step['t'] = abs_t + step
+
+            R_next = shift_fn(R_curr, dR_step, **kwargs_step)
+            t_next = t_curr + step
+
+            is_coll = (min_t_rel <= dt_rem + time_tol) & (min_t_rel <= step + time_tol)
+
+            def _apply_elastic_collision(v_arr):
+              idx_dtype = i_idx.dtype
+              ii = i_idx[coll_idx].astype(idx_dtype)
+              jj = j_idx[coll_idx].astype(idx_dtype)
+              p_i = R_next[ii]
+              p_j = R_next[jj]
+              v_i = v_arr[ii]
+              v_j = v_arr[jj]
+
+              t_coll = abs_t + step
+              dr = displacement_fn(p_i, p_j, t=t_coll)
+              dist = space.distance(dr)
+              n = dr / (dist + f32(1e-7))
+
+              dv_aff = _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
+              dv_dot_n = jnp.dot((v_i - v_j) + dv_aff, n)
+              impulse = jnp.where(dv_dot_n < 0, dv_dot_n, f32(0.0))
+
+              v_i_new = v_i - impulse * n
+              v_j_new = v_j + impulse * n
+              v_next = v_arr.at[ii].set(v_i_new).at[jj].set(v_j_new)
+
+              overlap = diameter - dist
+
+              def _correct_positions(Rin):
+                corr = f32(0.5) * overlap * n
+                Ri_new = shift_fn(Rin[ii], corr, **kwargs_step)
+                Rj_new = shift_fn(Rin[jj], -corr, **kwargs_step)
+                return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
+
+              if compute_stress:
+                # Use the single-particle collision kick (not the relative change)
+                # and accumulate as (Δv ⊗ r) to match σ_xy ∝ Δv_x Δr_y.
+                dv_ij = v_i_new - v_i
+                r_contact = diameter * n
+                impulse = dv_ij * dt
+                stress_inc = jnp.einsum('i,j->ij', impulse, r_contact)
+              else:
+                stress_inc = stress_zero
+
+              R_corr = lax.cond(overlap > 0, _correct_positions, lambda Rin: Rin, R_next)
+              return v_next, R_corr, stress_inc, ii, jj
+
+            zero_idx = jnp.array(0, dtype=i_idx.dtype)
+            V_next, R_step_next, stress_inc, ii, jj = lax.cond(
+                is_coll,
+                _apply_elastic_collision,
+                lambda v_arr: (v_arr, R_next, stress_zero, zero_idx, zero_idx),
+                V_curr,
+            )
+
+            collided_next = lax.cond(
+                is_coll,
+                lambda c: c.at[ii].set(True).at[jj].set(True),
+                lambda c: c,
+                collided_accum,
+            )
+
+            return (
+                t_next,
+                R_step_next,
+                V_next,
+                stress_accum + stress_inc,
+                collided_next,
+                count + 1,
+                pend_xy,
+                pend_xz,
+                pend_yz,
+            )
+
+          return lax.cond(do_remap_now, _apply_remap_event, _advance_to_next_event, operand=None)
+
+        (
+            t_final,
+            R_final,
+            _,
+            stress_accum,
+            collided_accum,
+            loop_count,
+            pend_xy_f,
+            pend_xz_f,
+            pend_yz_f,
+        ) = lax.while_loop(loop_cond, loop_body, loop_init)
+
+    def _collision_loop_error(reached_limit):
+      if reached_limit:
+        raise RuntimeError(
+            "Hard sphere BD: exceeded max_collision_loops="
+            f"{max_collision_loops} within one dt.")
+
+    is_unfinished = (t_final < dt - time_tol) & (loop_count >= max_collision_loops)
+    # Safety check: raise a Python error if the collision loop exceeds the
+    # max per-step limit. This uses a host callback (requires a CPU backend)
+    # and can slow GPU runs. Uncomment to enable strict checking.
+    # jax.debug.callback(_collision_loop_error, is_unfinished)
+
+    # Safety: apply any pending remaps if we exited early.
+    if remap and fractional_coordinates:
+      pend_any_f = pend_xy_f | pend_xz_f | pend_yz_f
+
+      def _apply_remaining(Rin):
+        m_xy_rem = jnp.where(pend_xy_f, m_xy, jnp.array(0, dtype=jnp.int32))
+        m_xz_rem = jnp.where(pend_xz_f, m_xz, jnp.array(0, dtype=jnp.int32))
+        m_yz_rem = jnp.where(pend_yz_f, m_yz, jnp.array(0, dtype=jnp.int32))
+        return _apply_fractional_shear_remap(Rin, m_xy_rem, m_xz_rem, m_yz_rem, dim)
+
+      R_final = lax.cond(pend_any_f, _apply_remaining, lambda Rin: Rin, R_final)
+
+    # Convention: return the Cauchy stress (negative of the momentum flux /
+    # pressure tensor), matching common rheology/Irving-Kirkwood conventions.
+    stress = -stress_accum / (volume * dt) if compute_stress else stress_zero
+    
+    return HardSphereBrownianState(R_final, mu, key, time + dt, stress, collided_accum, is_unfinished)
+
+  return init_fn, apply_fn
