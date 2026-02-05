@@ -1115,6 +1115,65 @@ def _normalize_shear_schedule(
   return _wrap(None), _wrap(None), _wrap(None)
 
 
+def _make_shear_at(sf_xy, sf_xz, sf_yz):
+  """Return a `(time, dim) -> (gamma_xy, gamma_xz, gamma_yz)` shear helper."""
+  def _shear_at(time, dim):
+    gamma_xy = f32(sf_xy(time))
+    if dim >= 3:
+      gamma_xz = f32(sf_xz(time))
+      gamma_yz = f32(sf_yz(time))
+    else:
+      gamma_xz = gamma_yz = f32(0.0)
+    return gamma_xy, gamma_xz, gamma_yz
+  return _shear_at
+
+
+def _reduce_shear_strain(gamma_xy, gamma_xz, gamma_yz, dim):
+  """Reduce shear strain into [-0.5, 0.5) and return integer remap counters."""
+  m_xy = jnp.floor(gamma_xy + f32(0.5))
+  if dim >= 3:
+    m_xz = jnp.floor(gamma_xz + f32(0.5))
+    m_yz = jnp.floor(gamma_yz + f32(0.5))
+  else:
+    m_xz = m_yz = f32(0.0)
+  return (
+      gamma_xy - m_xy,
+      gamma_xz - m_xz,
+      gamma_yz - m_yz,
+      m_xy.astype(jnp.int32),
+      m_xz.astype(jnp.int32),
+      m_yz.astype(jnp.int32),
+  )
+
+
+def _apply_fractional_shear_remap(R, m_xy, m_xz, m_yz, dim):
+  """Apply the unimodular fractional-coordinate remap for shearing(..., remap=True)."""
+  if dim >= 3:
+    mxy = jnp.asarray(m_xy, R.dtype)
+    mxz = jnp.asarray(m_xz, R.dtype)
+    myz = jnp.asarray(m_yz, R.dtype)
+
+    def _apply_3d_remap(Rin):
+      add_x = mxy * Rin[:, 1] + (mxz + mxy * myz) * Rin[:, 2]
+      add_y = myz * Rin[:, 2]
+      Rout = Rin.at[:, 0].add(add_x).at[:, 1].add(add_y)
+      return jnp.mod(Rout, 1.0)
+
+    any_flip = (jnp.not_equal(m_xy, 0) |
+                jnp.not_equal(m_xz, 0) |
+                jnp.not_equal(m_yz, 0))
+    return lax.cond(any_flip, _apply_3d_remap, lambda Rin: Rin, R)
+
+  mxy = jnp.asarray(m_xy, R.dtype)
+
+  def _apply_2d_remap(Rin):
+    Rout = Rin.at[:, 0].add(mxy * Rin[:, 1])
+    return jnp.mod(Rout, 1.0)
+
+  any_flip = jnp.not_equal(m_xy, 0)
+  return lax.cond(any_flip, _apply_2d_remap, lambda Rin: Rin, R)
+
+
 @dataclasses.dataclass
 class BrownianState:
   """A tuple containing state information for Brownian dynamics.

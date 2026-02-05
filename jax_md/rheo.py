@@ -38,6 +38,7 @@ from jax.scipy.signal import correlate
 import numpy as np
 from scipy.optimize import minimize
 
+from jax_md import smap
 from jax_md import util
 from jax_md import space
 from jax_md import partition
@@ -76,7 +77,6 @@ def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
 
     pair_force_mag_fn = grad(_sum_pair_energy)
 
-    @functools.partial(jit, static_argnames=('fractional_coordinates',))
     def stress_fn(R: Array,
                   box: Array,
                   *,
