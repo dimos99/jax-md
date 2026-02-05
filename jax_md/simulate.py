@@ -39,6 +39,8 @@ from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional
 
 import functools
 
+import jax
+
 from jax import grad
 from jax import jit
 from jax import random
@@ -1286,7 +1288,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
                         mobility,
                         shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None],
                         t0: float = 0.0,
-                        fractional_position: bool = True,
+                        fractional_coordinates: bool = True,
                         remap = True) -> Simulator:
   """Overdamped Langevin (Brownian) dynamics under simple shear with PBCs.
 
@@ -1330,7 +1332,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
       to functions of time. The geometry is determined by the provided
       `space.shearing` configuration.
     t0: Initial time.
-    fractional_position: If True, `R` are interpreted as fractional coordinates
+    fractional_coordinates: If True, `R` are interpreted as fractional coordinates
       inside the unit cell; real positions are obtained via
       `space.transform(box_of(...), R)`. For stress, real positions are used.
     remap: If True, apply a nearest-integer remap so that `gamma` is kept in
@@ -1353,7 +1355,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     init_fn, apply_fn = simulate.brownian_with_shear(pair_fn, shift, dt, kT,
                                                      mobility=1.0,
                                                      shear_schedule=sr_fn,
-                                                     fractional_position=True,
+                                                     fractional_coordinates=True,
                                                      remap=True)
     state = init_fn(key, R0)
     state = apply_fn(state, neighbor=nbrs)  # kwargs forwarded as needed
@@ -1375,52 +1377,8 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
   _dt = f32(dt)
   t0 = f32(t0)
 
-
   sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
-
-  def _shear_at(time, dim):
-    gamma_xy = f32(sf_xy(time))
-    if dim >= 3:
-      gamma_xz = f32(sf_xz(time))
-      gamma_yz = f32(sf_yz(time))
-    else:
-      gamma_xz = gamma_yz = f32(0.0)
-    return gamma_xy, gamma_xz, gamma_yz
-
-  def _reduce_shear(gamma_xy, gamma_xz, gamma_yz, dim):
-    m_xy = jnp.floor(gamma_xy + 0.5)
-    if dim >= 3:
-      m_xz = jnp.floor(gamma_xz + 0.5)
-      m_yz = jnp.floor(gamma_yz + 0.5)
-    else:
-      m_xz = m_yz = f32(0.0)
-    return (
-        gamma_xy - m_xy,
-        gamma_xz - m_xz,
-        gamma_yz - m_yz,
-        m_xy.astype(jnp.int32),
-        m_xz.astype(jnp.int32),
-        m_yz.astype(jnp.int32),
-    )
-
-  def _apply_fractional_remap(R, m_xy, m_xz, m_yz, dim):
-    if dim >= 3:
-      mxy = jnp.asarray(m_xy, R.dtype)
-      mxz = jnp.asarray(m_xz, R.dtype)
-      myz = jnp.asarray(m_yz, R.dtype)
-      def _apply_3d_remap(Rin):
-        add_x = mxy * Rin[:, 1] + (mxz + mxy * myz) * Rin[:, 2]
-        add_y = myz * Rin[:, 2]
-        Rout = Rin.at[:, 0].add(add_x).at[:, 1].add(add_y)
-        return jnp.mod(Rout, 1.0)
-      any_flip = jnp.not_equal(m_xy, 0) | jnp.not_equal(m_xz, 0) | jnp.not_equal(m_yz, 0)
-      return lax.cond(any_flip, _apply_3d_remap, lambda Rin: Rin, R)
-    mxy = jnp.asarray(m_xy, R.dtype)
-    def _apply_2d_remap(Rin):
-      Rout = Rin.at[:, 0].add(mxy * Rin[:, 1])
-      return jnp.mod(Rout, 1.0)
-    any_flip = jnp.not_equal(m_xy, 0)
-    return lax.cond(any_flip, _apply_2d_remap, lambda Rin: Rin, R)
+  shear_at = _make_shear_at(sf_xy, sf_xz, sf_yz)
 
   @jit
   def init_fn(key, R, **kwargs):
@@ -1430,10 +1388,11 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     # Use reduced gamma to match neighbor-list/space kernels.
     dim = R.shape[1]
     time0 = jnp.array(t0, dtype=R.dtype)
-    gamma_xy, gamma_xz, gamma_yz = _shear_at(time0, dim)
+    gamma_xy, gamma_xz, gamma_yz = shear_at(time0, dim)
       
     if remap:
-      curr_xy, curr_xz, curr_yz, _, _, _ = _reduce_shear(gamma_xy, gamma_xz, gamma_yz, dim)
+      curr_xy, curr_xz, curr_yz, _, _, _ = _reduce_shear_strain(
+          gamma_xy, gamma_xz, gamma_yz, dim)
     else:
       curr_xy, curr_xz, curr_yz = gamma_xy, gamma_xz, gamma_yz
 
@@ -1463,24 +1422,24 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     if remap:
       # --- Shear handling: compute reduced gamma and optional integer remap ---
       # Unwrapped shears at start/end of the step
-      prev_xy, prev_xz, prev_yz = _shear_at(time, dim)
-      curr_xy, curr_xz, curr_yz = _shear_at(time + _dt, dim)
+      prev_xy, prev_xz, prev_yz = shear_at(time, dim)
+      curr_xy, curr_xz, curr_yz = shear_at(time + _dt, dim)
 
       # Nearest-integer counters (how many unit tilts elapsed)
-      _, _, _, m_prev_xy, m_prev_xz, m_prev_yz = _reduce_shear(prev_xy, prev_xz, prev_yz, dim)
-      curr_xy, curr_xz, curr_yz, m_curr_xy, m_curr_xz, m_curr_yz = _reduce_shear(
-          curr_xy, curr_xz, curr_yz, dim
-      )
+      _, _, _, m_prev_xy, m_prev_xz, m_prev_yz = _reduce_shear_strain(
+          prev_xy, prev_xz, prev_yz, dim)
+      curr_xy, curr_xz, curr_yz, m_curr_xy, m_curr_xz, m_curr_yz = _reduce_shear_strain(
+          curr_xy, curr_xz, curr_yz, dim)
       m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
       m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
       m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
 
       # If we store fractional coordinates and a tilt index changed, apply the exact
       # unimodular change-of-basis map to the coordinates. Handle 2D and 3D.
-      if fractional_position:
-        R = _apply_fractional_remap(R, m_xy, m_xz, m_yz, dim)
+      if fractional_coordinates:
+        R = _apply_fractional_shear_remap(R, m_xy, m_xz, m_yz, dim)
     else:
-      curr_xy, curr_xz, curr_yz = _shear_at(time + _dt, dim)
+      curr_xy, curr_xz, curr_yz = shear_at(time + _dt, dim)
 
     # Expose the reduced shear to downstream kernels (displacement/shift)
     if dim >= 3:
@@ -1641,7 +1600,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                    eta: float,
                    shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None],
                    t0: float = 0.0,
-                   fractional_position: bool = True,
+                   fractional_coordinates: bool = True,
                    remap: bool = True,
                    pair_energy_for_stress: Optional[Callable[..., Array]] = None,
                    Mr_params: Optional[Dict[str, Any]] = None,
@@ -1736,7 +1695,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     pse_state = pse_init(mobility_position, **shear_kwargs)
     F0 = force_fn(mobility_position, **shear_kwargs)
 
-    if fractional_position:
+    if fractional_coordinates:
       box_matrix0 = pse_state.real.box_matrix
       position_real0 = space.transform(box_matrix0, mobility_position)
     else:
@@ -1784,7 +1743,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
         curr_xz = curr_xz - m_curr_xz
         curr_yz = curr_yz - m_curr_yz
 
-      if fractional_position:
+      if fractional_coordinates:
         if mobility_position.shape[1] >= 3:
           mxy = jnp.asarray(m_xy, mobility_position.dtype)
           mxz = jnp.asarray(m_xz, mobility_position.dtype)
@@ -1844,7 +1803,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
       )
     displacement = _dt * velocities + dB
     mobility_position = shift_fn(mobility_position, displacement, **step_kwargs)
-    if fractional_position:
+    if fractional_coordinates:
       position_real = space.transform(current_box, mobility_position)
     else:
       position_real = mobility_position
