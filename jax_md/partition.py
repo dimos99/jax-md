@@ -831,7 +831,7 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
   @partial(jit, static_argnums=0)
   def candidate_fn(positionShape) -> Array:
-    candidates = jnp.arange(positionShape[0])
+    candidates = jnp.arange(positionShape[0], dtype=i32)
     return jnp.broadcast_to(candidates[None, :],
                             (positionShape[0], positionShape[0]))
 
@@ -870,6 +870,7 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
   @jit
   def prune_neighbor_list_dense(position: Array, idx: Array, **kwargs
                                 ) -> Array:
+    idx = idx.astype(i32)
     d = partial(metric_sq, **kwargs)
     d = space.map_neighbor(d)
 
@@ -895,10 +896,10 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
     d = space.map_bond(d)
 
     N = position.shape[0]
-    sender_idx = jnp.broadcast_to(jnp.arange(N)[:, None], idx.shape)
+    sender_idx = jnp.broadcast_to(jnp.arange(N, dtype=i32)[:, None], idx.shape)
 
     sender_idx = jnp.reshape(sender_idx, (-1,))
-    receiver_idx = jnp.reshape(idx, (-1,))
+    receiver_idx = jnp.reshape(idx, (-1,)).astype(i32)
     dR = d(position[sender_idx], position[receiver_idx])
 
     mask = (dR < cutoff_sq) & (receiver_idx < N)
