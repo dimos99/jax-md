@@ -2320,12 +2320,11 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
                          displacement_fn: space.DisplacementFn,
                          shift_fn: ShiftFn,
                          dt: float,
-                         kT: float,
-                         diameter: float,
+                         kT: float = 1.0,
+                         diameter: float = 2.0,
                          mobility: Union[float, Array] = 1.0,
-                         max_collision_loops: int = 100,
+                         max_collision_loops: int = 1e7,
                          event_time_tol: Optional[float] = None,
-                         dense_neighbor_update: bool = False,
                          shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None] = None,
                          t0: float = 0.0,
                          fractional_coordinates: bool = True,
@@ -2335,33 +2334,29 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
   """Hard-sphere Brownian dynamics via Strating's event-driven method under shear.
 
   Args:
-    energy_or_force_fn: Function to calculate energy or force.
-    displacement_fn: Function to compute displacements.
-    shift_fn: Function to shift positions.
-    dt: Time step.
-    kT: Thermal energy.
-    diameter: Hard sphere diameter (sigma).
-    mobility: Mobility coefficient.
-    max_collision_loops: Safety cap on collision events per step.
+    energy_or_force_fn: Function to calculate soft energy or force.
+    displacement_fn: Function to compute displacements. See 'space' module.
+    shift_fn: Function to shift positions. See 'space' module.
+    dt: Time step. In units of a^2/D.
+    kT: Thermal energy. Defaults to 1.0.
+    diameter: Hard sphere diameter (sigma). Defaults to 2.0.
+    mobility: Mobility coefficient. Defaults to 1.0. Viscosity 1/6pi then.
+    max_collision_loops: Safety cap on collision events per step. Defaults to 1e7.
     event_time_tol: Absolute tolerance for treating near-zero collision times
       as immediate events (to avoid zero-time stalls). If None, defaults to
       1e-9 and is capped by `dt`.
-    shear_schedule: Shear schedule function or dict.
-    t0: Initial time.
+    shear_schedule: Shear schedule function or dict. See `space.shearing` for more details.
+    t0: Initial time. Defaults to 0.0.
     fractional_coordinates: If True, positions are fractional coordinates in [0, 1).
     remap: If True, use reduced shear (gamma in [-0.5, 0.5)) and remap coords at
       half-integer crossings when using fractional positions.
-    dense_neighbor_update: If True and a dense neighbor list is provided,
-      use local event-table updates. This assumes the displacement function is
-      time-independent (e.g., no shear or other explicit time dependence).
     box: Optional constant box used to compute the collisional stress tensor.
     box_fn: Optional callable returning the box (e.g. `box_of` from
       `space.shearing`). If provided, stress is normalized by the box volume.
       Note: if you pass a `neighbor` kwarg to `apply_fn`, it may be `Dense`,
-      `Sparse`, or `OrderedSparse` (from `partition.neighbor_list`). For
-      time-dependent displacement (e.g., shear), keep
-      `dense_neighbor_update=False` to use the global pair-time recomputation
-      path.
+      `Sparse`, or `OrderedSparse` (from `partition.neighbor_list`).
+      Time-dependent displacement (e.g., shear) is supported; all neighbor
+      list formats use the global pair-time recomputation path.
       Important: when `neighbor` is provided, collisions are checked only for
       the listed pairs; to guarantee no overlaps, ensure the neighbor list's
       cutoff/skin is large enough to include any pair that could reach contact
@@ -2397,7 +2392,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
   diameter = jnp.asarray(diameter)
   diameter_sq = diameter ** 2
   t0 = jnp.asarray(t0, dtype=dt.dtype)
-
+ 
   if box is not None and box_fn is not None:
     raise ValueError(
         "brownian_hard_sphere: specify at most one of box and box_fn.")
@@ -2488,11 +2483,6 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
   # Used to prevent pathological near-zero event times from stalling the loop.
   NO_EVENT_TIME = jnp.asarray(1e8, dtype=dt.dtype)
 
-  if dense_neighbor_update and shear_schedule is not None:
-    raise ValueError(
-        "brownian_hard_sphere: dense_neighbor_update assumes time-independent "
-        "displacement; disable or remove shear_schedule.")
-
   def _supports_batched_displacement(dim):
     # Many displacement fns (e.g. space.periodic) accept only vector inputs,
     # while `space.shearing` explicitly supports batched inputs. We detect this
@@ -2527,6 +2517,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     g_dot_yz = (gamma_yz_1 - gamma_yz_0) / dt
 
     # --- Reduced shear (for force kernels / consistency with shearing remap) ---
+    # We track the integer "winding numbers" (m_xy, etc.) which count how many times
+    # the shear strain has wrapped around. This is crucial for Lees-Edwards boundary 
+    # conditions to ensure particles wrap correctly across the sheared periodic box.
     if remap:
       curr_xy, curr_xz, curr_yz, m_prev_xy, m_prev_xz, m_prev_yz = _reduce_shear_strain(
           gamma_xy_0, gamma_xz_0, gamma_yz_0, dim)
@@ -2567,6 +2560,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     key, split = random.split(key)
     xi = random.normal(split, R_start.shape, R_start.dtype)
     dR_noise = jnp.sqrt(f32(2) * mobility_arr * _kT * dt) * xi
+    # Strating's Algorithm: Interpret the Brownian displacement (drift + diffusion) 
+    # as a constant "peculiar velocity" over the timestep dt. This allows treating 
+    # the dynamics as ballistic between hard-sphere events.
     v_peculiar = (mobility_arr * F * dt + dR_noise) / dt
 
     # --- Collisional stress bookkeeping ---
@@ -2616,49 +2612,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       pending_yz = jnp.array(False)
 
     # --- Event-driven collision loop ---
-    # Dense neighbor lists enable local time-table updates; sparse/none fall
-    # back to the global pair-time recomputation path.
-    use_dense_neighbor = (
-        dense_neighbor_update and
-        (neighbor is not None) and
-        (not partition.is_sparse(neighbor.format))
-    )
     use_batched_disp = _batched_disp_3d if dim >= 3 else _batched_disp_2d
-
-    def _predict_times(Ra, Rb, Va, Vb, abs_t):
-      shape = Ra.shape[:-1]
-      ra_flat = Ra.reshape(-1, dim)
-      rb_flat = Rb.reshape(-1, dim)
-      va_flat = Va.reshape(-1, dim)
-      vb_flat = Vb.reshape(-1, dim)
-
-      if use_batched_disp:
-        dr_flat = displacement_fn(ra_flat, rb_flat, t=abs_t)
-      else:
-        dr_flat = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(ra_flat, rb_flat)
-
-      dv_flat = (va_flat - vb_flat) + _affine_relative_velocity(
-          dr_flat, g_dot_xy, g_dot_xz, g_dot_yz)
-
-      a = jnp.sum(dv_flat * dv_flat, axis=-1)
-      b = 2 * jnp.sum(dr_flat * dv_flat, axis=-1)
-      c = jnp.sum(dr_flat * dr_flat, axis=-1) - diameter_sq
-      delta = b**2 - 4 * a * c
-
-      is_overlapping = c < 0
-      is_approaching = b < 0
-      valid_quad = (delta >= 0) & (a > f32(1e-12))
-
-      safe_delta = jnp.where(valid_quad, delta, f32(1.0))
-      safe_a = jnp.where(valid_quad, a, f32(1.0))
-      t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
-      t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
-      t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
-
-      resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
-      t_event = jnp.where(resolve_now, time_tol, t_hit)
-      t_event = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
-      return t_event.reshape(shape)
 
     def _advance_no_collision(loop_init):
       def loop_cond(loop_state):
@@ -2688,6 +2642,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           m_apply_xz = jnp.where(apply_xz, m_xz, jnp.array(0, dtype=jnp.int32))
           m_apply_yz = jnp.where(apply_yz, m_yz, jnp.array(0, dtype=jnp.int32))
 
+          # Apply the coordinate discontinuity. This keeps particles inside the 
+          # fundamental simulation box by wrapping them when the box shears too far.
           R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
           t_new = jnp.minimum(t_next_remap + remap_eps, dt)
 
@@ -2737,51 +2693,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
       return lax.while_loop(loop_cond, loop_body, loop_init)
 
-    if use_dense_neighbor and neighbor.idx.shape[1] == 0:
-      use_dense_neighbor = False
-
-    if use_dense_neighbor:
-      neighbor_idx = neighbor.idx
-      if neighbor_idx.ndim != 2 or neighbor_idx.shape[0] != N:
-        raise ValueError(
-            "brownian_hard_sphere: dense neighbor.idx must have shape "
-            "[N, max_occupancy].")
-      max_occupancy = neighbor_idx.shape[1]
-      neighbor_mask = neighbor_idx < N
-      self_idx = jnp.arange(N)[:, None]
-      neighbor_mask = neighbor_mask & (neighbor_idx != self_idx)
-      neighbor_idx = jnp.where(neighbor_mask, neighbor_idx, 0)
-
-      def _build_event_tables(R_curr, V_curr, abs_t, t_curr, stamps):
-        Rj = R_curr[neighbor_idx]
-        Vj = V_curr[neighbor_idx]
-        Ri = jnp.broadcast_to(R_curr[:, None, :], Rj.shape)
-        Vi = jnp.broadcast_to(V_curr[:, None, :], Vj.shape)
-        times_rel = _predict_times(Ri, Rj, Vi, Vj, abs_t)
-        times_abs = jnp.where(neighbor_mask, t_curr + times_rel, NO_EVENT_TIME)
-        invalid_stamp = jnp.array(-1, dtype=stamps.dtype)
-        neigh_stamp = jnp.where(neighbor_mask, stamps[neighbor_idx], invalid_stamp)
-        return times_abs, neigh_stamp
-
-      def _update_rows(rows, R_curr, V_curr, abs_t, t_curr, stamps, times, neigh_stamp):
-        nbrs = neighbor_idx[rows]
-        mask = neighbor_mask[rows]
-        nbrs_safe = jnp.where(mask, nbrs, 0)
-        Rb = R_curr[nbrs_safe]
-        Vb = V_curr[nbrs_safe]
-        Ra = jnp.broadcast_to(R_curr[rows][:, None, :], Rb.shape)
-        Va = jnp.broadcast_to(V_curr[rows][:, None, :], Vb.shape)
-        times_rel = _predict_times(Ra, Rb, Va, Vb, abs_t)
-        times_abs = jnp.where(mask, t_curr + times_rel, NO_EVENT_TIME)
-        invalid_stamp = jnp.array(-1, dtype=stamps.dtype)
-        neigh_rows = jnp.where(mask, stamps[nbrs_safe], invalid_stamp)
-        times = times.at[rows].set(times_abs)
-        neigh_stamp = neigh_stamp.at[rows].set(neigh_rows)
-        return times, neigh_stamp
-
-      stamps0 = jnp.zeros((N,), dtype=jnp.int32)
-      times0, neigh_stamp0 = _build_event_tables(R_start, v_peculiar, time, t_zero, stamps0)
-
+    # Global pair-time recomputation for all neighbor list formats.
+    i_idx, j_idx, pair_mask = _pair_indices_and_mask(neighbor, N)
+    if i_idx.size == 0:
       loop_init = (
           t_zero,
           R_start,
@@ -2792,9 +2706,29 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           pending_xy,
           pending_xz,
           pending_yz,
-          stamps0,
-          times0,
-          neigh_stamp0,
+      )
+      (
+          t_final,
+          R_final,
+          _,
+          stress_accum,
+          collided_accum,
+          loop_count,
+          pend_xy_f,
+          pend_xz_f,
+          pend_yz_f,
+      ) = _advance_no_collision(loop_init)
+    else:
+      loop_init = (
+          t_zero,
+          R_start,
+          v_peculiar,
+          stress_zero,
+          collided_zero,
+          0,
+          pending_xy,
+          pending_xz,
+          pending_yz,
       )
 
       def loop_cond(loop_state):
@@ -2802,8 +2736,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
         return (t_curr < dt - time_tol) & (count < max_collision_loops)
 
       def loop_body(loop_state):
-        (t_curr, R_curr, V_curr, stress_accum, collided_accum, count,
-         pend_xy, pend_xz, pend_yz, stamps, times, neigh_stamp) = loop_state
+        t_curr, R_curr, V_curr, stress_accum, collided_accum, count, pend_xy, pend_xz, pend_yz = loop_state
 
         pend_any = pend_xy | pend_xz | pend_yz
         t_next_remap = jnp.minimum(
@@ -2828,8 +2761,6 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
 
           t_new = jnp.minimum(t_next_remap + remap_eps, dt)
-          times_new, neigh_stamp_new = _build_event_tables(
-              R_remap, V_curr, time + t_new, t_new, stamps)
 
           return (
               t_new,
@@ -2841,28 +2772,52 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
               pend_xy & (~apply_xy),
               pend_xz & (~apply_xz),
               pend_yz & (~apply_yz),
-              stamps,
-              times_new,
-              neigh_stamp_new,
           )
 
         def _advance_to_next_event(_):
+          dt_rem = dt - t_curr
           abs_t = time + t_curr
 
-          neighbor_stamp = stamps[neighbor_idx]
-          valid = neighbor_mask & (neigh_stamp == neighbor_stamp)
-          time_ok = times >= (t_curr + time_tol)
-          times_valid = jnp.where(valid & time_ok, times, NO_EVENT_TIME)
+          Ri = R_curr[i_idx]
+          Rj = R_curr[j_idx]
+          Vi = V_curr[i_idx]
+          Vj = V_curr[j_idx]
 
-          min_t_abs = jnp.min(times_valid)
-          flat_idx = jnp.argmin(times_valid)
-          coll_i = flat_idx // max_occupancy
-          coll_k = flat_idx - coll_i * max_occupancy
-          coll_j = neighbor_idx[coll_i, coll_k]
+          if use_batched_disp:
+            dr = displacement_fn(Ri, Rj, t=abs_t)
+          else:
+            dr = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(Ri, Rj)
 
-          step_limit_remap = jnp.where(pend_any, t_next_remap - remap_eps, dt)
-          t_target = jnp.minimum(min_t_abs, jnp.minimum(step_limit_remap, dt))
-          step = jnp.maximum(t_target - t_curr, f32(0.0))
+          # Relative velocity includes both the peculiar velocity difference and the 
+          # affine shear flow difference. Note: This assumes linear affine motion 
+          # during the sub-step (O(t^2) shear advection of Brownian motion is ignored).
+          dv = (Vi - Vj) + _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
+
+          a = jnp.sum(dv * dv, axis=-1)
+          b = 2 * jnp.sum(dr * dv, axis=-1)
+          c = jnp.sum(dr * dr, axis=-1) - diameter_sq
+          delta = b**2 - 4 * a * c
+
+          is_overlapping = c < 0
+          is_approaching = b < 0
+          valid_quad = (delta >= 0) & (a > f32(1e-12))
+
+          safe_delta = jnp.where(valid_quad, delta, f32(1.0))
+          safe_a = jnp.where(valid_quad, a, f32(1.0))
+          t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
+          t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
+          t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
+
+          resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
+          t_event = jnp.where(resolve_now, time_tol, t_hit)
+          times = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
+          times = jnp.where(pair_mask, times, NO_EVENT_TIME)
+
+          min_t_rel = jnp.min(times)
+          coll_idx = jnp.argmin(times)
+
+          step_limit_remap = jnp.where(pend_any, (t_next_remap - remap_eps) - t_curr, dt_rem)
+          step = jnp.minimum(min_t_rel, jnp.minimum(dt_rem, step_limit_remap))
 
           dR_step = V_curr * step
           if not fractional_coordinates:
@@ -2878,13 +2833,12 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           R_next = shift_fn(R_curr, dR_step, **kwargs_step)
           t_next = t_curr + step
 
-          is_coll = ((min_t_abs <= dt + time_tol) &
-                     (min_t_abs <= step_limit_remap + time_tol) &
-                     (min_t_abs <= t_next + time_tol))
+          is_coll = (min_t_rel <= dt_rem + time_tol) & (min_t_rel <= step + time_tol)
 
           def _apply_elastic_collision(v_arr):
-            ii = coll_i
-            jj = coll_j
+            idx_dtype = i_idx.dtype
+            ii = i_idx[coll_idx].astype(idx_dtype)
+            jj = j_idx[coll_idx].astype(idx_dtype)
             p_i = R_next[ii]
             p_j = R_next[jj]
             v_i = v_arr[ii]
@@ -2901,6 +2855,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
             v_i_new = v_i - impulse * n
             v_j_new = v_j + impulse * n
+            # Update the peculiar velocities with the collision impulse.
+            # The affine part of the velocity is unchanged by the collision itself.
             v_next = v_arr.at[ii].set(v_i_new).at[jj].set(v_j_new)
 
             overlap = diameter - dist
@@ -2924,7 +2880,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
             R_corr = lax.cond(overlap > 0, _correct_positions, lambda Rin: Rin, R_next)
             return v_next, R_corr, stress_inc, ii, jj
 
-          zero_idx = jnp.array(0, dtype=neighbor_idx.dtype)
+          zero_idx = jnp.array(0, dtype=i_idx.dtype)
           V_next, R_step_next, stress_inc, ii, jj = lax.cond(
               is_coll,
               _apply_elastic_collision,
@@ -2939,29 +2895,6 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
               collided_accum,
           )
 
-          def _update_after_collision(args):
-            v_arr, R_arr, stamps_in, times_in, neigh_in = args
-            stamps_next = stamps_in.at[ii].add(1).at[jj].add(1)
-            # Update rows for the collided particles and their neighbors.
-            # This is required because pairs (k, ii)/(k, jj) live in row k and
-            # are invalidated when ii/jj collide.
-            rows_i = jnp.where(neighbor_mask[ii], neighbor_idx[ii], ii)
-            rows_j = jnp.where(neighbor_mask[jj], neighbor_idx[jj], jj)
-            rows = jnp.concatenate(
-                [jnp.array([ii, jj], dtype=neighbor_idx.dtype), rows_i, rows_j],
-                axis=0,
-            )
-            times_next, neigh_next = _update_rows(
-                rows, R_arr, v_arr, time + t_next, t_next, stamps_next, times_in, neigh_in)
-            return stamps_next, times_next, neigh_next
-
-          stamps_next, times_next, neigh_next = lax.cond(
-              is_coll,
-              _update_after_collision,
-              lambda args: (args[2], args[3], args[4]),
-              operand=(V_next, R_step_next, stamps, times, neigh_stamp),
-          )
-
           return (
               t_next,
               R_step_next,
@@ -2972,9 +2905,6 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
               pend_xy,
               pend_xz,
               pend_yz,
-              stamps_next,
-              times_next,
-              neigh_next,
           )
 
         return lax.cond(do_remap_now, _apply_remap_event, _advance_to_next_event, operand=None)
@@ -2989,234 +2919,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           pend_xy_f,
           pend_xz_f,
           pend_yz_f,
-          _,
-          _,
-          _,
       ) = lax.while_loop(loop_cond, loop_body, loop_init)
-    else:
-      # Fallback: global pair-time recomputation.
-      i_idx, j_idx, pair_mask = _pair_indices_and_mask(neighbor, N)
-      if i_idx.size == 0:
-        loop_init = (
-            t_zero,
-            R_start,
-            v_peculiar,
-            stress_zero,
-            collided_zero,
-            0,
-            pending_xy,
-            pending_xz,
-            pending_yz,
-        )
-        (
-            t_final,
-            R_final,
-            _,
-            stress_accum,
-            collided_accum,
-            loop_count,
-            pend_xy_f,
-            pend_xz_f,
-            pend_yz_f,
-        ) = _advance_no_collision(loop_init)
-      else:
-
-        loop_init = (
-            t_zero,
-            R_start,
-            v_peculiar,
-            stress_zero,
-            collided_zero,
-            0,
-            pending_xy,
-            pending_xz,
-            pending_yz,
-        )
-
-        def loop_cond(loop_state):
-          t_curr, _, _, _, _, count, *_ = loop_state
-          return (t_curr < dt - time_tol) & (count < max_collision_loops)
-
-        def loop_body(loop_state):
-          t_curr, R_curr, V_curr, stress_accum, collided_accum, count, pend_xy, pend_xz, pend_yz = loop_state
-
-          pend_any = pend_xy | pend_xz | pend_yz
-          t_next_remap = jnp.minimum(
-              jnp.minimum(
-                  jnp.where(pend_xy, t_cross_xy, NO_EVENT_TIME),
-                  jnp.where(pend_xz, t_cross_xz, NO_EVENT_TIME),
-              ),
-              jnp.where(pend_yz, t_cross_yz, NO_EVENT_TIME),
-          )
-
-          do_remap_now = pend_any & (t_curr >= t_next_remap - remap_eps)
-
-          def _apply_remap_event(_):
-            apply_xy = pend_xy & (jnp.abs(t_cross_xy - t_next_remap) <= remap_eps)
-            apply_xz = pend_xz & (jnp.abs(t_cross_xz - t_next_remap) <= remap_eps)
-            apply_yz = pend_yz & (jnp.abs(t_cross_yz - t_next_remap) <= remap_eps)
-
-            m_apply_xy = jnp.where(apply_xy, m_xy, jnp.array(0, dtype=jnp.int32))
-            m_apply_xz = jnp.where(apply_xz, m_xz, jnp.array(0, dtype=jnp.int32))
-            m_apply_yz = jnp.where(apply_yz, m_yz, jnp.array(0, dtype=jnp.int32))
-
-            R_remap = _apply_fractional_shear_remap(R_curr, m_apply_xy, m_apply_xz, m_apply_yz, dim)
-
-            t_new = jnp.minimum(t_next_remap + remap_eps, dt)
-
-            return (
-                t_new,
-                R_remap,
-                V_curr,
-                stress_accum,
-                collided_accum,
-                count,
-                pend_xy & (~apply_xy),
-                pend_xz & (~apply_xz),
-                pend_yz & (~apply_yz),
-            )
-
-          def _advance_to_next_event(_):
-            dt_rem = dt - t_curr
-            abs_t = time + t_curr
-
-            Ri = R_curr[i_idx]
-            Rj = R_curr[j_idx]
-            Vi = V_curr[i_idx]
-            Vj = V_curr[j_idx]
-
-            if use_batched_disp:
-              dr = displacement_fn(Ri, Rj, t=abs_t)
-            else:
-              dr = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(Ri, Rj)
-
-            dv = (Vi - Vj) + _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
-
-            a = jnp.sum(dv * dv, axis=-1)
-            b = 2 * jnp.sum(dr * dv, axis=-1)
-            c = jnp.sum(dr * dr, axis=-1) - diameter_sq
-            delta = b**2 - 4 * a * c
-
-            is_overlapping = c < 0
-            is_approaching = b < 0
-            valid_quad = (delta >= 0) & (a > f32(1e-12))
-
-            safe_delta = jnp.where(valid_quad, delta, f32(1.0))
-            safe_a = jnp.where(valid_quad, a, f32(1.0))
-            t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
-            t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
-            t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
-
-            resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
-            t_event = jnp.where(resolve_now, time_tol, t_hit)
-            times = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
-            times = jnp.where(pair_mask, times, NO_EVENT_TIME)
-
-            min_t_rel = jnp.min(times)
-            coll_idx = jnp.argmin(times)
-
-            step_limit_remap = jnp.where(pend_any, (t_next_remap - remap_eps) - t_curr, dt_rem)
-            step = jnp.minimum(min_t_rel, jnp.minimum(dt_rem, step_limit_remap))
-
-            dR_step = V_curr * step
-            if not fractional_coordinates:
-              dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
-
-            kwargs_step = dict(step_kwargs)
-            kwargs_step.pop('gamma', None)
-            kwargs_step.pop('gamma_xy', None)
-            kwargs_step.pop('gamma_xz', None)
-            kwargs_step.pop('gamma_yz', None)
-            kwargs_step['t'] = abs_t + step
-
-            R_next = shift_fn(R_curr, dR_step, **kwargs_step)
-            t_next = t_curr + step
-
-            is_coll = (min_t_rel <= dt_rem + time_tol) & (min_t_rel <= step + time_tol)
-
-            def _apply_elastic_collision(v_arr):
-              idx_dtype = i_idx.dtype
-              ii = i_idx[coll_idx].astype(idx_dtype)
-              jj = j_idx[coll_idx].astype(idx_dtype)
-              p_i = R_next[ii]
-              p_j = R_next[jj]
-              v_i = v_arr[ii]
-              v_j = v_arr[jj]
-
-              t_coll = abs_t + step
-              dr = displacement_fn(p_i, p_j, t=t_coll)
-              dist = space.distance(dr)
-              n = dr / (dist + f32(1e-7))
-
-              dv_aff = _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
-              dv_dot_n = jnp.dot((v_i - v_j) + dv_aff, n)
-              impulse = jnp.where(dv_dot_n < 0, dv_dot_n, f32(0.0))
-
-              v_i_new = v_i - impulse * n
-              v_j_new = v_j + impulse * n
-              v_next = v_arr.at[ii].set(v_i_new).at[jj].set(v_j_new)
-
-              overlap = diameter - dist
-
-              def _correct_positions(Rin):
-                corr = f32(0.5) * overlap * n
-                Ri_new = shift_fn(Rin[ii], corr, **kwargs_step)
-                Rj_new = shift_fn(Rin[jj], -corr, **kwargs_step)
-                return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
-
-              if compute_stress:
-                # Use the single-particle collision kick (not the relative change)
-                # and accumulate as (Δv ⊗ r) to match σ_xy ∝ Δv_x Δr_y.
-                dv_ij = v_i_new - v_i
-                r_contact = diameter * n
-                impulse = dv_ij * dt
-                stress_inc = jnp.einsum('i,j->ij', impulse, r_contact)
-              else:
-                stress_inc = stress_zero
-
-              R_corr = lax.cond(overlap > 0, _correct_positions, lambda Rin: Rin, R_next)
-              return v_next, R_corr, stress_inc, ii, jj
-
-            zero_idx = jnp.array(0, dtype=i_idx.dtype)
-            V_next, R_step_next, stress_inc, ii, jj = lax.cond(
-                is_coll,
-                _apply_elastic_collision,
-                lambda v_arr: (v_arr, R_next, stress_zero, zero_idx, zero_idx),
-                V_curr,
-            )
-
-            collided_next = lax.cond(
-                is_coll,
-                lambda c: c.at[ii].set(True).at[jj].set(True),
-                lambda c: c,
-                collided_accum,
-            )
-
-            return (
-                t_next,
-                R_step_next,
-                V_next,
-                stress_accum + stress_inc,
-                collided_next,
-                count + 1,
-                pend_xy,
-                pend_xz,
-                pend_yz,
-            )
-
-          return lax.cond(do_remap_now, _apply_remap_event, _advance_to_next_event, operand=None)
-
-        (
-            t_final,
-            R_final,
-            _,
-            stress_accum,
-            collided_accum,
-            loop_count,
-            pend_xy_f,
-            pend_xz_f,
-            pend_yz_f,
-        ) = lax.while_loop(loop_cond, loop_body, loop_init)
 
     def _collision_loop_error(reached_limit):
       if reached_limit:
