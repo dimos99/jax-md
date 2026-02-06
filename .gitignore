@@ -15,3 +15,6 @@ dist/
 examples/output/*
 .vscode
 *literature*
+*traj*
+etc/
+output
