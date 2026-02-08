@@ -55,7 +55,7 @@ from jax_md import space
 from jax_md import dataclasses
 from jax_md import partition
 from jax_md import smap
-from jax_md.hydro import pse as hydro_pse
+from jax_md.hydro import rpy as hydro_rpy
 
 static_cast = util.static_cast
 
@@ -1472,19 +1472,19 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
 
 @dataclasses.dataclass
 class RPYState:
-  """State for pse/Rotne-Prager–Yamakawa Brownian dynamics."""
+  """State for RPY Brownian dynamics with split-Ewald mobility."""
   position: Array
   mobility_position: Array
-  pse_state: hydro_pse.PseState
+  rpy_state: hydro_rpy.RpyState
   rng: Array
 
 
 @dataclasses.dataclass
 class ShearedRPYState:
-  """State for PSE RPY dynamics under shear."""
+  """State for RPY dynamics under shear."""
   position: Array
   mobility_position: Array
-  pse_state: hydro_pse.PseState
+  rpy_state: hydro_rpy.RpyState
   rng: Array
   time: float
   force: Array
@@ -1520,7 +1520,7 @@ def rpy(space_fns: Tuple[Callable, ...],
   if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
     Mw_params_local['fused_wave'] = True
 
-  pse_init, pse_apply = hydro_pse.build_pse_mobility(
+  rpy_init, rpy_apply = hydro_rpy.build_rpy_mobility(
       space_fns,
       a,
       xi,
@@ -1536,12 +1536,12 @@ def rpy(space_fns: Tuple[Callable, ...],
 
   def init_fn(key, R, **kwargs):
     mobility_position = jnp.asarray(R)
-    pse_state = pse_init(mobility_position, **kwargs)
-    box_matrix = pse_state.real.box_matrix
+    rpy_state = rpy_init(mobility_position, **kwargs)
+    box_matrix = rpy_state.real.box_matrix
     position_real = space.transform(box_matrix, mobility_position)
     return RPYState(position=position_real,
                     mobility_position=mobility_position,
-                    pse_state=pse_state,
+                    rpy_state=rpy_state,
                     rng=key)
 
   def apply_fn(state, **kwargs):
@@ -1551,15 +1551,15 @@ def rpy(space_fns: Tuple[Callable, ...],
 
     R_mobility = state.mobility_position
     R_real = state.position
-    pse_state = state.pse_state
+    rpy_state = state.rpy_state
     key = state.rng
 
     force = force_fn(R_mobility, **step_kwargs)
-    apply_with_brownian = getattr(pse_apply, 'with_brownian', None)
+    apply_with_brownian = getattr(rpy_apply, 'with_brownian', None)
     if apply_with_brownian is not None:
       key, brownian_key = random.split(key)
-      velocities, dB, pse_state, _, _, _ = apply_with_brownian(
-          pse_state,
+      velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
+          rpy_state,
           R_mobility,
           force,
           brownian_key,
@@ -1569,14 +1569,14 @@ def rpy(space_fns: Tuple[Callable, ...],
           **step_kwargs,
       )
     else:
-      velocities, pse_state = pse_apply(pse_state, R_mobility, force, **step_kwargs)
+      velocities, rpy_state = rpy_apply(rpy_state, R_mobility, force, **step_kwargs)
       key, noise_key = random.split(key)
-      dB = hydro_pse.brownian_increment(
-          noise_key, pse_state, R_mobility, kT=_kT, dt=_dt, mr_iters=_mr_iters
+      dB = hydro_rpy.brownian_increment(
+          noise_key, rpy_state, R_mobility, kT=_kT, dt=_dt, mr_iters=_mr_iters
       )
     # Combine deterministic and stochastic increments consistently in REAL coordinates.
     # periodic_general with fractional_coordinates=True expects REAL displacement.
-    # NOTE: PSE mobility already returns velocities and dB in real coordinates,
+    # NOTE: RPY mobility already returns velocities and dB in real coordinates,
     # so no transformation is needed.
     displacement_real = _dt * velocities + dB
     R_mobility = shift_fn(R_mobility, displacement_real, **step_kwargs)
@@ -1584,7 +1584,7 @@ def rpy(space_fns: Tuple[Callable, ...],
 
     return RPYState(position=R_real,
                     mobility_position=R_mobility,
-                    pse_state=pse_state,
+                    rpy_state=rpy_state,
                     rng=key)
 
   return init_fn, apply_fn
@@ -1637,7 +1637,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
   if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
     Mw_params_local['fused_wave'] = True
 
-  pse_init, pse_apply = hydro_pse.build_pse_mobility(
+  rpy_init, rpy_apply = hydro_rpy.build_rpy_mobility(
       space_fns,
       a,
       xi,
@@ -1692,18 +1692,18 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     else:
       shear_kwargs['gamma'] = curr_xy
 
-    pse_state = pse_init(mobility_position, **shear_kwargs)
+    rpy_state = rpy_init(mobility_position, **shear_kwargs)
     F0 = force_fn(mobility_position, **shear_kwargs)
 
     if fractional_coordinates:
-      box_matrix0 = pse_state.real.box_matrix
+      box_matrix0 = rpy_state.real.box_matrix
       position_real0 = space.transform(box_matrix0, mobility_position)
     else:
       position_real0 = mobility_position
 
     return ShearedRPYState(position=position_real0,
                            mobility_position=mobility_position,
-                           pse_state=pse_state,
+                           rpy_state=rpy_state,
                            rng=key,
                            time=t0,
                            force=F0)
@@ -1715,7 +1715,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
 
     mobility_position = state.mobility_position
     position_real = state.position
-    pse_state = state.pse_state
+    rpy_state = state.rpy_state
     key = state.rng
     time = state.time
 
@@ -1782,11 +1782,11 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     else:
       current_box = box_of(gamma=curr_xy)
 
-    apply_with_brownian = getattr(pse_apply, 'with_brownian', None)
+    apply_with_brownian = getattr(rpy_apply, 'with_brownian', None)
     if apply_with_brownian is not None:
       key, brownian_key = random.split(key)
-      velocities, dB, pse_state = apply_with_brownian(
-          pse_state,
+      velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
+          rpy_state,
           mobility_position,
           force,
           brownian_key,
@@ -1796,10 +1796,10 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
           **step_kwargs,
       )
     else:
-      velocities, pse_state = pse_apply(pse_state, mobility_position, force, **step_kwargs)
+      velocities, rpy_state = rpy_apply(rpy_state, mobility_position, force, **step_kwargs)
       key, noise_key = random.split(key)
-      dB = hydro_pse.brownian_increment(
-          noise_key, pse_state, mobility_position, kT=_kT, dt=_dt, mr_iters=_mr_iters
+      dB = hydro_rpy.brownian_increment(
+          noise_key, rpy_state, mobility_position, kT=_kT, dt=_dt, mr_iters=_mr_iters
       )
     displacement = _dt * velocities + dB
     mobility_position = shift_fn(mobility_position, displacement, **step_kwargs)
@@ -1810,7 +1810,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
 
     return ShearedRPYState(position=position_real,
                            mobility_position=mobility_position,
-                           pse_state=pse_state,
+                           rpy_state=rpy_state,
                            rng=key,
                            time=time + _dt,
                            force=force)

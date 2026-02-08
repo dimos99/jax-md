@@ -1,27 +1,27 @@
 """
 Hydrodynamic mobility operators for Stokes flow.
 
-This module provides Pse-split hydrodynamic mobility operators for
+This module provides split-Ewald RPY mobility operators for
 suspensions of spherical particles in periodic domains.
 
 Modules:
 --------
-pse_real : Real-space Pse mobility (M^r)
-pse_wave : Wave-space Spectral Pse mobility (M^w)
-pse : Combined mobility operator (M = M^r + M^w)
+rpy_real : Real-space RPY mobility (M^r)
+rpy_wave : Wave-space Spectral Ewald RPY mobility (M^w)
+rpy : Combined mobility operator (M = M^r + M^w)
 
 Example:
 --------
 >>> from jax_md import space
->>> from jax_md.hydro import pse
+>>> from jax_md.hydro import rpy
 >>> 
 >>> # Setup periodic box and space functions
 >>> box = jnp.eye(3) * 10.0  # 10x10x10 cubic box
 >>> space_fns = space.periodic_general(box, fractional_coordinates=True)
 >>> 
->>> # Build mobility operator
->>> init_fn, apply_fn = pse.build_pse_mobility(
->>>     space_fns, a=0.03, xi=10.0, eta=1.0, P=16, Mgrid=64
+>>> # Build mobility operator (space must be provided explicitly)
+>>> init_fn, apply_fn = rpy.build_rpy_mobility(
+>>>     space_fns, a=0.03, xi=0.7, eta=1.0, P=16, Mgrid=64
 >>> )
 >>> 
 >>> # Apply to positions and forces (fractional coordinates)
@@ -29,7 +29,7 @@ Example:
 >>> velocities, state = apply_fn(state, positions_fractional, forces)
 """
 
-from jax_md.hydro.pse_real import (
+from jax_md.hydro.rpy_real import (
     F1F2_closed_form,
     Mr_pair_block,
     Mr_self,
@@ -41,10 +41,17 @@ from jax_md.hydro.pse_real import (
     sample_mr_sqrt
 )
 
-from jax_md.hydro.pse_wave import (
+from jax_md.hydro.rpy_wave import (
+    WaveSpaceParams,
+    WaveSpaceState,
+    build_Mw,
+    build_Mw_state,
     build_B_modes,
+    build_wave_modes,
     build_Mw_apply,
+    mw_matvec,
     build_Mw_sqrt_sampler,
+    build_Mw_apply_and_sample,
     make_reciprocal,
     q_grid,
     k_from_q,
@@ -53,16 +60,15 @@ from jax_md.hydro.pse_wave import (
     gather,
     fft_vec,
     ifft_vec,
-    Mw_bruteforce
+    Mw_bruteforce,
 )
 
-from jax_md.hydro.pse import (
-    build_pse_mobility,
-    build_pse_mobility_direct,
-    PseState,
-    suggest_pse_params,
+from jax_md.hydro.rpy import (
+    build_rpy_matvec,
+    build_rpy_mobility,
+    estimate_rpy_params,
+    RpyState,
     brownian_increment,
-    build_euler_maruyama_step
 )
 
 __all__ = [
@@ -77,9 +83,16 @@ __all__ = [
     'lanczos_sqrt_mv',
     'sample_mr_sqrt',
     # Wave-space
+    'WaveSpaceParams',
+    'WaveSpaceState',
+    'build_Mw',
+    'build_Mw_state',
     'build_B_modes',
+    'build_wave_modes',
     'build_Mw_apply',
+    'mw_matvec',
     'build_Mw_sqrt_sampler',
+    'build_Mw_apply_and_sample',
     'make_reciprocal',
     'q_grid',
     'k_from_q',
@@ -90,10 +103,9 @@ __all__ = [
     'ifft_vec',
     'Mw_bruteforce',
     # Combined
-    'build_pse_mobility',
-    'build_pse_mobility_direct',
-    'PseState',
-    'suggest_pse_params',
+    'build_rpy_matvec',
+    'build_rpy_mobility',
+    'estimate_rpy_params',
+    'RpyState',
     'brownian_increment',
-    'build_euler_maruyama_step'
 ]

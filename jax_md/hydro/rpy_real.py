@@ -1,16 +1,16 @@
-"""Compatibility wrapper exposing deterministic and stochastic real-space utilities."""
+"""Deterministic and stochastic real-space RPY utilities."""
 
-from jax_md.hydro.pse_real_det import (
+from jax_md.hydro.rpy_real_det import (
     REAL_DTYPE,
     F1F2_closed_form,
     Mr_pair_block,
     Mr_self,
     RealSpaceState,
-    _current_box_matrix,
+    current_box_matrix,
     build_Mr_apply,
     mr_matvec,
 )
-from jax_md.hydro.pse_real_stoch import (
+from jax_md.hydro.rpy_real_stoch import (
     Preconditioner,
     identity_preconditioner,
     scalar_preconditioner,
@@ -29,7 +29,7 @@ __all__ = [
     'Mr_pair_block',
     'Mr_self',
     'RealSpaceState',
-    '_current_box_matrix',
+    'current_box_matrix',
     'build_Mr_apply',
     'mr_matvec',
     # Stochastic utilities

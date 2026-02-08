@@ -1,4 +1,4 @@
-"""Stochastic sampling utilities for the real-space PSE mobility.
+"""Stochastic sampling utilities for the real-space RPY mobility.
 
 The current implementation is force-only: ``mr_matvec`` applies a 3Nx3N mobility
 and the sampler draws/returns arrays of shape ``(N, 3)`` in real coordinates.
@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from functools import partial
 
 from jax_md import dataclasses
-from jax_md.hydro.pse_real_det import REAL_DTYPE, RealSpaceState, mr_matvec
+from jax_md.hydro.rpy_real_det import REAL_DTYPE, RealSpaceState, mr_matvec
 
 # --- Preconditioner for Chow–Saad-style sampling ---
 

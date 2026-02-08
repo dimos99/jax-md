@@ -1,4 +1,4 @@
-"""Real-space PSE mobility (M^r) with closed-form kernels
+"""Real-space RPY mobility (M^r) with closed-form kernels
 
 Real-space mobility M^(r) uses closed-form F1,F2 coefficients for
 monodisperse spheres of radius a, with Ewald splitting parameter ξ.
@@ -68,7 +68,7 @@ from typing import Callable, Optional, Tuple
 
 from jax_md import dataclasses, partition, space
 from jax import ops
-from jax_md.hydro.pse_real_det_helpers import (
+from jax_md.hydro.rpy_real_det_helpers import (
     REAL_DTYPE,
     F1F2_closed_form,
     Mr_self,
@@ -76,10 +76,6 @@ from jax_md.hydro.pse_real_det_helpers import (
     canonicalize_box_matrix,
     generate_lattice_hypercube,
 )
-
-# Backward-compatible aliases for helper utilities.
-_current_box_matrix = current_box_matrix
-_generate_lattice_hypercube = generate_lattice_hypercube
 
 
 I3 = jnp.eye(3, dtype=REAL_DTYPE) # 3x3 identity matrix
@@ -140,7 +136,7 @@ def Mr_pair_block(r_vec, a, xi, eta):
     a : float
         Sphere radius
     xi : float
-        Pse splitting parameter
+        Ewald splitting parameter
     eta : float
         Fluid viscosity
         
@@ -184,7 +180,7 @@ def _build_mr_core(
         v_i = M^r_ii·f_i + Σ_{j≠i} Σ_{images} M^r_ij·f_j
     
     where M^r_ij are 3×3 mobility blocks constructed from the closed-form F1, F2
-    coefficients (see F1F2_closed_form in pse_real_det_helpers).
+    coefficients (see F1F2_closed_form in rpy_real_det_helpers).
     
     Parameters
     ----------
@@ -290,6 +286,22 @@ def _build_mr_core(
         prefactor = jnp.asarray(prefactor_scalar, dtype=dtype)
         self_term = prefactor * jnp.asarray(self_factor, dtype=dtype)
 
+        def _pair_contrib(rij, r2, mask, forces):
+            """Fused mobility·force contraction for arbitrary neighbor shapes."""
+            eps = jnp.finfo(dtype).tiny
+            safe_r = jnp.where(mask, jnp.sqrt(r2 + eps), jnp.ones_like(r2, dtype=dtype))
+            rhat = jnp.where(mask[..., None], rij / safe_r[..., None], 0.0)
+
+            F1, F2 = F1F2_closed_form(safe_r, a, xi)
+            F1 = jnp.where(mask, F1, 0.0)
+            F2 = jnp.where(mask, F2, 0.0)
+
+            rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces)
+            return prefactor * (
+                F1[..., None] * forces +
+                (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
+            )
+
         # Early exit when no neighbors or lattice images are present.
         if n_images == 0:
             return self_term * forces
@@ -327,27 +339,8 @@ def _build_mr_core(
                 return self_term * forces
 
             def _with_pairs(_):
-                eps = jnp.finfo(dtype).tiny
-                safe_r = jnp.sqrt(r2 + eps)
-                safe_r = jnp.where(valid_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
-
-                # Normalize separation vectors; drop invalid entries to avoid NaNs.
-                rhat = jnp.where(valid_pairs[..., None], rij / safe_r[..., None], 0.0)
-
-                F1, F2 = F1F2_closed_form(safe_r, a, xi)
-                F1 = jnp.where(valid_pairs, F1, 0.0)
-                F2 = jnp.where(valid_pairs, F2, 0.0)
-
-                # Fused mobility-force contraction to avoid materializing Mr_blocks tensor.
-                # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
-                #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
-                # This eliminates the (edges, images, 3, 3) tensor, saving ~60% memory.
                 forces_neighbors = forces[neighbor_idx_masked][:, :, None, :]
-                rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_neighbors)
-                contrib = prefactor * (
-                    F1[..., None] * forces_neighbors +
-                    (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
-                )
+                contrib = _pair_contrib(rij, r2, valid_pairs, forces_neighbors)
                 contrib = contrib.sum(axis=2)
                 contrib = contrib.sum(axis=1)
 
@@ -388,26 +381,8 @@ def _build_mr_core(
             return self_term * forces
 
         def _with_pairs(_):
-            eps = jnp.finfo(dtype).tiny
-            safe_r = jnp.sqrt(r2 + eps)
-            safe_r = jnp.where(mask_pairs, safe_r, jnp.ones_like(safe_r, dtype=dtype))
-
-            rhat = jnp.where(mask_pairs[..., None], rij / safe_r[..., None], 0.0)
-
-            F1, F2 = F1F2_closed_form(safe_r, a, xi)
-            F1 = jnp.where(mask_pairs, F1, 0.0)
-            F2 = jnp.where(mask_pairs, F2, 0.0)
-
-            # Fused mobility-force contraction.
-            # M·f = prefactor * [(F1 (I - rr^T) + F2 rr^T)] · f
-            #     = prefactor * [F1·f + (F2-F1)·(r^T·f)·r]
             forces_senders = forces[senders][:, None, :]
-            rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces_senders)
-            contrib_i = prefactor * (
-                F1[..., None] * forces_senders +
-                (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
-            )
-            contrib_i = contrib_i.sum(axis=1)
+            contrib_i = _pair_contrib(rij, r2, mask_pairs, forces_senders).sum(axis=1)
 
             velocities = self_term * forces
             velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
@@ -415,12 +390,7 @@ def _build_mr_core(
             if include_ordered_backflow: # For OrderedSparse format
                 # Compute backflow contributions M_ji·f_i
                 forces_receivers = forces[receivers][:, None, :]
-                rhat_dot_f_back = jnp.einsum("...i,...i->...", rhat, forces_receivers)
-                contrib_j = prefactor * (
-                    F1[..., None] * forces_receivers +
-                    (F2 - F1)[..., None] * rhat_dot_f_back[..., None] * rhat
-                )
-                contrib_j = contrib_j.sum(axis=1)
+                contrib_j = _pair_contrib(rij, r2, mask_pairs, forces_receivers).sum(axis=1)
                 velocities = velocities + ops.segment_sum(contrib_j, senders, N)
 
             return velocities # = M^r @ forces
