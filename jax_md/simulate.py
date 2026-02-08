@@ -2457,12 +2457,23 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
         raise ValueError(
             "brownian_hard_sphere: sparse neighbor.idx must have shape "
             "[2, max_neighbors].")
-      i_idx = idx[0]
-      j_idx = idx[1]
-      mask = i_idx < n_particles
+      src = idx[0]
+      dst = idx[1]
+      mask = (src < n_particles) & (dst < n_particles) & (src != dst)
+      i_idx = jnp.minimum(src, dst)
+      j_idx = jnp.maximum(src, dst)
       i_idx = jnp.where(mask, i_idx, 0)
       j_idx = jnp.where(mask, j_idx, 0)
-      return _sort_pairs(i_idx, j_idx, mask)
+      i_idx, j_idx, mask = _sort_pairs(i_idx, j_idx, mask)
+
+      # Sparse lists can contain both (i, j) and (j, i). Collision handling
+      # is pair-wise (undirected), so drop duplicates after canonicalization.
+      sent = jnp.asarray(n_particles, dtype=i_idx.dtype)
+      prev_i = jnp.concatenate((jnp.array([sent], dtype=i_idx.dtype), i_idx[:-1]))
+      prev_j = jnp.concatenate((jnp.array([sent], dtype=j_idx.dtype), j_idx[:-1]))
+      dedup = ~((i_idx == prev_i) & (j_idx == prev_j))
+      mask = mask & dedup
+      return i_idx, j_idx, mask
 
     if idx.ndim != 2 or idx.shape[0] != n_particles:
       raise ValueError(
