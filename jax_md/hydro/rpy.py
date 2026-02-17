@@ -7,44 +7,175 @@ and wave-space contributions for efficient hydrodynamic interactions in
 periodic systems. It supports deterministic mobility application and
 stochastic Brownian velocity sampling.
 """
-from typing import Callable, Optional, Tuple
+
+from typing import Callable, Dict, Mapping, Optional, Tuple, Union
+import itertools
 import math
 import warnings
 
 import jax
 import jax.numpy as jnp
+from jax import core as jax_core
 from jax import config as jax_config
 
 from jax_md import dataclasses, space
 from jax_md.hydro.rpy_wave import (
-    WaveSpaceState,
-    build_Mw_state,
-    choose_theta,
+  WaveSpaceState,
+  build_Mw_state,
+  choose_theta,
+  se_alpha,
+  make_reciprocal,
+  q_grid,
+  k_from_q,
+  build_P_modes,
+  build_B_modes,
+  build_stencils_frac,
+  spread,
+  gather,
+  fft_vec,
+  ifft_vec,
 )
 from jax_md.hydro.rpy_real import (
-    RealSpaceState,
-    build_Mr_apply,
-    sample_mr_sqrt_precond,
-    current_box_matrix,
-    jacobi_from_self,
-    identity_preconditioner,
-    Preconditioner,
+  RealSpaceState,
+  build_Mr_apply,
+  sample_mr_sqrt_precond,
+  Mr_self,
+  current_box_matrix,
+  jacobi_from_self,
+  identity_preconditioner,
+  Preconditioner,
 )
+from jax_md.hydro.rpy_wave_stoch import _hermitian_gaussian_modes
 
 XI_OPT_A = 0.5  # default target for xi * a in Fiore (2017)
 REAL_DTYPE = jnp.float64 if jax_config.jax_enable_x64 else jnp.float32
+COMPLEX_DTYPE = jnp.complex128 if jax_config.jax_enable_x64 else jnp.complex64
 
 
-def _quadrature_error_bound(P: int) -> Tuple[float, float]:
+def _shear_planes_for_dim(dim: int) -> Tuple[str, ...]:
+  if dim == 2:
+    return ('xy',)
+  if dim == 3:
+    return ('xy', 'xz', 'yz')
+  raise ValueError(f"Unsupported dimensionality for shear estimator: dim={dim}.")
+
+
+def _normalize_shear_schedule(
+    shear_schedule: Union[Callable[[float], float], Mapping[str, Callable[[float], float]]],
+    dim: int,
+) -> Dict[str, Callable[[float], float]]:
+  """Normalize estimator shear schedule into a per-plane callable map."""
+  planes = set(_shear_planes_for_dim(dim))
+  if callable(shear_schedule):
+    if 'xy' not in planes:
+      raise ValueError("Callable shear schedule is only supported for dimensions with an 'xy' plane.")
+    return {'xy': shear_schedule}
+  if isinstance(shear_schedule, Mapping):
+    fn_map = {}
+    for key, fn in shear_schedule.items():
+      if key not in planes or fn is None:
+        continue
+      if not callable(fn):
+        raise ValueError(f"shear_schedule['{key}'] must be callable or None.")
+      fn_map[str(key)] = fn
+    return fn_map
+  raise ValueError("shear_schedule must be a callable or a dict mapping shear planes to callables.")
+
+
+def _deformation_matrix_from_gammas(dim: int, gammas: Mapping[str, float]) -> jnp.ndarray:
+  """Build dimensionless deformation tensor F from plane shear strains."""
+  F = jnp.eye(dim, dtype=REAL_DTYPE)
+  for plane, gamma in gammas.items():
+    if plane == 'xy' and dim >= 2:
+      F = F.at[0, 1].set(jnp.asarray(gamma, dtype=REAL_DTYPE))
+    elif plane == 'xz' and dim >= 3:
+      F = F.at[0, 2].set(jnp.asarray(gamma, dtype=REAL_DTYPE))
+    elif plane == 'yz' and dim >= 3:
+      F = F.at[1, 2].set(jnp.asarray(gamma, dtype=REAL_DTYPE))
+  return F
+
+
+def quadrature_lambda_from_deformation(F: jnp.ndarray) -> float:
+  """Return max eigenvalue of F^T F used in deformed-grid quadrature bounds."""
+  F = jnp.asarray(F, dtype=REAL_DTYPE)
+  if F.ndim != 2 or F.shape[0] != F.shape[1]:
+    raise ValueError("Deformation tensor F must be square.")
+  lam = float(jnp.max(jnp.linalg.eigvalsh(F.T @ F)))
+  if lam <= 0.0 or not math.isfinite(lam):
+    raise ValueError(f"Invalid deformation eigenvalue lambda_max={lam}.")
+  return lam
+
+
+def _max_quadrature_lambda_from_shear(
+    shear_schedule: Union[Callable[[float], float], Mapping[str, Callable[[float], float]]],
+    dim: int,
+    *,
+    shear_t_bounds: Optional[Tuple[float, float]],
+    shear_remap: bool,
+) -> float:
+  """Compute exact quadrature deformation penalty from shear schedule assumptions."""
+  fn_map = _normalize_shear_schedule(shear_schedule, dim)
+  if not fn_map:
+    return 1.0
+
+  if shear_remap:
+    planes = tuple(sorted(fn_map.keys()))
+    lambda_max = 1.0
+    for signs in itertools.product((-0.5, 0.5), repeat=len(planes)):
+      gammas = {plane: sign for plane, sign in zip(planes, signs)}
+      F = _deformation_matrix_from_gammas(dim, gammas)
+      lambda_max = max(lambda_max, quadrature_lambda_from_deformation(F))
+    return lambda_max
+
+  if shear_t_bounds is None:
+    raise ValueError("shear_t_bounds=(t0, t1) is required when shear_schedule is provided with shear_remap=False.")
+  t0, t1 = float(shear_t_bounds[0]), float(shear_t_bounds[1])
+  if not math.isfinite(t0) or not math.isfinite(t1):
+    raise ValueError("shear_t_bounds entries must be finite.")
+  if t1 < t0:
+    raise ValueError("shear_t_bounds must satisfy t1 >= t0.")
+
+  tm = 0.5 * (t0 + t1)
+  gammas_t0 = {}
+  gammas_t1 = {}
+  for plane, fn in fn_map.items():
+    g0 = float(fn(t0))
+    g1 = float(fn(t1))
+    gm = float(fn(tm))
+    if not (math.isfinite(g0) and math.isfinite(g1) and math.isfinite(gm)):
+      raise ValueError(f"Non-finite shear value encountered on plane '{plane}'.")
+    g_affine = 0.5 * (g0 + g1)
+    tol = max(1e-10, 1e-8 * max(abs(g0), abs(g1), abs(gm), 1.0))
+    if abs(gm - g_affine) > tol:
+      raise ValueError(
+          f"shear_schedule for plane '{plane}' is not affine on [{t0}, {t1}] "
+          f"(midpoint check failed: gm={gm}, expected={g_affine})."
+      )
+    gammas_t0[plane] = g0
+    gammas_t1[plane] = g1
+
+  F0 = _deformation_matrix_from_gammas(dim, gammas_t0)
+  F1 = _deformation_matrix_from_gammas(dim, gammas_t1)
+  return max(
+      quadrature_lambda_from_deformation(F0),
+      quadrature_lambda_from_deformation(F1),
+  )
+
+
+def _quadrature_error_bound(P: int, quadrature_lambda_max: float = 1.0) -> Tuple[float, float]:
   """Quadrature error bound ε_q and Gaussian width m (Fiore 2017, Sec. II.C).
 
   Uses the spectral Ewald choice m = sqrt(pi P), consistent with the
-  theta-selection in `choose_theta`.
+  theta-selection in `choose_theta`, with deformation penalty lambda_max from
+  Fiore & Swan (2018) Eq. (55).
   """
+  quadrature_lambda_max = float(quadrature_lambda_max)
+  if quadrature_lambda_max <= 0.0 or not math.isfinite(quadrature_lambda_max):
+    raise ValueError(f"quadrature_lambda_max must be positive and finite; got {quadrature_lambda_max}.")
   P = int(P)
   m = math.sqrt(math.pi * float(P))
-  term1 = math.exp(-0.5 * math.pi * float(P))
-  term2 = math.erfc(m / math.sqrt(2.0))
+  term1 = math.exp(-0.5 * math.pi * float(P) / quadrature_lambda_max)
+  term2 = math.erfc(m / math.sqrt(2.0 * quadrature_lambda_max))
   return term1 + term2, m
 
 
@@ -86,14 +217,24 @@ def _select_kcut(xi: float, a: float, eps_w: float) -> float:
   return k_high
 
 
-def _select_P_and_m(eps_q: float) -> Tuple[int, float, float]:
+def _select_P_and_m(
+    eps_q: float,
+    quadrature_lambda_max: float = 1.0,
+    quadrature_safety_nodes: int = 0,
+) -> Tuple[int, float, float]:
   """Choose the smallest integer P with ε_q <= eps_q."""
   eps_q = float(max(eps_q, 1e-16))
+  quadrature_safety_nodes = int(quadrature_safety_nodes)
+  if quadrature_safety_nodes < 0:
+    raise ValueError("quadrature_safety_nodes must be >= 0.")
   P = 4
-  err, m = _quadrature_error_bound(P)
+  err, m = _quadrature_error_bound(P, quadrature_lambda_max=quadrature_lambda_max)
   while err > eps_q and P < 64:
     P += 1
-    err, m = _quadrature_error_bound(P)
+    err, m = _quadrature_error_bound(P, quadrature_lambda_max=quadrature_lambda_max)
+  if quadrature_safety_nodes:
+    P += quadrature_safety_nodes
+    err, m = _quadrature_error_bound(P, quadrature_lambda_max=quadrature_lambda_max)
   return P, m, err
 
 
@@ -111,6 +252,12 @@ def estimate_rpy_params(tol: float,
                         error_split: Tuple[float, float, float] = (1.0 / 3.0,
                                                                   1.0 / 3.0,
                                                                   1.0 / 3.0),
+                        shear_schedule: Optional[
+                            Union[Callable[[float], float], Mapping[str, Callable[[float], float]]]
+                        ] = None,
+                        shear_t_bounds: Optional[Tuple[float, float]] = None,
+                        shear_remap: bool = False,
+                        quadrature_safety_nodes: int = 1,
                         notes: bool = False) -> dict:
   """Fiore (2017) parameter estimator for split-Ewald RPY.
 
@@ -121,36 +268,8 @@ def estimate_rpy_params(tol: float,
   constants set to unity; for dilute/underspecified cases, xi is set by
   xi * a ≈ 0.5 (Fiore 2017, Fig. 4/Table I).
 
-  Parameters
-  ----------
-  tol : float
-      Target relative tolerance for mobility accuracy.
-  A : array_like (3,3)
-      Periodic cell matrix (real units).
-  a : float
-      Sphere radius.
-  N : int
-      Number of particles (used for xi* estimate).
-  phi : float
-      Volume fraction (used for xi* estimate).
-  xi_override : float, optional
-      If provided, force xi to this value.
-  d_f : float, optional
-      Fractal dimension (defaults to 3 for random suspensions).
-  n_iter : int, optional
-      Lanczos iteration count (used in xi* estimate).
-  C_R, C_W : float, optional
-      Implementation constants in Eq. (22/23); default to 1.
-  error_split : tuple of 3 floats
-      Fractions of tol assigned to (eps_R, eps_W, eps_q).
-  notes : bool, optional
-      If True, include diagnostic fields in the returned dict.
-
-  Returns
-  -------
-  dict with keys:
-      xi, P, M, grid_shape, rcut, kcut, theta, m
-      (plus optional 'notes' diagnostic map when requested)
+  Returns dict with keys:
+    xi, P, M, grid_shape, rcut, kcut, theta, m, lattice_extent
   """
   tol = float(tol)
   A = jnp.asarray(A, dtype=REAL_DTYPE)
@@ -158,11 +277,16 @@ def estimate_rpy_params(tol: float,
     raise ValueError("tol must be positive.")
   if a <= 0.0:
     raise ValueError("a must be positive.")
+  if A.ndim != 2 or A.shape[0] != A.shape[1]:
+    raise ValueError("A must be a square 2D box matrix.")
+  dim = int(A.shape[0])
 
   L_cols = jnp.linalg.norm(A, axis=0)
-  L_min = float(jnp.min(L_cols))
   L_max = float(jnp.max(L_cols))
   L_mean = float(jnp.mean(L_cols))
+  sigma_vals = jnp.linalg.svd(A, compute_uv=False)
+  sigma_min = float(jnp.min(sigma_vals))
+  safe_sigma = max(sigma_min, 1e-12)
 
   split_r, split_w, split_q = error_split
   if split_r <= 0 or split_w <= 0 or split_q <= 0:
@@ -187,12 +311,24 @@ def estimate_rpy_params(tol: float,
   eps_w = max(tol * split_w, 1e-16)
   eps_q = max(tol * split_q, 1e-16)
 
-  rcut_candidate = math.sqrt(math.log(1.0 / eps_r)) / xi
-  rcut_guard = 0.49 * L_min
-  rcut = min(rcut_candidate, rcut_guard)
-  rcut_capped = rcut < rcut_candidate
+  rcut = math.sqrt(math.log(1.0 / eps_r)) / xi
+  lattice_extent = int(math.ceil(rcut / safe_sigma))
 
-  P, m, eps_q_est = _select_P_and_m(eps_q)
+  if shear_schedule is None:
+    quadrature_lambda_max = 1.0
+  else:
+    quadrature_lambda_max = _max_quadrature_lambda_from_shear(
+        shear_schedule,
+        dim,
+        shear_t_bounds=shear_t_bounds,
+        shear_remap=shear_remap,
+    )
+
+  P, m, eps_q_est = _select_P_and_m(
+      eps_q,
+      quadrature_lambda_max=quadrature_lambda_max,
+      quadrature_safety_nodes=quadrature_safety_nodes,
+  )
 
   kcut = _select_kcut(xi, a, eps_w)
 
@@ -213,16 +349,15 @@ def estimate_rpy_params(tol: float,
       'kcut': float(kcut),
       'theta': float(theta),
       'm': float(m),
+      'lattice_extent': int(lattice_extent),
   }
 
   if notes:
     eps_w_est = _epsilon_k_bound(kcut, xi, a)
     eps_r_est = math.exp(-(xi * rcut) ** 2)
     result['notes'] = {
-        'rcut_candidate': float(rcut_candidate),
-        'rcut_guard': float(rcut_guard),
-        'rcut_capped': bool(rcut_capped),
-        'L_min': float(L_min),
+        'sigma_min': float(sigma_min),
+        'lattice_extent': int(lattice_extent),
         'L_mean': float(L_mean),
         'L_max': float(L_max),
         'eps_r_target': float(eps_r),
@@ -231,6 +366,10 @@ def estimate_rpy_params(tol: float,
         'eps_r_est': float(eps_r_est),
         'eps_w_est': float(eps_w_est),
         'eps_q_est': float(eps_q_est),
+        'quadrature_lambda_max': float(quadrature_lambda_max),
+        'quadrature_safety_nodes': int(quadrature_safety_nodes),
+        'shear_remap': bool(shear_remap),
+        'shear_schedule_provided': bool(shear_schedule is not None),
         'N': int(N),
         'phi': float(phi),
         'd_f': float(d_f),
@@ -259,33 +398,6 @@ class RpyState:
   )
 
 
-def _base_box_kwargs(dim: int, kwargs: dict) -> dict:
-  """Zero out shear entries to recover the base box used for wave modes."""
-  base_kwargs = dict(kwargs)
-  base_kwargs.pop('gamma', None)
-  base_kwargs.pop('gamma_xy', None)
-  base_kwargs.pop('gamma_xz', None)
-  base_kwargs.pop('gamma_yz', None)
-  if dim >= 3:
-    base_kwargs['gamma'] = {'xy': 0.0, 'xz': 0.0, 'yz': 0.0}
-  elif dim >= 2:
-    base_kwargs['gamma'] = 0.0
-  return base_kwargs
-
-
-def _map_positions_to_base(base_inv: Optional[jnp.ndarray],
-                           current_box: Optional[jnp.ndarray],
-                           positions_frac: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-  """Map fractional coordinates into the base box used by the wave operator."""
-  dim = positions_frac.shape[-1]
-  if base_inv is None or current_box is None:
-    transform = jnp.eye(dim, dtype=positions_frac.dtype)
-    return positions_frac, transform
-  transform = base_inv @ current_box
-  mapped = jnp.mod(positions_frac @ transform.T, 1.0)
-  return mapped, transform
-
-
 def build_rpy_matvec(space_fns,
                      a: float,
                      xi: float,
@@ -303,10 +415,9 @@ def build_rpy_matvec(space_fns,
   """
   Construct matvec apply functions for the split-Ewald RPY mobility.
 
-  - `space_fns` must include displacement/shift and may include `box_fn`; when
-    `box_fn` is present, the wave operator is rebuilt on the *current* box each
-    call (matches Wang–Brady Eq. 39 / Fiore–Swan deformed-grid treatment).
-  - Positions are always used directly in that live frame (no base-frame mapping).
+  - `space_fns` must include displacement/shift and may include `box_fn`.
+  - Wave modes are rebuilt on the *current* box each call for exact
+    instantaneous wave-space mobility under deformation.
   - Brownian sampling (if enabled) uses the same live-box wave modes; provide
     `brownian_key`, `kT`, and `dt` via `apply_fn` or call `apply_fn.with_brownian`.
   - xi must be positive; values with xi * a ≈ 0.5 are a good starting point.
@@ -356,10 +467,79 @@ def build_rpy_matvec(space_fns,
     P_ = 16
 
   if preconditioner is None:
-    self_coeff = 1.0 / (6.0 * jnp.pi * eta * a)
+    self_coeff = float((1.0 / (6.0 * jnp.pi * eta * a)) * Mr_self(a, xi))
     precond = jacobi_from_self(self_coeff)
   else:
     precond = preconditioner
+
+  # Static wave quadrature/grid factors shared across exact live-box evaluation.
+  if theta_ is None:
+    M_eff = (Mx + My + Mz) / 3.0
+    theta_eff = float(choose_theta(P_, xi, M_eff))
+  else:
+    theta_eff = float(theta_)
+  alpha_eff = float(se_alpha(xi, theta_eff))
+  alpha_arr = jnp.asarray(alpha_eff, dtype=REAL_DTYPE)
+  QX, QY, QZ = q_grid(Mx, My, Mz)
+  Q2 = QX * QX + QY * QY + QZ * QZ
+  Ngrid = jnp.asarray(Mx * My * Mz, dtype=REAL_DTYPE)
+  deconv_pref = (alpha_arr / jnp.pi) ** 3 / (Ngrid ** 2)
+  deconv = deconv_pref * jnp.exp(2.0 * (jnp.pi ** 2) * Q2 / alpha_arr)
+
+  def _wave_operators_exact(current_box: jnp.ndarray,
+                            positions_frac: jnp.ndarray,
+                            forces: jnp.ndarray,
+                            *,
+                            key_wave: Optional[jax.Array] = None):
+    """Exact wave-space apply under the live box without host-side rebuilds."""
+    box = jnp.asarray(current_box, dtype=REAL_DTYPE)
+    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+
+    Brecip = make_reciprocal(box)
+    k, K, K2 = k_from_q(QX, QY, QZ, Brecip)
+    V_box = jnp.linalg.det(box)
+    sigma_inv = Ngrid / V_box
+    Pshape = build_P_modes(K, a)
+    Bfluid, Bhalf = build_B_modes(k, K, K2, xi, eta, V_box, deconv)
+
+    st = build_stencils_frac(positions_frac, Mx, My, Mz, P_, alpha_eff)
+    force_grid = spread(forces, st, Mx, My, Mz)
+    force_q = fft_vec(sigma_inv * force_grid)
+    P_force_q = Pshape[..., None] * force_q
+    BP_force_q = jnp.einsum('...ij,...j->...i', Bfluid, P_force_q)
+    Uq = Pshape[..., None] * BP_force_q
+    u_grid = ifft_vec(Uq)
+    velocities = V_box * gather(u_grid, st, Mx, My, Mz)
+
+    if key_wave is None:
+      return velocities, None
+
+    Bhalf_complex = jnp.asarray(Bhalf, dtype=COMPLEX_DTYPE)
+    draw = _hermitian_gaussian_modes(key_wave, (Mx, My, Mz, 3))
+    modes_q = jnp.einsum('...ij,...j->...i', Bhalf_complex, draw)
+    modes_q = Pshape[..., None] * modes_q
+    u_grid_noise = ifft_vec(modes_q)
+    vel_noise = gather(u_grid_noise, st, Mx, My, Mz)
+    noise_scale = jnp.sqrt(sigma_inv * Ngrid)
+    wave_noise = noise_scale * (jnp.sqrt(V_box) * vel_noise)
+    return velocities, wave_noise
+
+  def _build_wave_state_for_box(box_matrix: jnp.ndarray) -> WaveSpaceState:
+    return build_Mw_state(
+        box_matrix,
+        a,
+        xi,
+        eta,
+        Mx,
+        My,
+        Mz,
+        P_,
+        theta=theta_,
+        fractional_coordinates=True,
+        attach_sqrt=include_brownian,
+        attach_fused=False,
+    )
 
   def init_fn(positions_frac, **kwargs):
     positions_frac = jnp.asarray(positions_frac)
@@ -367,15 +547,9 @@ def build_rpy_matvec(space_fns,
     combined_kwargs.update(kwargs)
 
     dim = int(positions_frac.shape[1])
-    if has_box_fn:
-      current_box = current_box_matrix(displacement_fn, box_fn, dim, **combined_kwargs)
-      base_kwargs = _base_box_kwargs(dim, combined_kwargs)
-      base_box = current_box_matrix(displacement_fn, box_fn, dim, **base_kwargs)
-    else:
-      base_box = current_box_matrix(displacement_fn, box_fn, dim, **combined_kwargs)
-      current_box = base_box
+    active_box = current_box_matrix(displacement_fn, box_fn, dim, **combined_kwargs)
 
-    L_min = float(jnp.min(jnp.linalg.norm(base_box, axis=0)))
+    L_min = float(jnp.min(jnp.linalg.norm(active_box, axis=0)))
     if rcut_value > 0.5 * L_min:
       warnings.warn(
           (
@@ -389,20 +563,7 @@ def build_rpy_matvec(space_fns,
 
     real_state = Mr_init(positions_frac, **combined_kwargs)
 
-    wave_state = build_Mw_state(
-        base_box,
-        a,
-        xi,
-        eta,
-        Mx,
-        My,
-        Mz,
-        P_,
-        theta=theta_,
-        fractional_coordinates=True,
-        attach_sqrt=include_brownian,
-        attach_fused=False,
-    )
+    wave_state = _build_wave_state_for_box(active_box)
 
     return RpyState(
         real=real_state,
@@ -433,13 +594,17 @@ def build_rpy_matvec(space_fns,
 
     Ur, real_state = Mr_apply(state.real, positions_frac, forces, **combined_kwargs)
 
-    # Reuse the base wave operator; remapping is handled by passing the current box.
     wave_state = state.wave
-
-    if wave_state.apply_fn is None:
-      raise ValueError('wave-space operator missing from state; run init_fn first.')
-
-    Uw = wave_state.apply_fn(positions_frac, forces, current_box=current_box)
+    if current_box is not None:
+      # In traced loops (lax.scan/fori_loop), avoid rebuilding WaveSpaceState objects.
+      # We evaluate the exact live-box wave operator with pure JAX arrays instead.
+      Uw, _ = _wave_operators_exact(current_box, positions_frac, forces)
+      if not isinstance(current_box, jax_core.Tracer):
+        wave_state = _build_wave_state_for_box(current_box)
+    else:
+      if wave_state.apply_fn is None:
+        raise ValueError('wave-space operator missing from state; run init_fn first.')
+      Uw = wave_state.apply_fn(positions_frac, forces)
     velocities = Ur + Uw if real_space_first else Uw + Ur
 
     next_state = RpyState(
@@ -468,7 +633,22 @@ def build_rpy_matvec(space_fns,
         iters=mr_iters,
         return_info=True,
     )
-    wave_noise = wave_state.sqrt_fn(key_wave, positions_frac, current_box=current_box)
+    if current_box is not None:
+      _, wave_noise = _wave_operators_exact(
+          current_box,
+          positions_frac,
+          forces,
+          key_wave=key_wave,
+      )
+      if wave_noise is None:
+        raise ValueError('Exact wave-space sampler unexpectedly returned None.')
+    else:
+      if wave_state.sqrt_fn is None:
+        raise ValueError('wave-space sampler missing from state; run init_fn first.')
+      wave_noise = wave_state.sqrt_fn(
+          key_wave,
+          positions_frac,
+      )
     noise = jnp.sqrt(2.0 * kT * dt) * (real_noise + wave_noise)
 
     info = {
@@ -528,8 +708,8 @@ def brownian_increment(key: jax.Array,
                        mr_iters: int = 10) -> jnp.ndarray:
   """Draw the total Brownian increment dB for the provided state and box.
 
-  The wave-space sampler is tied to the base box stored in `state.wave`, so we
-  forward `state.real.box_matrix` as the current box when it is available.
+  The wave-space sampler is attached to `state.wave`, which must correspond to
+  the box encoded in `state.real`.
   """
   positions_frac = jnp.asarray(positions_frac)
   key_real, key_wave = jax.random.split(key)
@@ -544,15 +724,13 @@ def brownian_increment(key: jax.Array,
       return_info=True,
   )
 
-  current_box = getattr(state.real, 'box_matrix', None)
-
   if state.wave.sqrt_fn is None:
     raise ValueError('wave-space sampler missing; rebuild with include_brownian=True.')
   wave_sample_real = state.wave.sqrt_fn(
       key_wave,
       positions_frac,
-      current_box=current_box,
   )
 
   scale = jnp.sqrt(2.0 * kT * dt)
   return scale * (real_sample_real + wave_sample_real)
+

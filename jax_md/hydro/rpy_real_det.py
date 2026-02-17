@@ -28,9 +28,8 @@ The lattice indices generation serves two critical purposes:
    cutoff radius r_cut are included in the mobility calculation. Missing images
    would break translational invariance and introduce artificial boundaries.
 
-2. **Efficiency**: Limits the sum to a finite set of nearby images. The Ewald
-   splitting causes real-space contributions to decay exponentially beyond r_cut,
-   so distant images (|L| >> r_cut) contribute negligibly and can be omitted.
+2. **Efficiency**: Uses a finite lattice extent N to bound candidate images while
+   preserving strict real-space coverage within r_cut through pair-level masking.
 
 **Lattice Construction Algorithm**:
 - Generate a symmetric hypercube of integer shifts: L ∈ {-N, ..., N}^d where d
@@ -40,13 +39,11 @@ The lattice indices generation serves two critical purposes:
 - The zero lattice vector (L=0, primary cell) is explicitly tracked because
   self-interactions (i=j, L=0) require special treatment via the analytic
   self-mobility term.
-- A post-processing step trims lattice vectors that cannot contribute within
-  r_cut to reduce computational overhead, while always preserving L=0.
+- Pair-level masking inside the matvec keeps only |r_ij + L| < r_cut terms.
 
 **Example**: For a cubic box with side length 10 and r_cut=3, we generate lattice
-shifts in {-1, 0, 1}^3, yielding 27 images (including the primary cell). Images at
-corners (e.g., L=[1,1,1]) map to real-space distances ~17.3, well beyond r_cut,
-so they are pruned, leaving fewer active images for the mobility calculation.
+shifts in {-1, 0, 1}^3, yielding 27 images (including the primary cell). The
+matvec keeps only pair/image terms satisfying |r_ij + L| < r_cut.
 
 This approach balances accuracy (all interactions within r_cut are captured) with
 performance (distant images are excluded), making real-space mobility evaluation
@@ -70,6 +67,7 @@ from jax_md import dataclasses, partition, space
 from jax import ops
 from jax_md.hydro.rpy_real_det_helpers import (
     REAL_DTYPE,
+    PAIR_EPS_FRACTION_OF_DIAMETER,
     F1F2_closed_form,
     Mr_self,
     current_box_matrix,
@@ -145,18 +143,23 @@ def Mr_pair_block(r_vec, a, xi, eta):
     Mr : (3,3) array
         Real-space mobility block
     """
-    # Compute separation related quantities
+    # Compute separation related quantities.
     r2 = jnp.dot(r_vec, r_vec)
-    r = jnp.sqrt(r2 + 1e-300)
-    rhat = r_vec / r
+    pair_eps = jnp.asarray((2.0 * a) * PAIR_EPS_FRACTION_OF_DIAMETER, dtype=r_vec.dtype)
+    pair_eps2 = pair_eps * pair_eps
+    tiny_pair = r2 <= pair_eps2
+    safe_r = jnp.sqrt(jnp.maximum(r2, pair_eps2))
+    rhat = jnp.where(tiny_pair, jnp.zeros_like(r_vec), r_vec / safe_r)
     rhat_outer = jnp.outer(rhat, rhat)
     # Get mobility coefficients (Appx. A of Fiore et al.)
-    F1, F2 = F1F2_closed_form(r, a, xi)
+    F1, F2 = F1F2_closed_form(safe_r, a, xi)
     
     prefactor = 1.0 / (6.0 * jnp.pi * eta * a)
-    Mr = prefactor * (F1 * (I3 - rhat_outer) + F2 * rhat_outer)
-    
-    return Mr
+    anisotropic = prefactor * (F1 * (I3 - rhat_outer) + F2 * rhat_outer)
+    # Near exact overlap, use an isotropic contraction evaluated at r=0+eps.
+    F_iso = (2.0 * F1 + F2) / 3.0
+    isotropic = prefactor * F_iso * I3
+    return jnp.where(tiny_pair, isotropic, anisotropic)
 
 
 def _build_mr_core(
@@ -220,6 +223,7 @@ def _build_mr_core(
     """
 
     self_factor = Mr_self(a, xi)
+    pair_eps2_scalar = float(((2.0 * a) * PAIR_EPS_FRACTION_OF_DIAMETER) ** 2)
     prefactor_scalar = 1.0 / (6.0 * np.pi * eta * a)
     include_ordered_backflow = neighbor_format is partition.NeighborListFormat.OrderedSparse
     uses_sparse = partition.is_sparse(neighbor_format)
@@ -285,11 +289,14 @@ def _build_mr_core(
         dtype = x_real.dtype
         prefactor = jnp.asarray(prefactor_scalar, dtype=dtype)
         self_term = prefactor * jnp.asarray(self_factor, dtype=dtype)
+        pair_eps2 = jnp.asarray(pair_eps2_scalar, dtype=dtype)
 
         def _pair_contrib(rij, r2, mask, forces):
             """Fused mobility·force contraction for arbitrary neighbor shapes."""
-            eps = jnp.finfo(dtype).tiny
-            safe_r = jnp.where(mask, jnp.sqrt(r2 + eps), jnp.ones_like(r2, dtype=dtype))
+            safe_r = jnp.where(
+                mask,
+                jnp.sqrt(jnp.maximum(r2, pair_eps2)),
+                jnp.ones_like(r2, dtype=dtype))
             rhat = jnp.where(mask[..., None], rij / safe_r[..., None], 0.0)
 
             F1, F2 = F1F2_closed_form(safe_r, a, xi)
@@ -297,10 +304,14 @@ def _build_mr_core(
             F2 = jnp.where(mask, F2, 0.0)
 
             rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces)
-            return prefactor * (
+            anisotropic = prefactor * (
                 F1[..., None] * forces +
                 (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
             )
+            F_iso = (2.0 * F1 + F2) / 3.0
+            isotropic = prefactor * F_iso[..., None] * forces
+            tiny_pairs = mask & (r2 <= pair_eps2)
+            return jnp.where(tiny_pairs[..., None], isotropic, anisotropic)
 
         # Early exit when no neighbors or lattice images are present.
         if n_images == 0:
@@ -414,7 +425,8 @@ def build_Mr_apply(
     neighbor_format=partition.NeighborListFormat.Dense,
     extra_capacity=0,
     lattice_extent: Optional[int] = None,
-    lattice_extra: float = 1.0,
+    lattice_extra: float = 0.0,
+    box_jump_threshold: Optional[float] = None,
 ):
     """Construct the neighbor-list-backed real-space mobility operator.
 
@@ -445,7 +457,14 @@ def build_Mr_apply(
         shifts in [-N, N]^dim. If ``None`` (default) the extent is estimated from
         the instantaneous box via the smallest singular value and ``lattice_extra``.
     lattice_extra : float
-        Additional padding added to the automatically estimated lattice extent.
+        Non-negative padding added to the automatically estimated lattice extent.
+        Ignored when ``lattice_extent`` is explicitly provided.
+    box_jump_threshold : Optional[float]
+        Outside JIT, force neighbor-list reallocation when the Frobenius norm
+        of the box-matrix change exceeds this threshold. If None, defaults to
+        ``dr_threshold``.
+        In traced/JIT dynamic-box contexts with implicit ``lattice_extent``, strict
+        Fiore mode raises an error instead of silently under-covering image sums.
 
     Returns
     -------
@@ -459,11 +478,19 @@ def build_Mr_apply(
 
     if rcut <= 0.0:
         raise ValueError("rcut must be positive.")
+    if lattice_extra < 0.0:
+        raise ValueError("lattice_extra must be non-negative.")
+    if lattice_extent is not None and int(lattice_extent) < 0:
+        raise ValueError("lattice_extent must be non-negative when provided.")
 
     # Set reasonable default for dr_threshold if not provided
     # Use 10% of rcut as a safe update threshold
     if dr_threshold is None:
         dr_threshold = 0.1 * rcut
+    if box_jump_threshold is None:
+        box_jump_threshold = float(dr_threshold)
+    if box_jump_threshold < 0.0:
+        raise ValueError("box_jump_threshold must be non-negative.")
 
     if len(space_fns) < 2:
         raise ValueError("space_fns must contain at least displacement and shift functions.")
@@ -498,9 +525,8 @@ def build_Mr_apply(
         
             M^r_ij = ∑_L M^r(r_ij + L·Box)
         
-        The lattice extent is chosen to ensure all images within the real-space cutoff
-        r_cut are included, while excluding distant images that contribute negligibly
-        due to exponential decay from Ewald splitting.
+        The lattice extent is chosen to ensure all images needed for strict
+        real-space coverage within r_cut are present.
         
         Algorithm
         ---------
@@ -511,13 +537,8 @@ def build_Mr_apply(
         2. **Hypercube Generation**: Create a symmetric grid of integer shifts in
            {-N, ..., N}^d, yielding (2N+1)^d candidate lattice vectors.
            
-        3. **Pruning**: Map lattice shifts to real space (L·Box^T) and discard those
-           with |L| > r_cut, as they cannot contribute to any particle pair within r_cut.
-           This reduces the active lattice from ~O(N^3) to ~O(N^2) images for typical boxes.
-           
-        4. **Zero Image Preservation**: Ensure the primary cell (L=0) is always included,
-           even if pruning would remove it (degenerate edge case). Track its index for
-           self-interaction masking in the mobility kernel.
+        3. **Zero Image Preservation**: Ensure the primary cell (L=0) is included and
+           track its index for self-interaction masking in the mobility kernel.
         
         Parameters
         ----------
@@ -527,7 +548,7 @@ def build_Mr_apply(
         Returns
         -------
         lattice : (n_images, d) array of int32
-            Integer lattice vectors to sum over, with |L·Box| ≲ r_cut.
+            Integer lattice vectors to sum over.
         zero_idx : int
             Index of the zero lattice vector (L=0, primary cell) in the returned array.
             
@@ -535,8 +556,6 @@ def build_Mr_apply(
         -----
         - For non-cubic or shearing boxes, the SVD-based extent estimate adapts to the
           box geometry, ensuring sufficient coverage without excessive oversampling.
-        - The r_cut pruning threshold ensures any image L with |L·Box| ≥ r_cut cannot
-          contribute to interactions, as even the closest pair (r_ij ≈ 0) would exceed cutoff.
         - Degenerate boxes (σ_min → 0) are protected by the safe_sigma clamp to 1e-12.
         """
         box_np = np.asarray(box_matrix, dtype=np.float64)
@@ -546,44 +565,14 @@ def build_Mr_apply(
             svals = np.linalg.svd(box_np, compute_uv=False)
             sigma_min = float(np.min(svals))
             safe_sigma = max(sigma_min, 1e-12)
-
-            # Ratio of cutoff to smallest box scale determines required lattice extent.
-            ratio = float(rcut) / safe_sigma
-
-            # Base extent from geometric ratio: N ≥ ceil(r_cut / σ_min).
-            base_extent = int(np.ceil(ratio)) if ratio > 0.0 else 0
-
-            # For r_cut << box size (ratio < 1), a single shell of images suffices.
-            # This avoids over-allocating lattice vectors for large boxes.
-            if ratio < 1.0:
-                extent_val = min(base_extent, 1)
-            else:
-                extent_val = base_extent
+            base_extent = int(np.ceil(float(rcut) / safe_sigma))
+            extent_padding = int(np.ceil(float(lattice_extra)))
+            extent_val = max(base_extent + extent_padding, 0)
         else:
             extent_val = int(lattice_extent)
 
         # Generate symmetric hypercube: L ∈ {-N, ..., N}^d.
         lattice_np, zero_idx = generate_lattice_hypercube(dim, extent_val)
-        
-        # Prune lattice images beyond r_cut in real space.
-        # Any image with |A·L| ≥ r_cut cannot contribute to any pair interaction.
-        lattice_real = lattice_np @ box_np.T
-        lattice_norm2 = np.sum(lattice_real * lattice_real, axis=1)
-        lattice_mask = lattice_norm2 < (rcut * rcut)  # |L| < r_cut
-        
-        # Ensure at least one image survives (edge case: very small cutoffs).
-        if not np.any(lattice_mask):
-            lattice_mask = np.ones_like(lattice_norm2, dtype=bool)
-        lattice_np = lattice_np[lattice_mask]
-        
-        # Verify primary cell (L=0) is present after pruning.
-        zero_candidates = np.where(np.all(lattice_np == 0, axis=1))[0]
-        if len(zero_candidates) == 0:
-            # Re-insert zero lattice if missing (should not occur in practice).
-            lattice_np = np.concatenate([lattice_np, np.zeros((1, dim), dtype=np.int32)], axis=0)
-            zero_idx = lattice_np.shape[0] - 1
-        else:
-            zero_idx = int(zero_candidates[0])
 
         lattice = jnp.asarray(lattice_np, dtype=jnp.int32)
         return lattice, zero_idx
@@ -633,12 +622,34 @@ def build_Mr_apply(
             if box_matrix is None:
                 raise ValueError("box_matrix must be a scalar, vector, or matrix.")
 
+        # Outside `jit`, we optionally rebuild neighbor/lattice bookkeeping when the
+        # box changes abruptly (e.g. due to a host-side resize).
+        #
+        # Inside `jit`, we must *not* attempt any NumPy conversion or data-dependent
+        # Python branching. When the box is *dynamic* (i.e. `box_matrix` itself is a
+        # Tracer), we cannot safely recompute lattice indices with a data-dependent
+        # extent because that would change array shapes; require an explicit
+        # `lattice_extent` (or an explicit `lattice_indices` override) in that case.
+        if lattice_extent is None and lattice_override is None and isinstance(box_matrix, jax.core.Tracer):
+            raise ValueError(
+                "Dynamic/traced box requires explicit lattice_extent (or lattice_indices) "
+                "so the lattice-image set has static shape under jit."
+            )
+        force_rebuild_py = False
+        if not (isinstance(box_matrix, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
+            delta_box = np.asarray(box_matrix - state.box_matrix, dtype=np.float64)
+            box_jump = float(np.linalg.norm(delta_box))
+            force_rebuild_py = box_jump > float(box_jump_threshold)
+
         if lattice_override is not None:
             lattice_indices = jnp.asarray(lattice_override, dtype=jnp.int32)
             zero_idx = int(zero_override) if zero_override is not None else state.zero_image_index
         else:
-            lattice_indices = state.lattice_indices
-            zero_idx = state.zero_image_index
+            if force_rebuild_py and lattice_extent is None:
+                lattice_indices, zero_idx = _compute_lattice_indices(box_matrix)
+            else:
+                lattice_indices = state.lattice_indices
+                zero_idx = state.zero_image_index
 
         neighbor_kwargs = dict(kwargs)
         neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
@@ -649,27 +660,30 @@ def build_Mr_apply(
         if neighbor_override is None:
             if state.neighbors is None:
                 raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
-            # Use the built-in NeighborList.update() method
-            updated = state.neighbors.update(positions, **neighbor_kwargs)
-
-            # Check for errors using NeighborList properties
-            try:
-                overflow_py = bool(np.asarray(updated.did_buffer_overflow))
-                cell_small_py = bool(np.asarray(updated.cell_size_too_small))
-                malformed_py = bool(np.asarray(updated.malformed_box))
-            except (TypeError, jax_errors.TracerArrayConversionError, jax_errors.TracerBoolConversionError):
-                # In JIT context, can't reallocate; just use updated neighbor list
-                # The error flags will be set in the returned state for inspection
-                # DEBUG CALLBACK DISABLED FOR GPU COMPATIBILITY
-                # The callback causes GPU-to-CPU transfer issues
-                # Instead, we rely on silent overflow handling
-                neighbors = updated
+            if force_rebuild_py:
+                neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
             else:
-                # Outside JIT: reallocate if any error occurred
-                if overflow_py or cell_small_py or malformed_py:
-                    neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
-                else:
+                # Use the built-in NeighborList.update() method
+                updated = state.neighbors.update(positions, **neighbor_kwargs)
+
+                # Check for errors using NeighborList properties
+                try:
+                    overflow_py = bool(np.asarray(updated.did_buffer_overflow))
+                    cell_small_py = bool(np.asarray(updated.cell_size_too_small))
+                    malformed_py = bool(np.asarray(updated.malformed_box))
+                except (TypeError, jax_errors.TracerArrayConversionError, jax_errors.TracerBoolConversionError):
+                    # In JIT context, can't reallocate; just use updated neighbor list
+                    # The error flags will be set in the returned state for inspection
+                    # DEBUG CALLBACK DISABLED FOR GPU COMPATIBILITY
+                    # The callback causes GPU-to-CPU transfer issues
+                    # Instead, we rely on silent overflow handling
                     neighbors = updated
+                else:
+                    # Outside JIT: reallocate if any error occurred
+                    if overflow_py or cell_small_py or malformed_py:
+                        neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
+                    else:
+                        neighbors = updated
         else:
             neighbors = neighbor_override
 
