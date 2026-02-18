@@ -1,58 +1,18 @@
-"""Real-space RPY mobility (M^r) with closed-form kernels
+"""Real-space RPY mobility (M^r) with closed-form kernels.
 
-Real-space mobility M^(r) uses closed-form F1,F2 coefficients for
-monodisperse spheres of radius a, with Ewald splitting parameter ξ.
+Computes pair mobility blocks using F1, F2 coefficients for monodisperse
+spheres of radius a with Ewald splitting parameter ξ:
 
-For a pair at separation r:
-  M^r_ij = (1/(6πηa)) * [F1(r; a, ξ) * (I - r̂⊗r̂) + F2(r; a, ξ) * r̂⊗r̂]
+    M^r_ij = (1/(6πηa)) [F1(I - r̂⊗r̂) + F2 r̂⊗r̂]
+    M^r_ii = (1/(6πηa)) f_self(a, ξ)
 
-Self term (r=0):
-  M^r_ii = (1/(6πηa)) * f_self(a, ξ)
-  
-where f_self(a, ξ) = [1/(4√π ξ a)] * [1 - exp(-4a²ξ²) + 4√π a ξ erfc(2aξ)]
-is the eta-independent self-mobility factor computed by Mr_self(a, ξ).
+Periodic images are summed over a lattice hypercube L ∈ {-N,…,N}^d with
+N ≥ ⌈r_cut / σ_min(Box)⌉, and pair-level masking enforces |r_ij + L| < r_cut.
 
-Lattice Image Summation
------------------------
-In periodic boundary conditions, hydrodynamic interactions extend across periodic
-images of the simulation cell. To correctly evaluate the real-space mobility, we
-must sum contributions from particles and their periodic images:
-
-  M^r_ij = ∑_L M^r(r_ij + L)
-
-where L iterates over lattice vectors representing periodic cell translations.
-
-The lattice indices generation serves two critical purposes:
-
-1. **Completeness**: Ensures all relevant periodic images within the real-space
-   cutoff radius r_cut are included in the mobility calculation. Missing images
-   would break translational invariance and introduce artificial boundaries.
-
-2. **Efficiency**: Uses a finite lattice extent N to bound candidate images while
-   preserving strict real-space coverage within r_cut through pair-level masking.
-
-**Lattice Construction Algorithm**:
-- Generate a symmetric hypercube of integer shifts: L ∈ {-N, ..., N}^d where d
-  is the spatial dimension (typically 3).
-- N (lattice extent) is chosen such that the smallest box dimension spans at
-  least r_cut when mapped to real space: N ≥ ceil(r_cut / σ_min(Box)).
-- The zero lattice vector (L=0, primary cell) is explicitly tracked because
-  self-interactions (i=j, L=0) require special treatment via the analytic
-  self-mobility term.
-- Pair-level masking inside the matvec keeps only |r_ij + L| < r_cut terms.
-
-**Example**: For a cubic box with side length 10 and r_cut=3, we generate lattice
-shifts in {-1, 0, 1}^3, yielding 27 images (including the primary cell). The
-matvec keeps only pair/image terms satisfying |r_ij + L| < r_cut.
-
-This approach balances accuracy (all interactions within r_cut are captured) with
-performance (distant images are excluded), making real-space mobility evaluation
-tractable for typical simulation box sizes.
-  
 References
 ----------
-[1] Fiore, Andrew M., Florencio Balboa Usabiaga, Aleksandar Donev, and James W. Swan. "Rapid Sampling of Stochastic Displacements in Brownian Dynamics Simulations." The Journal of Chemical Physics 146, no. 12 (2017): 124116. https://doi.org/10.1063/1.4978242.
-[2] Fiore, Andrew M. "Fast Simulation Methods for Soft Matter Hydrodynamics." PhD Thesis, Massachusetts Institute of Technology, 2019.
+[1] Fiore et al., J. Chem. Phys. 146, 124116 (2017).
+[2] Fiore, PhD Thesis, MIT (2019).
 """
 
 import jax
@@ -61,7 +21,7 @@ import numpy as np
 from jax import errors as jax_errors
 from functools import partial
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Literal, Optional, Tuple
 
 from jax_md import dataclasses, partition, space
 from jax import ops
@@ -77,6 +37,19 @@ from jax_md.hydro.rpy_real_det_helpers import (
 
 
 I3 = jnp.eye(3, dtype=REAL_DTYPE) # 3x3 identity matrix
+
+
+RealSpaceMode = Literal['auto', 'min_image', 'lattice']
+_REAL_SPACE_MODES = frozenset({'auto', 'min_image', 'lattice'})
+
+
+def _validate_real_space_mode(mode: str) -> RealSpaceMode:
+    mode_str = str(mode)
+    if mode_str not in _REAL_SPACE_MODES:
+        raise ValueError(
+            f"real_space_mode must be one of {_REAL_SPACE_MODES}; got {mode_str!r}."
+        )
+    return mode_str  # type: ignore[return-value]
 
 
 @dataclasses.dataclass
@@ -162,7 +135,38 @@ def Mr_pair_block(r_vec, a, xi, eta):
     return jnp.where(tiny_pair, isotropic, anisotropic)
 
 
-def _build_mr_core(
+def _build_pair_contrib_fn(a: float, xi: float, eta: float):
+    """Build shared pairwise mobility-force contraction helpers."""
+    self_factor = Mr_self(a, xi)
+    pair_eps2_scalar = float(((2.0 * a) * PAIR_EPS_FRACTION_OF_DIAMETER) ** 2)
+    prefactor_scalar = 1.0 / (6.0 * np.pi * eta * a)
+
+    def pair_contrib(rij, r2, mask, forces, *, prefactor, pair_eps2):
+        """Fused mobility·force contraction for arbitrary neighbor shapes."""
+        safe_r = jnp.where(
+            mask,
+            jnp.sqrt(jnp.maximum(r2, pair_eps2)),
+            jnp.ones_like(r2, dtype=rij.dtype))
+        rhat = jnp.where(mask[..., None], rij / safe_r[..., None], 0.0)
+
+        F1, F2 = F1F2_closed_form(safe_r, a, xi)
+        F1 = jnp.where(mask, F1, 0.0)
+        F2 = jnp.where(mask, F2, 0.0)
+
+        rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces)
+        anisotropic = prefactor * (
+            F1[..., None] * forces +
+            (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
+        )
+        F_iso = (2.0 * F1 + F2) / 3.0
+        isotropic = prefactor * F_iso[..., None] * forces
+        tiny_pairs = mask & (r2 <= pair_eps2)
+        return jnp.where(tiny_pairs[..., None], isotropic, anisotropic)
+
+    return self_factor, pair_eps2_scalar, prefactor_scalar, pair_contrib
+
+
+def _build_mr_core_lattice(
     a: float,
     xi: float,
     eta: float,
@@ -170,61 +174,8 @@ def _build_mr_core(
     neighbor_format: partition.NeighborListFormat,
     fractional_coordinates: bool,
 ) -> Callable[..., jnp.ndarray]:
-    """
-    Create the JIT-ed core that evaluates the real-space mobility.
-    
-    This factory function builds a specialized JIT-compiled kernel for computing
-    real-space mobility matrix-vector products M^r @ f, where M^r is the real-space
-    component of the Ewald-split mobility operator. The returned function supports
-    both dense and sparse neighbor list formats and applies memory-efficient fused
-    contractions to avoid materializing the full mobility tensor.
-    
-    The mobility kernel computes:
-        v_i = M^r_ii·f_i + Σ_{j≠i} Σ_{images} M^r_ij·f_j
-    
-    where M^r_ij are 3×3 mobility blocks constructed from the closed-form F1, F2
-    coefficients (see F1F2_closed_form in rpy_real_det_helpers).
-    
-    Parameters
-    ----------
-    a : float
-        Sphere radius (in real units). Determines hydrodynamic size and self-mobility.
-    xi : float
-        Ewald splitting parameter (inverse length units). Controls the real/wave space
-        decomposition; larger xi means faster real-space decay but more wave modes needed.
-    eta : float
-        Fluid dynamic viscosity. Sets the overall mobility scale (1/(6πηa)).
-    rcut2 : float
-        Squared real-space cutoff radius. Pairs with r² > rcut2 are excluded from
-        the real-space sum (their contribution is handled in wave space).
-    neighbor_format : partition.NeighborListFormat
-        Neighbor list storage format. Dense format is fastest but uses more memory;
-        Sparse or OrderedSparse reduce memory at the cost of scatter-gather overhead.
-        OrderedSparse additionally includes symmetric backflow contributions (M_ji·f_i).
-    
-    Returns
-    -------
-    Callable[..., jnp.ndarray]
-        A JIT-compiled function with signature:
-            core(positions, forces, neighbor_idx, neighbor_mask,
-                 box_matrix, lattice_indices, zero_image_index) -> velocities
-        
-        The returned callable evaluates M^r @ forces using the neighbor list and
-        lattice image sums, applying cutoff and self-term corrections.
-    
-    Notes
-    -----
-    - The core uses fused mobility-force contractions to avoid materializing the
-      full (N, neighbors, images, 3, 3) mobility tensor, saving ~60% memory.
-    - For OrderedSparse format, symmetric backflow M_ji·f_i is included to ensure
-      the mobility operator remains symmetric when used in iterative solvers.
-    - Self-interactions (i=j, primary cell) are replaced by the analytic self-mobility
-      computed via Mr_self(a, xi).
-    """
-
-    self_factor = Mr_self(a, xi)
-    pair_eps2_scalar = float(((2.0 * a) * PAIR_EPS_FRACTION_OF_DIAMETER) ** 2)
-    prefactor_scalar = 1.0 / (6.0 * np.pi * eta * a)
+    """Build the original lattice-image real-space kernel."""
+    self_factor, pair_eps2_scalar, prefactor_scalar, pair_contrib = _build_pair_contrib_fn(a, xi, eta)
     include_ordered_backflow = neighbor_format is partition.NeighborListFormat.OrderedSparse
     uses_sparse = partition.is_sparse(neighbor_format)
 
@@ -238,38 +189,6 @@ def _build_mr_core(
         lattice_indices: jnp.ndarray,
         zero_image_index: int,
     ) -> jnp.ndarray:
-        """
-        Core real-space mobility evaluation with support for dense and sparse neighbor lists.
-        
-        Computes velocities from forces using the real-space mobility operator:
-          v = M^r @ f
-        
-        Handles both Dense and Sparse/OrderedSparse neighbor list formats, with
-        optimized tensor contractions to minimize memory usage.
-        
-        Parameters
-        ----------
-        positions : (N, 3) array
-            Particle positions (fractional if ``fractional_coordinates=True``)
-        forces : (N, 3) array
-            Forces in REAL units
-        neighbor_idx : array
-            Neighbor list indices (format depends on neighbor_format)
-        neighbor_mask : array
-            Boolean mask for valid neighbors
-        box_matrix : (3, 3) array
-            Box transformation matrix
-        lattice_indices : (n_images, 3) array
-            Integer lattice vectors
-        zero_image_index : int
-            Index of the zero lattice vector (primary cell)
-            
-        Returns
-        -------
-        (N, 3) array
-            Velocities from real-space mobility evaluation
-        """
-        # Ensure inputs are JAX arrays with correct dtypes
         positions = jnp.asarray(positions)
         forces = jnp.asarray(forces)
         neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
@@ -278,10 +197,7 @@ def _build_mr_core(
         lattice_indices = jnp.asarray(lattice_indices, dtype=jnp.int32)
         zero_image_index = jnp.int32(zero_image_index)
 
-        # Convert to real coordinates if needed
         x_real = _positions_to_real(positions, box_matrix, fractional_coordinates)
-        
-        # Precompute lattice vectors in real space
         lattice_vecs = lattice_indices @ box_matrix.T
         N = x_real.shape[0]
         n_images = lattice_vecs.shape[0]
@@ -291,29 +207,6 @@ def _build_mr_core(
         self_term = prefactor * jnp.asarray(self_factor, dtype=dtype)
         pair_eps2 = jnp.asarray(pair_eps2_scalar, dtype=dtype)
 
-        def _pair_contrib(rij, r2, mask, forces):
-            """Fused mobility·force contraction for arbitrary neighbor shapes."""
-            safe_r = jnp.where(
-                mask,
-                jnp.sqrt(jnp.maximum(r2, pair_eps2)),
-                jnp.ones_like(r2, dtype=dtype))
-            rhat = jnp.where(mask[..., None], rij / safe_r[..., None], 0.0)
-
-            F1, F2 = F1F2_closed_form(safe_r, a, xi)
-            F1 = jnp.where(mask, F1, 0.0)
-            F2 = jnp.where(mask, F2, 0.0)
-
-            rhat_dot_f = jnp.einsum("...i,...i->...", rhat, forces)
-            anisotropic = prefactor * (
-                F1[..., None] * forces +
-                (F2 - F1)[..., None] * rhat_dot_f[..., None] * rhat
-            )
-            F_iso = (2.0 * F1 + F2) / 3.0
-            isotropic = prefactor * F_iso[..., None] * forces
-            tiny_pairs = mask & (r2 <= pair_eps2)
-            return jnp.where(tiny_pairs[..., None], isotropic, anisotropic)
-
-        # Early exit when no neighbors or lattice images are present.
         if n_images == 0:
             return self_term * forces
 
@@ -327,9 +220,7 @@ def _build_mr_core(
             if max_neighbors == 0:
                 return self_term * forces
 
-            # Always use vectorized path
             neighbor_idx_masked = jnp.where(neighbor_mask, neighbor_idx, 0)
-
             xi_vec = x_real[:, None, None, :]
             xj = x_real[neighbor_idx_masked][:, :, None, :]
             lattice = lattice_vecs[None, None, :, :]
@@ -342,7 +233,6 @@ def _build_mr_core(
             is_self = neighbor_idx_masked == idx_i[:, None]
             zero_mask = (jnp.arange(n_images, dtype=jnp.int32) == zero_image_index)
             primary_self = is_self[:, :, None] & zero_mask[None, None, :]
-
             valid_pairs = neighbor_mask[:, :, None] & (~primary_self) & within_rcut
             valid_any = jnp.any(valid_pairs)
 
@@ -351,15 +241,13 @@ def _build_mr_core(
 
             def _with_pairs(_):
                 forces_neighbors = forces[neighbor_idx_masked][:, :, None, :]
-                contrib = _pair_contrib(rij, r2, valid_pairs, forces_neighbors)
-                contrib = contrib.sum(axis=2)
-                contrib = contrib.sum(axis=1)
-
+                contrib = pair_contrib(
+                    rij, r2, valid_pairs, forces_neighbors,
+                    prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=2).sum(axis=1)
                 return self_term * forces + contrib
 
             return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
 
-        # Sparse or ordered-sparse neighbor lists.
         if neighbor_idx.ndim == 1:
             neighbor_idx = neighbor_idx[None, :]
         if neighbor_mask.ndim == 0:
@@ -368,45 +256,197 @@ def _build_mr_core(
         if capacity == 0:
             return self_term * forces
 
-        # Unroll neighbor indices and masks
         receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
         senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
 
-        # Compute separations for all lattice images
-        xi_vec = x_real[receivers][:, None, :]
-        xj = x_real[senders][:, None, :]
-        lattice = lattice_vecs[None, :, :]
-        rij = xj - xi_vec + lattice
-
-        r2 = jnp.sum(rij * rij, axis=-1)
-        within_rcut = r2 < rcut2
-
         zero_mask = (jnp.arange(n_images, dtype=jnp.int32) == zero_image_index)[None, :]
-        is_self_edge = (receivers == senders)[:, None]
-        primary_self = is_self_edge & zero_mask
+        lattice = lattice_vecs[None, :, :]
+        velocities_init = self_term * forces
 
-        mask_pairs = neighbor_mask[:, None] & (~primary_self) & within_rcut
-        valid_any = jnp.any(mask_pairs)
+        def _accumulate_sparse_batch(
+            velocities: jnp.ndarray,
+            receivers_batch: jnp.ndarray,
+            senders_batch: jnp.ndarray,
+            edge_mask_batch: jnp.ndarray,
+        ) -> jnp.ndarray:
+            xi_vec = x_real[receivers_batch][:, None, :]
+            xj = x_real[senders_batch][:, None, :]
+            rij = xj - xi_vec + lattice
 
-        def _no_pairs(_):
+            r2 = jnp.sum(rij * rij, axis=-1)
+            within_rcut = r2 < rcut2
+            is_self_edge = (receivers_batch == senders_batch)[:, None]
+            primary_self = is_self_edge & zero_mask
+            mask_pairs = edge_mask_batch[:, None] & (~primary_self) & within_rcut
+
+            forces_senders = forces[senders_batch][:, None, :]
+            contrib_i = pair_contrib(
+                rij, r2, mask_pairs, forces_senders,
+                prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=1)
+            velocities = velocities + ops.segment_sum(contrib_i, receivers_batch, N)
+
+            if include_ordered_backflow:
+                forces_receivers = forces[receivers_batch][:, None, :]
+                contrib_j = pair_contrib(
+                    rij, r2, mask_pairs, forces_receivers,
+                    prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=1)
+                velocities = velocities + ops.segment_sum(contrib_j, senders_batch, N)
+            return velocities
+
+        pair_image_work = capacity * n_images
+        pair_image_limit = 32_000_000
+
+        if pair_image_work <= pair_image_limit:
+            return _accumulate_sparse_batch(velocities_init, receivers, senders, neighbor_mask)
+
+        chunk_size = max(1, pair_image_limit // max(n_images, 1))
+        n_chunks = (capacity + chunk_size - 1) // chunk_size
+        padded_capacity = n_chunks * chunk_size
+        pad = padded_capacity - capacity
+
+        receivers_padded = jnp.pad(receivers, (0, pad))
+        senders_padded = jnp.pad(senders, (0, pad))
+        mask_padded = jnp.pad(neighbor_mask, (0, pad), constant_values=False)
+
+        receivers_chunks = receivers_padded.reshape((n_chunks, chunk_size))
+        senders_chunks = senders_padded.reshape((n_chunks, chunk_size))
+        mask_chunks = mask_padded.reshape((n_chunks, chunk_size))
+
+        def _scan_body(velocities, chunk):
+            receivers_chunk, senders_chunk, mask_chunk = chunk
+            velocities = _accumulate_sparse_batch(
+                velocities, receivers_chunk, senders_chunk, mask_chunk
+            )
+            return velocities, None
+
+        velocities, _ = jax.lax.scan(
+            _scan_body,
+            velocities_init,
+            (receivers_chunks, senders_chunks, mask_chunks),
+        )
+        return velocities
+
+    return core
+
+
+def _build_mr_core_min_image(
+    a: float,
+    xi: float,
+    eta: float,
+    rcut2: float,
+    neighbor_format: partition.NeighborListFormat,
+    fractional_coordinates: bool,
+) -> Callable[..., jnp.ndarray]:
+    """Build a minimum-image real-space kernel (single image per pair)."""
+    self_factor, pair_eps2_scalar, prefactor_scalar, pair_contrib = _build_pair_contrib_fn(a, xi, eta)
+    include_ordered_backflow = neighbor_format is partition.NeighborListFormat.OrderedSparse
+    uses_sparse = partition.is_sparse(neighbor_format)
+
+    @jax.jit
+    def core(
+        positions: jnp.ndarray,
+        forces: jnp.ndarray,
+        neighbor_idx: jnp.ndarray,
+        neighbor_mask: jnp.ndarray,
+        box_matrix: jnp.ndarray,
+        lattice_indices: jnp.ndarray,
+        zero_image_index: int,
+    ) -> jnp.ndarray:
+        del lattice_indices, zero_image_index
+        positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+        forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+        neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
+        neighbor_mask = jnp.asarray(neighbor_mask, dtype=bool)
+        box_matrix = jnp.asarray(box_matrix, dtype=REAL_DTYPE)
+        dtype = forces.dtype
+
+        prefactor = jnp.asarray(prefactor_scalar, dtype=dtype)
+        self_term = prefactor * jnp.asarray(self_factor, dtype=dtype)
+        pair_eps2 = jnp.asarray(pair_eps2_scalar, dtype=dtype)
+
+        if fractional_coordinates:
+            positions_frac = positions
+        else:
+            inv_box = jnp.linalg.inv(box_matrix)
+            positions_frac = space.transform(inv_box, positions)
+
+        def _wrapped_frac_delta(delta_frac):
+            return jnp.mod(delta_frac + 0.5, 1.0) - 0.5
+
+        def _to_real(delta_frac):
+            return space.transform(box_matrix, delta_frac)
+
+        N = positions_frac.shape[0]
+
+        if not uses_sparse:
+            if neighbor_idx.ndim == 1:
+                neighbor_idx = neighbor_idx[:, None]
+            if neighbor_mask.ndim == 1:
+                neighbor_mask = neighbor_mask[:, None]
+
+            max_neighbors = neighbor_idx.shape[1]
+            if max_neighbors == 0:
+                return self_term * forces
+
+            neighbor_idx_masked = jnp.where(neighbor_mask, neighbor_idx, 0)
+            xi_frac = positions_frac[:, None, :]
+            xj_frac = positions_frac[neighbor_idx_masked]
+            delta_frac = _wrapped_frac_delta(xj_frac - xi_frac)
+            rij = _to_real(delta_frac)
+
+            r2 = jnp.sum(rij * rij, axis=-1)
+            within_rcut = r2 < rcut2
+
+            idx_i = jnp.arange(N, dtype=neighbor_idx.dtype)
+            is_self = neighbor_idx_masked == idx_i[:, None]
+            valid_pairs = neighbor_mask & (~is_self) & within_rcut
+            valid_any = jnp.any(valid_pairs)
+
+            def _no_pairs(_):
+                return self_term * forces
+
+            def _with_pairs(_):
+                forces_neighbors = forces[neighbor_idx_masked]
+                contrib = pair_contrib(
+                    rij, r2, valid_pairs, forces_neighbors,
+                    prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=1)
+                return self_term * forces + contrib
+
+            return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
+
+        if neighbor_idx.ndim == 1:
+            neighbor_idx = neighbor_idx[None, :]
+        if neighbor_mask.ndim == 0:
+            neighbor_mask = jnp.broadcast_to(neighbor_mask, neighbor_idx.shape[1])
+        capacity = neighbor_idx.shape[1]
+        if capacity == 0:
             return self_term * forces
 
-        def _with_pairs(_):
-            forces_senders = forces[senders][:, None, :]
-            contrib_i = _pair_contrib(rij, r2, mask_pairs, forces_senders).sum(axis=1)
+        receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
+        senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
 
-            velocities = self_term * forces
-            velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
+        delta_frac = _wrapped_frac_delta(positions_frac[senders] - positions_frac[receivers])
+        rij = _to_real(delta_frac)
+        r2 = jnp.sum(rij * rij, axis=-1)
+        within_rcut = r2 < rcut2
+        is_self_edge = receivers == senders
+        mask_pairs = neighbor_mask & (~is_self_edge) & within_rcut
 
-            if include_ordered_backflow: # For OrderedSparse format
-                # Compute backflow contributions M_ji·f_i
-                forces_receivers = forces[receivers][:, None, :]
-                contrib_j = _pair_contrib(rij, r2, mask_pairs, forces_receivers).sum(axis=1)
-                velocities = velocities + ops.segment_sum(contrib_j, senders, N)
+        velocities = self_term * forces
+        forces_senders = forces[senders]
+        contrib_i = pair_contrib(
+            rij, r2, mask_pairs, forces_senders,
+            prefactor=prefactor, pair_eps2=pair_eps2)
+        velocities = velocities + ops.segment_sum(contrib_i, receivers, N)
 
-            return velocities # = M^r @ forces
+        if include_ordered_backflow:
+            forces_receivers = forces[receivers]
+            contrib_j = pair_contrib(
+                rij, r2, mask_pairs, forces_receivers,
+                prefactor=prefactor, pair_eps2=pair_eps2)
+            velocities = velocities + ops.segment_sum(contrib_j, senders, N)
 
-        return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
+        return velocities
 
     return core
 
@@ -427,6 +467,7 @@ def build_Mr_apply(
     lattice_extent: Optional[int] = None,
     lattice_extra: float = 0.0,
     box_jump_threshold: Optional[float] = None,
+    real_space_mode: RealSpaceMode = 'auto',
 ):
     """Construct the neighbor-list-backed real-space mobility operator.
 
@@ -465,6 +506,11 @@ def build_Mr_apply(
         ``dr_threshold``.
         In traced/JIT dynamic-box contexts with implicit ``lattice_extent``, strict
         Fiore mode raises an error instead of silently under-covering image sums.
+    real_space_mode : {'auto', 'min_image', 'lattice'}
+        Real-space evaluation kernel. ``lattice`` always uses the periodic-image
+        lattice sum, ``min_image`` always uses a minimum-image-only kernel (valid
+        only when ``rcut <= 0.5 * sigma_min(box)``), and ``auto`` selects the
+        minimum-image kernel when this safety condition holds.
 
     Returns
     -------
@@ -491,6 +537,7 @@ def build_Mr_apply(
         box_jump_threshold = float(dr_threshold)
     if box_jump_threshold < 0.0:
         raise ValueError("box_jump_threshold must be non-negative.")
+    mode = _validate_real_space_mode(real_space_mode)
 
     if len(space_fns) < 2:
         raise ValueError("space_fns must contain at least displacement and shift functions.")
@@ -514,7 +561,10 @@ def build_Mr_apply(
     )
 
     rcut2 = float(rcut * rcut)
-    core_fn = _build_mr_core(a, xi, eta, rcut2, neighbor_format, fractional_coordinates)
+    core_lattice = _build_mr_core_lattice(
+        a, xi, eta, rcut2, neighbor_format, fractional_coordinates)
+    core_min_image = _build_mr_core_min_image(
+        a, xi, eta, rcut2, neighbor_format, fractional_coordinates)
 
     def _compute_lattice_indices(box_matrix: jnp.ndarray) -> Tuple[jnp.ndarray, int]:
         """
@@ -577,11 +627,47 @@ def build_Mr_apply(
         lattice = jnp.asarray(lattice_np, dtype=jnp.int32)
         return lattice, zero_idx
 
+    def _sigma_min(box_matrix: jnp.ndarray) -> float:
+        box_np = np.asarray(box_matrix, dtype=np.float64)
+        svals = np.linalg.svd(box_np, compute_uv=False)
+        return max(float(np.min(svals)), 1e-12)
+
+    def _is_min_image_safe(box_matrix: jnp.ndarray) -> bool:
+        return float(rcut) <= 0.5 * _sigma_min(box_matrix)
+
+    def _select_core(box_matrix: jnp.ndarray) -> Tuple[Callable, str]:
+        is_tracer = isinstance(box_matrix, jax.core.Tracer)
+
+        if mode == 'lattice':
+            return core_lattice, 'lattice'
+
+        if mode == 'min_image':
+            if is_tracer:
+                raise ValueError(
+                    "real_space_mode='min_image' with traced/dynamic box is unsupported "
+                    "because safety cannot be verified at trace time."
+                )
+            if not _is_min_image_safe(box_matrix):
+                sigma_min = _sigma_min(box_matrix)
+                raise ValueError(
+                    "real_space_mode='min_image' requires rcut <= 0.5 * sigma_min(box). "
+                    f"Got rcut={float(rcut):.6g}, 0.5*sigma_min={0.5 * sigma_min:.6g}."
+                )
+            return core_min_image, 'min_image'
+
+        # mode == 'auto'
+        if is_tracer:
+            return core_lattice, 'lattice'
+        if _is_min_image_safe(box_matrix):
+            return core_min_image, 'min_image'
+        return core_lattice, 'lattice'
+
     def init_fn(positions, *, extra_capacity_override=None, **kwargs):
         positions = jnp.asarray(positions)
         dim = int(positions.shape[1])
         box_matrix = current_box_matrix(
             displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
+        core_fn_init, _ = _select_core(box_matrix)
         lattice_indices, zero_idx = _compute_lattice_indices(box_matrix)
         cap_value = extra_capacity if extra_capacity_override is None else extra_capacity_override
         neighbor_kwargs = dict(kwargs)
@@ -597,30 +683,45 @@ def build_Mr_apply(
             zero_image_index=zero_idx, # type: ignore
             box_matrix=box_matrix, # type: ignore
             fractional_coordinates=fractional_coordinates, # type: ignore
-            core_fn=core_fn, # type: ignore
+            core_fn=core_fn_init, # type: ignore
         )
 
-    def apply_fn(state: RealSpaceState, positions, forces, **kwargs):
+    def apply_fn(state: RealSpaceState,
+                 positions,
+                 forces,
+                 *,
+                 neighbor: Optional[partition.NeighborList] = None,
+                 lattice_indices: Optional[jnp.ndarray] = None,
+                 zero_image_index: Optional[int] = None,
+                 box_matrix: Optional[jnp.ndarray] = None,
+                 **kwargs):
         positions = jnp.asarray(positions)
         forces = jnp.asarray(forces)
 
         if positions.shape != forces.shape:
             raise ValueError("positions and forces must have the same shape.")
 
-        # Overrides from kwargs
         dim = int(positions.shape[1])
-        neighbor_override = kwargs.pop("neighbor", None)
-        lattice_override = kwargs.pop("lattice_indices", None)
-        zero_override = kwargs.pop("zero_image_index", None)
-        box_override = kwargs.pop("box_matrix", None)
-
-        if box_override is None:
-            box_matrix = current_box_matrix(
+        if box_matrix is None:
+            box_matrix_local = current_box_matrix(
                 displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
         else:
-            box_matrix = canonicalize_box_matrix(box_override, dim)
-            if box_matrix is None:
+            box_matrix_local = canonicalize_box_matrix(box_matrix, dim)
+            if box_matrix_local is None:
                 raise ValueError("box_matrix must be a scalar, vector, or matrix.")
+
+        core_fn_selected = state.core_fn
+        if core_fn_selected is None:
+            raise ValueError("RealSpaceState is missing core_fn; reinitialize with build_Mr_apply().")
+        using_lattice_kernel = core_fn_selected is core_lattice
+        using_min_image_kernel = core_fn_selected is core_min_image
+
+        if using_min_image_kernel and not isinstance(box_matrix_local, jax.core.Tracer):
+            if not _is_min_image_safe(box_matrix_local):
+                raise ValueError(
+                    "Current box violates minimum-image safety (rcut > 0.5 * sigma_min(box)) "
+                    "for the selected real-space kernel. Rebuild in lattice mode."
+                )
 
         # Outside `jit`, we optionally rebuild neighbor/lattice bookkeeping when the
         # box changes abruptly (e.g. due to a host-side resize).
@@ -630,34 +731,35 @@ def build_Mr_apply(
         # Tracer), we cannot safely recompute lattice indices with a data-dependent
         # extent because that would change array shapes; require an explicit
         # `lattice_extent` (or an explicit `lattice_indices` override) in that case.
-        if lattice_extent is None and lattice_override is None and isinstance(box_matrix, jax.core.Tracer):
+        if (using_lattice_kernel and lattice_extent is None and
+                lattice_indices is None and isinstance(box_matrix_local, jax.core.Tracer)):
             raise ValueError(
                 "Dynamic/traced box requires explicit lattice_extent (or lattice_indices) "
                 "so the lattice-image set has static shape under jit."
             )
         force_rebuild_py = False
-        if not (isinstance(box_matrix, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
-            delta_box = np.asarray(box_matrix - state.box_matrix, dtype=np.float64)
+        if not (isinstance(box_matrix_local, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
+            delta_box = np.asarray(box_matrix_local - state.box_matrix, dtype=np.float64)
             box_jump = float(np.linalg.norm(delta_box))
             force_rebuild_py = box_jump > float(box_jump_threshold)
 
-        if lattice_override is not None:
-            lattice_indices = jnp.asarray(lattice_override, dtype=jnp.int32)
-            zero_idx = int(zero_override) if zero_override is not None else state.zero_image_index
+        if lattice_indices is not None:
+            lattice_indices_local = jnp.asarray(lattice_indices, dtype=jnp.int32)
+            zero_idx = int(zero_image_index) if zero_image_index is not None else state.zero_image_index
         else:
             if force_rebuild_py and lattice_extent is None:
-                lattice_indices, zero_idx = _compute_lattice_indices(box_matrix)
+                lattice_indices_local, zero_idx = _compute_lattice_indices(box_matrix_local)
             else:
-                lattice_indices = state.lattice_indices
+                lattice_indices_local = state.lattice_indices
                 zero_idx = state.zero_image_index
 
         neighbor_kwargs = dict(kwargs)
-        neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
+        neighbor_box = _neighbor_box_from_matrix(box_matrix_local, fractional_coordinates)
         if neighbor_box is not None:
             neighbor_kwargs.setdefault("box", neighbor_box)
         else:
             neighbor_kwargs.pop("box", None)
-        if neighbor_override is None:
+        if neighbor is None:
             if state.neighbors is None:
                 raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
             if force_rebuild_py:
@@ -685,7 +787,7 @@ def build_Mr_apply(
                     else:
                         neighbors = updated
         else:
-            neighbors = neighbor_override
+            neighbors = neighbor
 
         mask = partition.neighbor_list_mask(neighbors)
 
@@ -693,23 +795,23 @@ def build_Mr_apply(
         forces_real = jnp.asarray(forces, dtype=REAL_DTYPE)
 
         # Apply core in real units
-        velocities_real = core_fn(
+        velocities_real = core_fn_selected(
             positions,
             forces_real,
             neighbors.idx,
             mask,
-            box_matrix,
-            lattice_indices,
+            box_matrix_local,
+            lattice_indices_local,
             zero_idx,
         )
 
         next_state = RealSpaceState(
             neighbors=neighbors, # type: ignore
-            lattice_indices=lattice_indices, # type: ignore
+            lattice_indices=lattice_indices_local, # type: ignore
             zero_image_index=zero_idx, # type: ignore
-            box_matrix=box_matrix, # type: ignore
+            box_matrix=box_matrix_local, # type: ignore
             fractional_coordinates=fractional_coordinates, # type: ignore
-            core_fn=core_fn, # type: ignore
+            core_fn=core_fn_selected, # type: ignore
         )
         return velocities_real, next_state
 

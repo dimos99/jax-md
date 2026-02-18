@@ -60,13 +60,13 @@ from jax_md.hydro.rpy_wave import (
     gather,
     fft_vec,
     ifft_vec,
-    Mw_bruteforce,
 )
 
 from jax_md.hydro.rpy import (
-    build_rpy_matvec,
     build_rpy_mobility,
     estimate_rpy_params,
+    RpyParameterEstimate,
+    RpyParameterDiagnostics,
     RpyState,
     brownian_increment,
 )
@@ -101,11 +101,11 @@ __all__ = [
     'gather',
     'fft_vec',
     'ifft_vec',
-    'Mw_bruteforce',
     # Combined
-    'build_rpy_matvec',
     'build_rpy_mobility',
     'estimate_rpy_params',
+    'RpyParameterEstimate',
+    'RpyParameterDiagnostics',
     'RpyState',
     'brownian_increment',
 ]

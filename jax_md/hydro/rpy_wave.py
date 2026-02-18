@@ -21,7 +21,6 @@ from jax_md.hydro.rpy_wave_det import (
     build_Mw_apply,
     mw_matvec,
     build_Mw_state,
-    Mw_bruteforce,
 )
 from jax_md.hydro.rpy_wave_stoch import build_Mw_sqrt_sampler, build_Mw_apply_and_sample
 
@@ -48,5 +47,4 @@ __all__ = [
     'build_Mw_state',
     'build_Mw_sqrt_sampler',
     'build_Mw_apply_and_sample',
-    'Mw_bruteforce',
 ]

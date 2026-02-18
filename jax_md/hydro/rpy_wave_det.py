@@ -475,7 +475,7 @@ def mw_matvec(state: WaveSpaceState,
 # ----------------------------
 # Brute-force reference (for testing)
 # ----------------------------
-def Mw_bruteforce(t, F, A, a, xi, eta, Mx, My, Mz, P, theta=None):
+def _mw_bruteforce(t, F, A, a, xi, eta, Mx, My, Mz, P, theta=None):
     """Direct k-space sum using the FFT mode set (slow; testing only).
 
     Parameters
