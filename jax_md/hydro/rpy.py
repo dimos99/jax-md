@@ -1014,7 +1014,7 @@ def build_rpy_mobility(space_fns,
         key=jax.random.PRNGKey(0),
         kT=1.0,
         dt=0.01,
-        mr_iters=20,
+        mr_iters=10,
     )
   """
 

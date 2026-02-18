@@ -17,8 +17,8 @@ where:
 ## Modules
 
 ### `rpy.py` - Main Interface
-High-level functions for building complete RPY mobility operators:
-- `build_rpy_mobility()` / `build_rpy_matvec()`: Accepts JAX-MD space functions (works with static and shearing boxes)
+High-level function for building complete RPY mobility operators:
+- `build_rpy_mobility()`: Accepts JAX-MD space functions (works with static and shearing boxes)
 
 ### `rpy_real.py` - Real-Space Mobility
 Implements M^(r) using Fiore's closed-form F1,F2 coefficients:

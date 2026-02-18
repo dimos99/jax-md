@@ -129,156 +129,116 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
     breakdown_tol = jnp.asarray(1e-12, dtype=REAL_DTYPE)
     zero = jnp.zeros_like(vec)
     vec_norm = _vec_norm(vec)
+    tol_arr = jnp.asarray(tol, dtype=REAL_DTYPE)
+    e1 = jnp.zeros((iters,), dtype=REAL_DTYPE).at[0].set(1.0)
+    diag_idx = jnp.arange(iters, dtype=jnp.int32)
+    off_idx = jnp.arange(max(iters - 1, 0), dtype=jnp.int32)
+
+    def _sqrt_coeff(alpha_arr, beta_arr, active_dim):
+        """Compute c = sqrt(T_m) e1 for the active Krylov subspace."""
+        diag_mask = (diag_idx < active_dim).astype(REAL_DTYPE)
+        diag = alpha_arr * diag_mask
+
+        off_arr = beta_arr[:-1]
+        off_mask = (off_idx < jnp.maximum(active_dim - 1, 0)).astype(REAL_DTYPE)
+        off = off_arr * off_mask
+
+        T = jnp.diag(diag)
+        if off.shape[0]:
+            T = T + jnp.diag(off, 1) + jnp.diag(off, -1)
+        eigvals, eigvecs = jnp.linalg.eigh(T)
+        eigvals = jnp.clip(eigvals, a_min=0.0)
+        sqrt_eigs = jnp.sqrt(eigvals)
+        return eigvecs @ (sqrt_eigs * (eigvecs.T @ e1))
 
     def _run_lanczos(beta0):
         q_curr = vec / beta0
         q_prev = jnp.zeros_like(q_curr)
+        beta_prev = jnp.array(0.0, dtype=REAL_DTYPE)
         alphas = jnp.zeros((iters,), dtype=REAL_DTYPE)
         betas = jnp.zeros((iters,), dtype=REAL_DTYPE)
-        beta_prev = jnp.array(0.0, dtype=REAL_DTYPE)
-        it_count_init = jnp.array(0, dtype=jnp.int32)
-        finished = jnp.array(False)
+        basis = jnp.zeros((iters,) + vec.shape, dtype=REAL_DTYPE)
+        rel_change0 = jnp.asarray(jnp.inf, dtype=REAL_DTYPE)
+        it_count0 = jnp.array(0, dtype=jnp.int32)
+        done0 = jnp.array(False)
 
         def body(k, state):
-            q_prev, q_curr, alpha_arr, beta_arr, beta_prev, it_count, done_flag = state
+            q_prev_i, q_curr_i, beta_prev_i, alpha_arr_i, beta_arr_i, basis_i, rel_change_i, it_count_i, done_i = state
 
-            def iterate(vals):
-                q_prev_i, q_curr_i, alpha_arr_i, beta_arr_i, beta_prev_i, it_count_i, _ = vals
-                w = matvec(params, q_curr_i)
+            def _skip(vals):
+                return vals
+
+            def _step(vals):
+                q_prev_s, q_curr_s, beta_prev_s, alpha_arr_s, beta_arr_s, basis_s, _, it_count_s, _ = vals
+                basis_s = basis_s.at[k].set(q_curr_s)
+
+                w = matvec(params, q_curr_s)
                 w = jnp.asarray(w, dtype=REAL_DTYPE)
-                w = w - beta_prev_i * q_prev_i
-                alpha = jnp.real(jnp.vdot(q_curr_i, w))
-                w = w - alpha * q_curr_i
+                w = w - beta_prev_s * q_prev_s
+                alpha = jnp.real(jnp.vdot(q_curr_s, w))
+                w = w - alpha * q_curr_s
                 beta = _vec_norm(w)
+
                 nonzero = beta > breakdown_tol
                 beta_safe = jnp.where(nonzero, beta, jnp.array(1.0, dtype=REAL_DTYPE))
-                q_next = jnp.where(nonzero, w / beta_safe, jnp.zeros_like(q_curr_i))
-                alpha_arr_i = alpha_arr_i.at[k].set(alpha)
-                beta_arr_i = beta_arr_i.at[k].set(beta)
-                new_done = jnp.logical_not(nonzero)
+                q_next = jnp.where(nonzero, w / beta_safe, jnp.zeros_like(q_curr_s))
+
+                alpha_arr_s = alpha_arr_s.at[k].set(alpha)
+                beta_arr_s = beta_arr_s.at[k].set(beta)
+                it_count_new = it_count_s + 1
+
+                def _compute_rel(_):
+                    coeff_curr = _sqrt_coeff(alpha_arr_s, beta_arr_s, it_count_new)
+                    prev_dim = jnp.maximum(jnp.array(1, dtype=jnp.int32), it_count_new - 1)
+                    coeff_prev = _sqrt_coeff(alpha_arr_s, beta_arr_s, prev_dim)
+                    diff = coeff_curr - coeff_prev
+                    numer = jnp.sqrt(jnp.maximum(
+                        jnp.real(jnp.vdot(diff, diff)),
+                        jnp.array(0.0, dtype=REAL_DTYPE)))
+                    denom = jnp.sqrt(jnp.maximum(
+                        jnp.real(jnp.vdot(coeff_curr, coeff_curr)),
+                        jnp.array(0.0, dtype=REAL_DTYPE)))
+                    denom = jnp.maximum(denom, jnp.asarray(1e-12, dtype=REAL_DTYPE))
+                    return numer / denom
+
+                rel_change_new = lax.cond(
+                    it_count_new > 1,
+                    _compute_rel,
+                    lambda _: jnp.asarray(jnp.inf, dtype=REAL_DTYPE),
+                    operand=None,
+                )
+                converged = jnp.logical_and(it_count_new > 1, rel_change_new <= tol_arr)
+                done_new = jnp.logical_or(jnp.logical_not(nonzero), converged)
                 return (
-                    q_curr_i,
+                    q_curr_s,
                     q_next,
-                    alpha_arr_i,
-                    beta_arr_i,
                     beta,
-                    it_count_i + 1,
-                    new_done,
+                    alpha_arr_s,
+                    beta_arr_s,
+                    basis_s,
+                    rel_change_new,
+                    it_count_new,
+                    done_new,
                 )
 
-            updated = lax.cond(
-                done_flag,
-                lambda s: s,
-                iterate,
-                (q_prev, q_curr, alpha_arr, beta_arr, beta_prev, it_count, done_flag),
-            )
-            q_prev_new, q_curr_new, alpha_new, beta_new, beta_prev_new, it_count_new, just_finished = updated
-            total_done = jnp.logical_or(done_flag, just_finished)
-            return (
-                q_prev_new,
-                q_curr_new,
-                alpha_new,
-                beta_new,
-                beta_prev_new,
-                it_count_new,
-                total_done,
+            return lax.cond(
+                done_i,
+                _skip,
+                _step,
+                (q_prev_i, q_curr_i, beta_prev_i, alpha_arr_i, beta_arr_i, basis_i, rel_change_i, it_count_i, done_i),
             )
 
-        init_state = (
-            q_prev,
-            q_curr,
-            alphas,
-            betas,
-            beta_prev,
-            it_count_init,
-            finished,
+        init_state = (q_prev, q_curr, beta_prev, alphas, betas, basis, rel_change0, it_count0, done0)
+        q_prev_f, q_curr_f, beta_prev_f, alpha_f, beta_f, basis_f, rel_change_f, iters_used, done_f = lax.fori_loop(
+            0, iters, body, init_state
         )
-        _, _, alpha_f, beta_f, _, iters_used, _ = lax.fori_loop(0, iters, body, init_state)
+        del q_prev_f, q_curr_f, beta_prev_f, done_f
+
         active_dim = jnp.maximum(jnp.array(1, dtype=jnp.int32), iters_used)
-
-        diag_idx = jnp.arange(iters, dtype=jnp.int32)
-        diag_mask_curr = (diag_idx < active_dim).astype(REAL_DTYPE)
-        diag_curr = alpha_f * diag_mask_curr
-
-        off_arr = beta_f[:-1]
-        off_idx = jnp.arange(max(iters - 1, 0), dtype=jnp.int32)
-        off_mask_curr = (off_idx < jnp.maximum(active_dim - 1, 0)).astype(REAL_DTYPE)
-        off_curr = off_arr * off_mask_curr
-
-        prev_dim = jnp.maximum(jnp.array(1, dtype=jnp.int32), active_dim - 1)
-        diag_mask_prev = (diag_idx < prev_dim).astype(REAL_DTYPE)
-        diag_prev = alpha_f * diag_mask_prev
-        off_mask_prev = (off_idx < jnp.maximum(prev_dim - 1, 0)).astype(REAL_DTYPE)
-        off_prev = off_arr * off_mask_prev
-
-        e1 = jnp.zeros((iters,), dtype=REAL_DTYPE).at[0].set(1.0)
-
-        def _sqrt_T_e1(diag, off):
-            T = jnp.diag(diag)
-            if off.shape[0]:
-                T = T + jnp.diag(off, 1) + jnp.diag(off, -1)
-            eigvals, eigvecs = jnp.linalg.eigh(T)
-            eigvals = jnp.clip(eigvals, a_min=0.0)
-            sqrt_eigs = jnp.sqrt(eigvals)
-            return eigvecs @ (sqrt_eigs * (eigvecs.T @ e1))
-
-        coeff_curr = _sqrt_T_e1(diag_curr, off_curr)
-
-        coeff_prev = lax.cond(
-            active_dim > 1,
-            lambda _: _sqrt_T_e1(diag_prev, off_prev),
-            lambda _: coeff_curr,
-            operand=None,
-        )
-
-        # Estimate relative change purely in coefficient space using orthonormality of V_m:
-        #   ||y_m - y_{m-1}|| / ||y_m|| = ||c_m - c_{m-1}|| / ||c_m||,
-        # where y_m = beta0 * V_m c_m.
-        diff = coeff_curr - coeff_prev
-        numer = jnp.sqrt(jnp.maximum(jnp.real(jnp.vdot(diff, diff)), jnp.array(0.0, dtype=REAL_DTYPE)))
-        denom = jnp.sqrt(jnp.maximum(jnp.real(jnp.vdot(coeff_curr, coeff_curr)), jnp.array(0.0, dtype=REAL_DTYPE)))
-        denom = jnp.maximum(denom, jnp.asarray(1e-12, dtype=REAL_DTYPE))
-        rel_change = numer / denom
-
-        def second_pass(coeffs, m_dim):
-            """Reconstruct y = beta0 * V_m coeffs via a second Lanczos pass."""
-
-            def body2(j, state2):
-                q_prev2, q_curr2, acc = state2
-                j_idx = j + 1  # 1-based index for current step
-
-                # β_j (with β_1 = 0, β_j = beta_f[j-2] for j >= 2)
-                beta_j = jnp.where(
-                    j_idx == 1,
-                    jnp.array(0.0, dtype=REAL_DTYPE),
-                    beta_f[j_idx - 2],
-                )
-                w2 = matvec(params, q_curr2)
-                w2 = jnp.asarray(w2, dtype=REAL_DTYPE)
-                w2 = w2 - beta_j * q_prev2
-                alpha_j = alpha_f[j_idx - 1]
-                w2 = w2 - alpha_j * q_curr2
-                beta_j1 = beta_f[j_idx - 1]
-
-                nonzero2 = beta_j1 > breakdown_tol
-                beta_safe2 = jnp.where(nonzero2, beta_j1, jnp.array(1.0, dtype=REAL_DTYPE))
-                q_next2 = jnp.where(nonzero2, w2 / beta_safe2, jnp.zeros_like(q_curr2))
-
-                acc = acc + coeffs[j_idx] * q_next2
-                return q_curr2, q_next2, acc
-
-            # j = 0 corresponds to v_1 = vec / beta0
-            q1 = vec / beta0
-            acc0 = coeffs[0] * q1
-            init_state2 = (jnp.zeros_like(q1), q1, acc0)
-
-            # Run for j = 1 .. m_dim-1
-            final_state2 = lax.fori_loop(0, jnp.maximum(m_dim - 1, 0), body2, init_state2)
-            _, _, acc_final = final_state2
-            return beta0 * acc_final
-
-        approx = second_pass(coeff_curr, active_dim)
-        return approx, rel_change, active_dim
+        coeff = _sqrt_coeff(alpha_f, beta_f, active_dim)
+        coeff_mask = coeff * (diag_idx < active_dim).astype(REAL_DTYPE)
+        approx = beta0 * jnp.einsum('i,i...->...', coeff_mask, basis_f)
+        return approx, rel_change_f, iters_used
 
     approx, rel_change, actual_iters = lax.cond(
         vec_norm <= 0.0,
@@ -286,8 +246,6 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
         lambda beta0: _run_lanczos(beta0),
         vec_norm,
     )
-
-    tol_arr = jnp.asarray(tol, dtype=REAL_DTYPE)
 
     converged = rel_change <= tol_arr
 
@@ -316,7 +274,7 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
 def lanczos_sqrt_mv_test(key: jax.Array,
                          *,
                          n: int = 64,
-                         iters: int = 32,
+                         iters: int = 10,
                          tol: float = 1e-3) -> float:
     """
     Convenience test helper for ``lanczos_sqrt_mv``.
@@ -348,7 +306,7 @@ def sample_mr_sqrt_precond(key: jax.Array,
                            positions: jnp.ndarray,
                            *,
                            precond: Optional[Preconditioner] = None,
-                           iters: int = 3,
+                           iters: int = 10,
                            tol: float = 1e-3,
                            return_info: bool = False):
     """
@@ -372,7 +330,7 @@ def sample_mr_sqrt_precond(key: jax.Array,
     precond : Preconditioner, optional
         Linear operator ``G`` used for preconditioning. Defaults to the identity.
     iters : int, optional
-        Maximum number of Lanczos iterations (default 3).
+        Maximum number of Lanczos iterations (default 10).
     tol : float, optional
         Convergence tolerance (default 1e-3). Monitors the change in approximation
         between consecutive iterations and enforces it as described in
@@ -415,7 +373,7 @@ def sample_mr_sqrt(key: jax.Array,
                    state: RealSpaceState,
                    positions: jnp.ndarray,
                    *,
-                   iters: int = 20,
+                   iters: int = 10,
                    tol: float = 1e-3,
                    return_info: bool = False):
     """
