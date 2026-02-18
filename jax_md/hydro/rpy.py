@@ -514,7 +514,7 @@ def estimate_rpy_params(tol: float,
   eps_r, eps_w, eps_q = _compute_error_targets(tol, split)
 
   rcut = math.sqrt(math.log(1.0 / eps_r)) / xi
-  lattice_extent = int(math.ceil(rcut / safe_sigma))
+  lattice_extent = int(math.ceil(2.0 * rcut / safe_sigma))
 
   if shear_vector_schedule is None:
     quadrature_lambda_max = 1.0

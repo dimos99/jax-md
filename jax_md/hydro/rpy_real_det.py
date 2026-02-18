@@ -7,13 +7,15 @@ spheres of radius a with Ewald splitting parameter ξ:
     M^r_ii = (1/(6πηa)) f_self(a, ξ)
 
 Periodic images are summed over a lattice hypercube L ∈ {-N,…,N}^d with
-N ≥ ⌈r_cut / σ_min(Box)⌉, and pair-level masking enforces |r_ij + L| < r_cut.
+N ≥ ⌈2·r_cut / σ_min(Box)⌉, and pair-level masking enforces |r_ij + L| < r_cut.
 
 References
 ----------
 [1] Fiore et al., J. Chem. Phys. 146, 124116 (2017).
 [2] Fiore, PhD Thesis, MIT (2019).
 """
+
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -210,55 +212,35 @@ def _build_mr_core_lattice(
         if n_images == 0:
             return self_term * forces
 
+        # --- Normalise all formats to a flat (capacity,) edge list ---
         if not uses_sparse:
+            # Dense: neighbor_idx shape (N, max_K), neighbor_mask shape (N, max_K)
             if neighbor_idx.ndim == 1:
                 neighbor_idx = neighbor_idx[:, None]
             if neighbor_mask.ndim == 1:
                 neighbor_mask = neighbor_mask[:, None]
-
             max_neighbors = neighbor_idx.shape[1]
             if max_neighbors == 0:
                 return self_term * forces
-
             neighbor_idx_masked = jnp.where(neighbor_mask, neighbor_idx, 0)
-            xi_vec = x_real[:, None, None, :]
-            xj = x_real[neighbor_idx_masked][:, :, None, :]
-            lattice = lattice_vecs[None, None, :, :]
-            rij = xj - xi_vec + lattice
-
-            r2 = jnp.sum(rij * rij, axis=-1)
-            within_rcut = r2 < rcut2
-
-            idx_i = jnp.arange(N, dtype=neighbor_idx.dtype)
-            is_self = neighbor_idx_masked == idx_i[:, None]
-            zero_mask = (jnp.arange(n_images, dtype=jnp.int32) == zero_image_index)
-            primary_self = is_self[:, :, None] & zero_mask[None, None, :]
-            valid_pairs = neighbor_mask[:, :, None] & (~primary_self) & within_rcut
-            valid_any = jnp.any(valid_pairs)
-
-            def _no_pairs(_):
+            idx_i = jnp.arange(N, dtype=jnp.int32)
+            receivers = jnp.repeat(idx_i, max_neighbors)
+            senders = neighbor_idx_masked.ravel()
+            flat_mask = neighbor_mask.ravel()
+        else:
+            # Sparse / OrderedSparse: neighbor_idx shape (2, capacity)
+            if neighbor_idx.ndim == 1:
+                neighbor_idx = neighbor_idx[None, :]
+            if neighbor_mask.ndim == 0:
+                neighbor_mask = jnp.broadcast_to(neighbor_mask, neighbor_idx.shape[1:])
+            capacity = neighbor_idx.shape[1]
+            if capacity == 0:
                 return self_term * forces
+            receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
+            senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
+            flat_mask = neighbor_mask
 
-            def _with_pairs(_):
-                forces_neighbors = forces[neighbor_idx_masked][:, :, None, :]
-                contrib = pair_contrib(
-                    rij, r2, valid_pairs, forces_neighbors,
-                    prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=2).sum(axis=1)
-                return self_term * forces + contrib
-
-            return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
-
-        if neighbor_idx.ndim == 1:
-            neighbor_idx = neighbor_idx[None, :]
-        if neighbor_mask.ndim == 0:
-            neighbor_mask = jnp.broadcast_to(neighbor_mask, neighbor_idx.shape[1])
-        capacity = neighbor_idx.shape[1]
-        if capacity == 0:
-            return self_term * forces
-
-        receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
-        senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
-
+        # --- Shared accumulation (lattice kernel) ---
         zero_mask = (jnp.arange(n_images, dtype=jnp.int32) == zero_image_index)[None, :]
         lattice = lattice_vecs[None, :, :]
         velocities_init = self_term * forces
@@ -293,11 +275,12 @@ def _build_mr_core_lattice(
                 velocities = velocities + ops.segment_sum(contrib_j, senders_batch, N)
             return velocities
 
+        capacity = flat_mask.shape[0]
         pair_image_work = capacity * n_images
         pair_image_limit = 32_000_000
 
         if pair_image_work <= pair_image_limit:
-            return _accumulate_sparse_batch(velocities_init, receivers, senders, neighbor_mask)
+            return _accumulate_sparse_batch(velocities_init, receivers, senders, flat_mask)
 
         chunk_size = max(1, pair_image_limit // max(n_images, 1))
         n_chunks = (capacity + chunk_size - 1) // chunk_size
@@ -306,7 +289,7 @@ def _build_mr_core_lattice(
 
         receivers_padded = jnp.pad(receivers, (0, pad))
         senders_padded = jnp.pad(senders, (0, pad))
-        mask_padded = jnp.pad(neighbor_mask, (0, pad), constant_values=False)
+        mask_padded = jnp.pad(flat_mask, (0, pad), constant_values=False)
 
         receivers_chunks = receivers_padded.reshape((n_chunks, chunk_size))
         senders_chunks = senders_padded.reshape((n_chunks, chunk_size))
@@ -378,59 +361,41 @@ def _build_mr_core_min_image(
 
         N = positions_frac.shape[0]
 
+        # --- Normalise all formats to a flat (capacity,) edge list ---
         if not uses_sparse:
+            # Dense: neighbor_idx shape (N, max_K), neighbor_mask shape (N, max_K)
             if neighbor_idx.ndim == 1:
                 neighbor_idx = neighbor_idx[:, None]
             if neighbor_mask.ndim == 1:
                 neighbor_mask = neighbor_mask[:, None]
-
             max_neighbors = neighbor_idx.shape[1]
             if max_neighbors == 0:
                 return self_term * forces
-
             neighbor_idx_masked = jnp.where(neighbor_mask, neighbor_idx, 0)
-            xi_frac = positions_frac[:, None, :]
-            xj_frac = positions_frac[neighbor_idx_masked]
-            delta_frac = _wrapped_frac_delta(xj_frac - xi_frac)
-            rij = _to_real(delta_frac)
-
-            r2 = jnp.sum(rij * rij, axis=-1)
-            within_rcut = r2 < rcut2
-
-            idx_i = jnp.arange(N, dtype=neighbor_idx.dtype)
-            is_self = neighbor_idx_masked == idx_i[:, None]
-            valid_pairs = neighbor_mask & (~is_self) & within_rcut
-            valid_any = jnp.any(valid_pairs)
-
-            def _no_pairs(_):
+            idx_i = jnp.arange(N, dtype=jnp.int32)
+            receivers = jnp.repeat(idx_i, max_neighbors)
+            senders = neighbor_idx_masked.ravel()
+            flat_mask = neighbor_mask.ravel()
+        else:
+            # Sparse / OrderedSparse: neighbor_idx shape (2, capacity)
+            if neighbor_idx.ndim == 1:
+                neighbor_idx = neighbor_idx[None, :]
+            if neighbor_mask.ndim == 0:
+                neighbor_mask = jnp.broadcast_to(neighbor_mask, neighbor_idx.shape[1:])
+            capacity = neighbor_idx.shape[1]
+            if capacity == 0:
                 return self_term * forces
+            receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
+            senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
+            flat_mask = neighbor_mask
 
-            def _with_pairs(_):
-                forces_neighbors = forces[neighbor_idx_masked]
-                contrib = pair_contrib(
-                    rij, r2, valid_pairs, forces_neighbors,
-                    prefactor=prefactor, pair_eps2=pair_eps2).sum(axis=1)
-                return self_term * forces + contrib
-
-            return jax.lax.cond(valid_any, _with_pairs, _no_pairs, operand=None)
-
-        if neighbor_idx.ndim == 1:
-            neighbor_idx = neighbor_idx[None, :]
-        if neighbor_mask.ndim == 0:
-            neighbor_mask = jnp.broadcast_to(neighbor_mask, neighbor_idx.shape[1])
-        capacity = neighbor_idx.shape[1]
-        if capacity == 0:
-            return self_term * forces
-
-        receivers = jnp.where(neighbor_mask, neighbor_idx[0], 0)
-        senders = jnp.where(neighbor_mask, neighbor_idx[1], 0)
-
+        # --- Shared accumulation (min-image kernel) ---
         delta_frac = _wrapped_frac_delta(positions_frac[senders] - positions_frac[receivers])
         rij = _to_real(delta_frac)
         r2 = jnp.sum(rij * rij, axis=-1)
         within_rcut = r2 < rcut2
         is_self_edge = receivers == senders
-        mask_pairs = neighbor_mask & (~is_self_edge) & within_rcut
+        mask_pairs = flat_mask & (~is_self_edge) & within_rcut
 
         velocities = self_term * forces
         forces_senders = forces[senders]
@@ -581,8 +546,9 @@ def build_Mr_apply(
         Algorithm
         ---------
         1. **Extent Estimation**: If not user-specified, compute the lattice extent N
-           from the ratio r_cut / σ_min(Box), where σ_min is the smallest singular
-           value of the box matrix. This ensures coverage in the 'thinnest' box direction.
+           from the ratio 2·r_cut / σ_min(Box), where σ_min is the smallest singular
+           value of the box matrix. This ensures coverage in the 'thinnest' box direction,
+           accounting for neighbor-list minimum-image shifts L_min ∈ {-1,0,1}³.
            
         2. **Hypercube Generation**: Create a symmetric grid of integer shifts in
            {-N, ..., N}^d, yielding (2N+1)^d candidate lattice vectors.
@@ -615,9 +581,18 @@ def build_Mr_apply(
             svals = np.linalg.svd(box_np, compute_uv=False)
             sigma_min = float(np.min(svals))
             safe_sigma = max(sigma_min, 1e-12)
-            base_extent = int(np.ceil(float(rcut) / safe_sigma))
+            base_extent = int(np.ceil(2.0 * float(rcut) / safe_sigma))
             extent_padding = int(np.ceil(float(lattice_extra)))
             extent_val = max(base_extent + extent_padding, 0)
+            if extent_val > 1:
+                warnings.warn(
+                    f"Real-space lattice extent is {extent_val} (box thinnest direction "
+                    f"σ_min={safe_sigma:.4g}, rcut={float(rcut):.4g}). "
+                    f"Each pair will be evaluated over {(2*extent_val+1)**dim} periodic images, "
+                    f"which may be slow. Consider increasing ξ (xi) to reduce rcut, or "
+                    f"ensure the box is not too elongated.",
+                    stacklevel=4,
+                )
         else:
             extent_val = int(lattice_extent)
 
