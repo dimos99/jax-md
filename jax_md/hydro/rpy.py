@@ -1,14 +1,16 @@
-"""
-Spectral-Ewald RPY mobility implementation.
+"""Spectral-Ewald RPY mobility implementation.
 
-This module provides functions to build and apply the Rotne–Prager–Yamakawa
-(RPY) mobility operator using a split-Ewald formulation. It combines real-space
-and wave-space contributions for efficient hydrodynamic interactions in
-periodic systems. It supports deterministic mobility application and
-stochastic Brownian velocity sampling.
+This module provides functions to build and apply the periodic
+Rotne-Prager-Yamakawa (RPY) mobility operator using a split-Ewald
+formulation. It combines real-space and wave-space contributions for
+efficient hydrodynamic interactions in periodic systems. It supports
+deterministic mobility application and stochastic Brownian velocity
+sampling.
+
+Reference: Fiore et al., J. Chem. Phys. 146, 124116 (2017).
 """
 
-from typing import Callable, Dict, Mapping, Optional, Tuple, Union
+from typing import Callable, Optional, Sequence, Tuple
 import itertools
 import math
 import warnings
@@ -47,12 +49,16 @@ from jax_md.hydro.rpy_real import (
 )
 from jax_md.hydro.rpy_wave_stoch import _hermitian_gaussian_modes
 
-XI_OPT_A = 0.5  # default target for xi * a in Fiore (2017)
-REAL_DTYPE = jnp.float64 if jax_config.jax_enable_x64 else jnp.float32
-COMPLEX_DTYPE = jnp.complex128 if jax_config.jax_enable_x64 else jnp.complex64
+XI_OPT_A = 0.5  # default target for xi * a
+REAL_DTYPE = jnp.float64 if jax_config.jax_enable_x64 else jnp.float32 #type: ignore[assignment]
+COMPLEX_DTYPE = jnp.complex128 if jax_config.jax_enable_x64 else jnp.complex64 #type: ignore[assignment]
 
 
-def _shear_planes_for_dim(dim: int) -> Tuple[str, ...]:
+ShearVector = Tuple[float, float, float] # (gamma_xy, gamma_xz, gamma_yz)
+ShearVectorSchedule = Callable[[float], Sequence[float]] # function of time
+
+
+def _shear_plane_count(dim: int) -> int:
   if dim == 2:
     return ('xy',)
   if dim == 3:

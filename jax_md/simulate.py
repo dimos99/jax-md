@@ -35,7 +35,7 @@
 
 from collections import namedtuple
 
-from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional
+from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional, Sequence
 
 import functools
 
@@ -1117,6 +1117,36 @@ def _normalize_shear_schedule(
   return _wrap(None), _wrap(None), _wrap(None)
 
 
+def _normalize_rpy_shear_vector_schedule(
+    shear_vector_schedule: Optional[Callable[[Array], Sequence[Array]]]
+) -> Tuple[Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]]:
+  """Return shear callables (xy, xz, yz) from a vector schedule."""
+
+  def _zero(t):
+    return f32(0.0)
+
+  if shear_vector_schedule is None:
+    return _zero, _zero, _zero
+  if not callable(shear_vector_schedule):
+    raise ValueError("shear_vector_schedule must be callable or None.")
+
+  def _eval_vec(t):
+    values = shear_vector_schedule(t)
+    try:
+      gamma_xy, gamma_xz, gamma_yz = values
+    except (TypeError, ValueError) as err:
+      raise ValueError(
+          "shear_vector_schedule(t) must return (gamma_xy, gamma_xz, gamma_yz)."
+      ) from err
+    return f32(gamma_xy), f32(gamma_xz), f32(gamma_yz)
+
+  return (
+      lambda t: _eval_vec(t)[0],
+      lambda t: _eval_vec(t)[1],
+      lambda t: _eval_vec(t)[2],
+  )
+
+
 def _make_shear_at(sf_xy, sf_xz, sf_yz):
   """Return a `(time, dim) -> (gamma_xy, gamma_xz, gamma_yz)` shear helper."""
   def _shear_at(time, dim):
@@ -1490,6 +1520,179 @@ class ShearedRPYState:
   force: Array
 
 
+def _build_rpy_operator_with_brownian(
+    *,
+    space_fns: Tuple[Callable, ...],
+    a: float,
+    xi: float,
+    eta: float,
+    rcut: Optional[float],
+    P: Optional[int],
+    Mgrid: Optional[int],
+    Mx: Optional[int],
+    My: Optional[int],
+    Mz: Optional[int],
+    theta: Optional[float],
+    fractional_coordinates: bool,
+    dr_threshold: Optional[float],
+    capacity_multiplier: float,
+    disable_cell_list: bool,
+    neighbor_format,
+    extra_capacity: int,
+    lattice_extent: Optional[int],
+    lattice_extra: float,
+    box_jump_threshold: Optional[float],
+    real_space_mode: str,
+    real_space_first: bool,
+) -> Tuple[Callable, Callable]:
+  rpy_init, rpy_apply = hydro_rpy.build_rpy_mobility(
+      space_fns,
+      a,
+      xi,
+      eta,
+      rcut=rcut,
+      P=P,
+      Mgrid=Mgrid,
+      Mx=Mx,
+      My=My,
+      Mz=Mz,
+      theta=theta,
+      fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold,
+      capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list,
+      neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity,
+      lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra,
+      box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode,
+      real_space_first=real_space_first,
+  )
+  apply_with_brownian = getattr(rpy_apply, 'with_brownian', None)
+  if apply_with_brownian is None:
+    raise ValueError(
+        "build_rpy_mobility did not provide with_brownian; "
+        "RPY wrappers require Brownian sampling support."
+    )
+  return rpy_init, apply_with_brownian
+
+
+def _rpy_force_and_increment(
+    *,
+    force_fn: Callable[..., Array],
+    apply_with_brownian: Callable,
+    rpy_state: hydro_rpy.RpyState,
+    mobility_position: Array,
+    key: Array,
+    step_kwargs: Dict[str, Any],
+    kT: float,
+    dt: float,
+    mr_iters: int,
+) -> Tuple[Array, Array, Array, hydro_rpy.RpyState, Array]:
+  force = force_fn(mobility_position, **step_kwargs)
+  key, brownian_key = random.split(key)
+  velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
+      rpy_state,
+      mobility_position,
+      force,
+      brownian_key,
+      kT=kT,
+      dt=dt,
+      mr_iters=mr_iters,
+      **step_kwargs,
+  )
+  return force, velocities, dB, rpy_state, key
+
+
+def _rpy_update_positions(
+    *,
+    shift_fn: Callable[..., Array],
+    mobility_position: Array,
+    position_real: Array,
+    displacement_real: Array,
+    step_kwargs: Dict[str, Any],
+) -> Tuple[Array, Array]:
+  mobility_position = shift_fn(mobility_position, displacement_real, **step_kwargs)
+  position_real = position_real + displacement_real
+  return mobility_position, position_real
+
+
+def _shear_kwargs_from_dim(dim: int, gamma_xy, gamma_xz, gamma_yz) -> Dict[str, Array]:
+  if dim >= 3:
+    return {'gamma_xy': gamma_xy, 'gamma_xz': gamma_xz, 'gamma_yz': gamma_yz}
+  return {'gamma': gamma_xy}
+
+
+def _current_box_from_reduced_shear(
+    box_of: Callable[..., Box],
+    dim: int,
+    gamma_xy,
+    gamma_xz,
+    gamma_yz,
+) -> Box:
+  if dim >= 3:
+    return box_of(gamma_xy=gamma_xy, gamma_xz=gamma_xz, gamma_yz=gamma_yz)
+  return box_of(gamma=gamma_xy)
+
+
+def _init_reduced_shear(sf_xy, sf_xz, sf_yz, t0, dim: int, remap: bool):
+  curr_xy = f32(sf_xy(t0))
+  if dim >= 3:
+    curr_xz = f32(sf_xz(t0))
+    curr_yz = f32(sf_yz(t0))
+  else:
+    curr_xz = curr_yz = f32(0.0)
+  if remap:
+    curr_xy, curr_xz, curr_yz, _, _, _ = _reduce_shear_strain(
+        curr_xy, curr_xz, curr_yz, dim)
+  return curr_xy, curr_xz, curr_yz
+
+
+def _step_reduced_shear_and_remap(
+    mobility_position: Array,
+    *,
+    sf_xy,
+    sf_xz,
+    sf_yz,
+    time,
+    dt,
+    dim: int,
+    remap: bool,
+    fractional_coordinates: bool,
+) -> Tuple[Array, Array, Array, Array]:
+  if remap:
+    prev_xy = f32(sf_xy(time))
+    curr_xy = f32(sf_xy(time + dt))
+    if dim >= 3:
+      prev_xz = f32(sf_xz(time))
+      curr_xz = f32(sf_xz(time + dt))
+      prev_yz = f32(sf_yz(time))
+      curr_yz = f32(sf_yz(time + dt))
+    else:
+      prev_xz = curr_xz = prev_yz = curr_yz = f32(0.0)
+
+    _, _, _, m_prev_xy, m_prev_xz, m_prev_yz = _reduce_shear_strain(
+        prev_xy, prev_xz, prev_yz, dim)
+    curr_xy, curr_xz, curr_yz, m_curr_xy, m_curr_xz, m_curr_yz = _reduce_shear_strain(
+        curr_xy, curr_xz, curr_yz, dim)
+    m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
+    m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
+    m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
+
+    if fractional_coordinates:
+      mobility_position = _apply_fractional_shear_remap(
+          mobility_position, m_xy, m_xz, m_yz, dim)
+  else:
+    curr_xy = f32(sf_xy(time + dt))
+    if dim >= 3:
+      curr_xz = f32(sf_xz(time + dt))
+      curr_yz = f32(sf_yz(time + dt))
+    else:
+      curr_xz = curr_yz = f32(0.0)
+  return mobility_position, curr_xy, curr_xz, curr_yz
+
+
 def rpy(space_fns: Tuple[Callable, ...],
         energy_or_force: Callable[..., Array],
         dt: float,
@@ -1498,39 +1701,55 @@ def rpy(space_fns: Tuple[Callable, ...],
         a: float,
         xi: float,
         eta: float,
-        Mr_params: Optional[Dict[str, Any]] = None,
-        Mw_params: Optional[Dict[str, Any]] = None,
         rcut: Optional[float] = None,
         P: Optional[int] = None,
         Mgrid: Optional[int] = None,
+        Mx: Optional[int] = None,
+        My: Optional[int] = None,
+        Mz: Optional[int] = None,
         theta: Optional[float] = None,
+        fractional_coordinates: bool = True,
+        dr_threshold: Optional[float] = None,
+        capacity_multiplier: float = 1.25,
+        disable_cell_list: bool = False,
+        neighbor_format=partition.NeighborListFormat.OrderedSparse,
+        extra_capacity: int = 0,
+        lattice_extent: Optional[int] = None,
+        lattice_extra: float = 0.0,
+        box_jump_threshold: Optional[float] = None,
+        real_space_mode: str = 'auto',
         mr_iters: int = 10,
         real_space_first: bool = True) -> Simulator:
   """Brownian dynamics with hydrodynamic interactions via Spectral Ewald."""
   if len(space_fns) < 2:
     raise ValueError("space_fns must contain displacement and shift functions.")
 
-  # Unpack space functions and optional box function for real<->fractional transforms.
-  displacement_fn, shift_fn = space_fns[:2]
-  box_fn = space_fns[2] if len(space_fns) > 2 else None
+  _, shift_fn = space_fns[:2]
   force_fn = quantity.canonicalize_force(energy_or_force)
   (_dt,) = static_cast(dt)
 
-  Mw_params_local = dict(Mw_params) if Mw_params is not None else {}
-  if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
-    Mw_params_local['fused_wave'] = True
-
-  rpy_init, rpy_apply = hydro_rpy.build_rpy_mobility(
-      space_fns,
-      a,
-      xi,
-      eta,
-      Mr_params=Mr_params,
-      Mw_params=Mw_params_local,
+  rpy_init, apply_with_brownian = _build_rpy_operator_with_brownian(
+      space_fns=space_fns,
+      a=a,
+      xi=xi,
+      eta=eta,
       rcut=rcut,
       P=P,
       Mgrid=Mgrid,
+      Mx=Mx,
+      My=My,
+      Mz=Mz,
       theta=theta,
+      fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold,
+      capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list,
+      neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity,
+      lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra,
+      box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode,
       real_space_first=real_space_first,
   )
 
@@ -1554,33 +1773,29 @@ def rpy(space_fns: Tuple[Callable, ...],
     rpy_state = state.rpy_state
     key = state.rng
 
-    force = force_fn(R_mobility, **step_kwargs)
-    apply_with_brownian = getattr(rpy_apply, 'with_brownian', None)
-    if apply_with_brownian is not None:
-      key, brownian_key = random.split(key)
-      velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
-          rpy_state,
-          R_mobility,
-          force,
-          brownian_key,
-          kT=_kT,
-          dt=_dt,
-          mr_iters=_mr_iters,
-          **step_kwargs,
-      )
-    else:
-      velocities, rpy_state = rpy_apply(rpy_state, R_mobility, force, **step_kwargs)
-      key, noise_key = random.split(key)
-      dB = hydro_rpy.brownian_increment(
-          noise_key, rpy_state, R_mobility, kT=_kT, dt=_dt, mr_iters=_mr_iters
-      )
+    _, velocities, dB, rpy_state, key = _rpy_force_and_increment(
+        force_fn=force_fn,
+        apply_with_brownian=apply_with_brownian,
+        rpy_state=rpy_state,
+        mobility_position=R_mobility,
+        key=key,
+        step_kwargs=step_kwargs,
+        kT=_kT,
+        dt=_dt,
+        mr_iters=_mr_iters,
+    )
     # Combine deterministic and stochastic increments consistently in REAL coordinates.
     # periodic_general with fractional_coordinates=True expects REAL displacement.
     # NOTE: RPY mobility already returns velocities and dB in real coordinates,
     # so no transformation is needed.
     displacement_real = _dt * velocities + dB
-    R_mobility = shift_fn(R_mobility, displacement_real, **step_kwargs)
-    R_real = R_real + displacement_real
+    R_mobility, R_real = _rpy_update_positions(
+        shift_fn=shift_fn,
+        mobility_position=R_mobility,
+        position_real=R_real,
+        displacement_real=displacement_real,
+        step_kwargs=step_kwargs,
+    )
 
     return RPYState(position=R_real,
                     mobility_position=R_mobility,
@@ -1598,17 +1813,26 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                    a: float,
                    xi: float,
                    eta: float,
-                   shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None],
+                   shear_vector_schedule: Optional[Callable[[Array], Sequence[Array]]],
                    t0: float = 0.0,
                    fractional_coordinates: bool = True,
                    remap: bool = True,
-                   pair_energy_for_stress: Optional[Callable[..., Array]] = None,
-                   Mr_params: Optional[Dict[str, Any]] = None,
-                   Mw_params: Optional[Dict[str, Any]] = None,
                    rcut: Optional[float] = None,
                    P: Optional[int] = None,
                    Mgrid: Optional[int] = None,
+                   Mx: Optional[int] = None,
+                   My: Optional[int] = None,
+                   Mz: Optional[int] = None,
                    theta: Optional[float] = None,
+                   dr_threshold: Optional[float] = None,
+                   capacity_multiplier: float = 1.25,
+                   disable_cell_list: bool = False,
+                   neighbor_format=partition.NeighborListFormat.OrderedSparse,
+                   extra_capacity: int = 0,
+                   lattice_extent: Optional[int] = None,
+                   lattice_extra: float = 0.0,
+                   box_jump_threshold: Optional[float] = None,
+                   real_space_mode: str = 'auto',
                    mr_iters: int = 10,
                    real_space_first: bool = True) -> Simulator:
   """Spectral-Ewald RPY dynamics with the shearing box utilities.
@@ -1631,66 +1855,40 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
   box = box_of(t=t0)
   dim = box.shape[0]
 
-  sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
+  sf_xy, sf_xz, sf_yz = _normalize_rpy_shear_vector_schedule(shear_vector_schedule)
 
-  Mw_params_local = dict(Mw_params) if Mw_params is not None else {}
-  if 'fused_wave' not in Mw_params_local and 'fused' not in Mw_params_local:
-    Mw_params_local['fused_wave'] = True
-
-  rpy_init, rpy_apply = hydro_rpy.build_rpy_mobility(
-      space_fns,
-      a,
-      xi,
-      eta,
-      Mr_params=Mr_params,
-      Mw_params=Mw_params_local,
+  rpy_init, apply_with_brownian = _build_rpy_operator_with_brownian(
+      space_fns=space_fns,
+      a=a,
+      xi=xi,
+      eta=eta,
       rcut=rcut,
       P=P,
       Mgrid=Mgrid,
+      Mx=Mx,
+      My=My,
+      Mz=Mz,
       theta=theta,
+      fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold,
+      capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list,
+      neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity,
+      lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra,
+      box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode,
       real_space_first=real_space_first,
   )
-
-  def _reduced_shear(time):
-    gamma_xy = f32(sf_xy(time))
-    if dim >= 3:
-      gamma_xz = f32(sf_xz(time))
-      gamma_yz = f32(sf_yz(time))
-    else:
-      gamma_xz = gamma_yz = f32(0.0)
-    if remap:
-      m_xy = jnp.floor(gamma_xy + 0.5)
-      if dim >= 3:
-        m_xz = jnp.floor(gamma_xz + 0.5)
-        m_yz = jnp.floor(gamma_yz + 0.5)
-      else:
-        m_xz = m_yz = f32(0.0)
-      return (
-          gamma_xy - m_xy,
-          gamma_xz - m_xz,
-          gamma_yz - m_yz,
-          m_xy.astype(jnp.int32),
-          m_xz.astype(jnp.int32),
-          m_yz.astype(jnp.int32),
-      )
-    return (
-        gamma_xy,
-        gamma_xz,
-        gamma_yz,
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
-        jnp.array(0, dtype=jnp.int32),
-    )
 
   def init_fn(key, R, **kwargs):
     mobility_position = jnp.asarray(R)
     shear_kwargs = dict(kwargs)
 
-    curr_xy, curr_xz, curr_yz, _, _, _ = _reduced_shear(t0)
-    if dim >= 3:
-      shear_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
-    else:
-      shear_kwargs['gamma'] = curr_xy
+    curr_xy, curr_xz, curr_yz = _init_reduced_shear(
+        sf_xy, sf_xz, sf_yz, t0, dim, remap)
+    shear_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
 
     rpy_state = rpy_init(mobility_position, **shear_kwargs)
     F0 = force_fn(mobility_position, **shear_kwargs)
@@ -1719,88 +1917,33 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     key = state.rng
     time = state.time
 
-    if remap:
-      prev_xy = f32(sf_xy(time))
-      curr_xy = f32(sf_xy(time + _dt))
-      if mobility_position.shape[1] >= 3:
-        prev_xz = f32(sf_xz(time)); curr_xz = f32(sf_xz(time + _dt))
-        prev_yz = f32(sf_yz(time)); curr_yz = f32(sf_yz(time + _dt))
-      else:
-        prev_xz = curr_xz = prev_yz = curr_yz = f32(0.0)
+    mobility_position, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
+        mobility_position,
+        sf_xy=sf_xy,
+        sf_xz=sf_xz,
+        sf_yz=sf_yz,
+        time=time,
+        dt=_dt,
+        dim=dim,
+        remap=remap,
+        fractional_coordinates=fractional_coordinates,
+    )
 
-      m_prev_xy = jnp.floor(prev_xy + 0.5); m_curr_xy = jnp.floor(curr_xy + 0.5)
-      m_xy = (m_curr_xy - m_prev_xy).astype(jnp.int32)
-      if mobility_position.shape[1] >= 3:
-        m_prev_xz = jnp.floor(prev_xz + 0.5); m_curr_xz = jnp.floor(curr_xz + 0.5)
-        m_prev_yz = jnp.floor(prev_yz + 0.5); m_curr_yz = jnp.floor(curr_yz + 0.5)
-        m_xz = (m_curr_xz - m_prev_xz).astype(jnp.int32)
-        m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
-      else:
-        m_xz = m_yz = jnp.array(0, dtype=jnp.int32)
+    step_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
+    current_box = _current_box_from_reduced_shear(
+        box_of, dim, curr_xy, curr_xz, curr_yz)
 
-      curr_xy = curr_xy - m_curr_xy
-      if mobility_position.shape[1] >= 3:
-        curr_xz = curr_xz - m_curr_xz
-        curr_yz = curr_yz - m_curr_yz
-
-      if fractional_coordinates:
-        if mobility_position.shape[1] >= 3:
-          mxy = jnp.asarray(m_xy, mobility_position.dtype)
-          mxz = jnp.asarray(m_xz, mobility_position.dtype)
-          myz = jnp.asarray(m_yz, mobility_position.dtype)
-          def _apply_3d_remap(Rin):
-            add_x = mxy * Rin[:, 1] + (mxz + mxy * myz) * Rin[:, 2]
-            add_y = myz * Rin[:, 2]
-            Rout = Rin.at[:, 0].add(add_x).at[:, 1].add(add_y)
-            return jnp.mod(Rout, 1.0)
-          any_flip = jnp.not_equal(m_xy, 0) | jnp.not_equal(m_xz, 0) | jnp.not_equal(m_yz, 0)
-          mobility_position = lax.cond(any_flip, _apply_3d_remap, lambda Rin: Rin, mobility_position)
-        else:
-          mxy = jnp.asarray(m_xy, mobility_position.dtype)
-          def _apply_2d_remap(Rin):
-            Rout = Rin.at[:, 0].add(mxy * Rin[:, 1])
-            return jnp.mod(Rout, 1.0)
-          any_flip = jnp.not_equal(m_xy, 0)
-          mobility_position = lax.cond(any_flip, _apply_2d_remap, lambda Rin: Rin, mobility_position)
-    else:
-      curr_xy = f32(sf_xy(time + _dt))
-      if mobility_position.shape[1] >= 3:
-        curr_xz = f32(sf_xz(time + _dt))
-        curr_yz = f32(sf_yz(time + _dt))
-      else:
-        curr_xz = curr_yz = f32(0.0)
-
-    if mobility_position.shape[1] >= 3:
-      step_kwargs.update({'gamma_xy': curr_xy, 'gamma_xz': curr_xz, 'gamma_yz': curr_yz})
-    else:
-      step_kwargs['gamma'] = curr_xy
-
-    force = force_fn(mobility_position, **step_kwargs)
-
-    if mobility_position.shape[1] >= 3:
-      current_box = box_of(gamma={'xy': curr_xy, 'xz': curr_xz, 'yz': curr_yz})
-    else:
-      current_box = box_of(gamma=curr_xy)
-
-    apply_with_brownian = getattr(rpy_apply, 'with_brownian', None)
-    if apply_with_brownian is not None:
-      key, brownian_key = random.split(key)
-      velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
-          rpy_state,
-          mobility_position,
-          force,
-          brownian_key,
-          kT=_kT,
-          dt=_dt,
-          mr_iters=_mr_iters,
-          **step_kwargs,
-      )
-    else:
-      velocities, rpy_state = rpy_apply(rpy_state, mobility_position, force, **step_kwargs)
-      key, noise_key = random.split(key)
-      dB = hydro_rpy.brownian_increment(
-          noise_key, rpy_state, mobility_position, kT=_kT, dt=_dt, mr_iters=_mr_iters
-      )
+    force, velocities, dB, rpy_state, key = _rpy_force_and_increment(
+        force_fn=force_fn,
+        apply_with_brownian=apply_with_brownian,
+        rpy_state=rpy_state,
+        mobility_position=mobility_position,
+        key=key,
+        step_kwargs=step_kwargs,
+        kT=_kT,
+        dt=_dt,
+        mr_iters=_mr_iters,
+    )
     displacement = _dt * velocities + dB
     mobility_position = shift_fn(mobility_position, displacement, **step_kwargs)
     if fractional_coordinates:
@@ -2593,7 +2736,15 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
     # --- Shear-remap discontinuities (fractional positions only) ---
     if remap and fractional_coordinates:
-      remap_eps = f32(1e-12)
+      # Use a safe epsilon to stop simulation steps before the remap boundary.
+      # For float32, we need ~1e-5. For float64, 1e-9 is sufficient.
+      # We also cap it at 0.5*dt to prevent swallowing the whole step.
+      dt_type = jnp.result_type(dt)
+      if dt_type == jnp.float64:
+        remap_eps = jnp.array(1e-9, dtype=dt_type)
+      else:
+        remap_eps = jnp.array(1e-5, dtype=dt_type)
+      remap_eps = jnp.minimum(remap_eps, 0.5 * dt)
 
       def _remap_cross_time(g0, gdot, m_prev, m_step):
         # Crossing occurs when floor(g + 0.5) changes, i.e. at half-integers.
@@ -2624,6 +2775,44 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
     # --- Event-driven collision loop ---
     use_batched_disp = _batched_disp_3d if dim >= 3 else _batched_disp_2d
+
+    # Helper: build kwargs with explicit reduced gamma at a given sub-step time.
+    # This avoids the float32 precision bug where shear_rate * (large_time + offset)
+    # loses precision at large times, causing floor(gamma + 0.5) to land on the
+    # wrong side of a half-integer remap boundary.  By computing gamma from the
+    # start-of-step REDUCED value (magnitude < 1) + a small linear increment,
+    # float32 has ample precision to resolve the remap crossing.
+    def _make_gamma_kwargs(t_rel):
+      """Return kwargs dict with explicit gamma at sub-step time t_rel."""
+      kw = dict(step_kwargs)
+      kw.pop('gamma', None)
+      kw.pop('gamma_xy', None)
+      kw.pop('gamma_xz', None)
+      kw.pop('gamma_yz', None)
+      kw.pop('t', None)
+      g_xy = curr_xy + g_dot_xy * t_rel
+      if dim >= 3:
+        g_xz = curr_xz + g_dot_xz * t_rel
+        g_yz = curr_yz + g_dot_yz * t_rel
+        kw['gamma_xy'] = g_xy
+        kw['gamma_xz'] = g_xz
+        kw['gamma_yz'] = g_yz
+      else:
+        kw['gamma'] = g_xy
+      return kw
+
+    def _disp_at(Ra, Rb, t_rel):
+      """Displacement using explicit gamma at sub-step time."""
+      kw = _make_gamma_kwargs(t_rel)
+      if use_batched_disp:
+        return displacement_fn(Ra, Rb, **kw)
+      else:
+        return jax.vmap(lambda a, b: displacement_fn(a, b, **kw))(Ra, Rb)
+
+    def _disp_single_at(Ra, Rb, t_rel):
+      """Single-pair displacement using explicit gamma."""
+      kw = _make_gamma_kwargs(t_rel)
+      return displacement_fn(Ra, Rb, **kw)
 
     def _advance_no_collision(loop_init):
       def loop_cond(loop_state):
@@ -2679,14 +2868,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           if not fractional_coordinates:
             dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
 
-          kwargs_step = dict(step_kwargs)
-          kwargs_step.pop('gamma', None)
-          kwargs_step.pop('gamma_xy', None)
-          kwargs_step.pop('gamma_xz', None)
-          kwargs_step.pop('gamma_yz', None)
-          kwargs_step['t'] = time + t_curr + step
-
-          R_next = shift_fn(R_curr, dR_step, **kwargs_step)
+          kw_shift = _make_gamma_kwargs(t_curr + step)
+          R_next = shift_fn(R_curr, dR_step, **kw_shift)
 
           return (
               t_curr + step,
@@ -2787,17 +2970,16 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
         def _advance_to_next_event(_):
           dt_rem = dt - t_curr
-          abs_t = time + t_curr
 
           Ri = R_curr[i_idx]
           Rj = R_curr[j_idx]
           Vi = V_curr[i_idx]
           Vj = V_curr[j_idx]
 
-          if use_batched_disp:
-            dr = displacement_fn(Ri, Rj, t=abs_t)
-          else:
-            dr = jax.vmap(lambda a, b: displacement_fn(a, b, t=abs_t))(Ri, Rj)
+          # Use explicit gamma (from start-of-step reduced value + linear
+          # increment) instead of t to avoid float32 precision loss at large
+          # simulation times.  See _make_gamma_kwargs / _disp_at.
+          dr = _disp_at(Ri, Rj, t_curr)
 
           # Relative velocity includes both the peculiar velocity difference and the 
           # affine shear flow difference. Note: This assumes linear affine motion 
@@ -2834,14 +3016,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           if not fractional_coordinates:
             dR_step = dR_step + _affine_velocity(R_curr, g_dot_xy, g_dot_xz, g_dot_yz) * step
 
-          kwargs_step = dict(step_kwargs)
-          kwargs_step.pop('gamma', None)
-          kwargs_step.pop('gamma_xy', None)
-          kwargs_step.pop('gamma_xz', None)
-          kwargs_step.pop('gamma_yz', None)
-          kwargs_step['t'] = abs_t + step
-
-          R_next = shift_fn(R_curr, dR_step, **kwargs_step)
+          kw_shift = _make_gamma_kwargs(t_curr + step)
+          R_next = shift_fn(R_curr, dR_step, **kw_shift)
           t_next = t_curr + step
 
           is_coll = (min_t_rel <= dt_rem + time_tol) & (min_t_rel <= step + time_tol)
@@ -2855,8 +3031,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
             v_i = v_arr[ii]
             v_j = v_arr[jj]
 
-            t_coll = abs_t + step
-            dr = displacement_fn(p_i, p_j, t=t_coll)
+            dr = _disp_single_at(p_i, p_j, t_curr + step)
             dist = space.distance(dr)
             n = dr / (dist + f32(1e-7))
 
@@ -2874,8 +3049,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
             def _correct_positions(Rin):
               corr = f32(0.5) * overlap * n
-              Ri_new = shift_fn(Rin[ii], corr, **kwargs_step)
-              Rj_new = shift_fn(Rin[jj], -corr, **kwargs_step)
+              Ri_new = shift_fn(Rin[ii], corr, **kw_shift)
+              Rj_new = shift_fn(Rin[jj], -corr, **kw_shift)
               return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
 
             if compute_stress:
