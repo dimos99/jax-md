@@ -604,6 +604,18 @@ class NeighborListTest(test_util.JAXMDTestCase):
         self.assertTrue(jnp.any(jnp.abs(E_target) > 0.25))
         self.assertAllClose(E_target, E(R, neighbor=nbrs, box=cl * factor))
       else:
+        # TODO(partition): This assertion fails when the original box is already
+        # so small/skewed that nmin=1 (only 1 cell fits). When halved, nmin
+        # would be 0 but _fractional_cell_size clamps it to 1, so both boxes
+        # produce fcs=1.0 and the comparison new > cur is 1.0 > 1.0 = False.
+        # Fix options:
+        #   (a) propagate the pre-clamp nmin=0 signal in partition.py so the
+        #       comparison can still detect the degenerate shrink case, or
+        #   (b) move the assertion outside the loop so it only requires the flag
+        #       to be set on at least one iteration (9/10 iterations do set it).
+        # Confirmed pre-existing: comparison logic in partition.py unchanged
+        # since before the rpy branch (git log: fcc14d5, b8edc60, f2856d7,
+        # c301cb2, 28d7423 — none touched the cell_size_too_small comparison).
         self.assertTrue(jnp.any(nbrs.cell_size_too_small))
 
 
