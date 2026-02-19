@@ -17,4 +17,5 @@ examples/output/*
 *literature*
 *traj*
 etc/
-output
+output/
+*tmp*
