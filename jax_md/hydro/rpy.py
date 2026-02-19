@@ -780,44 +780,6 @@ def _sample_real_space_noise(
   )
 
 
-def _sample_wave_noise_from_state(
-    *,
-    key_wave: jax.Array,
-    wave_state: WaveSpaceState,
-    positions_frac: jnp.ndarray,
-    current_box: Optional[jnp.ndarray],
-    forces: Optional[jnp.ndarray],
-    wave_static: Optional[_WaveStaticFactors],
-    a: Optional[float],
-    xi: Optional[float],
-    eta: Optional[float],
-    missing_sampler_error: str = 'wave-space sampler missing from state; run init_fn first.',
-) -> jnp.ndarray:
-  if current_box is not None:
-    if wave_static is None or forces is None or a is None or xi is None or eta is None:
-      raise ValueError('Exact wave-space sampling requires wave_static, forces, a, xi, and eta.')
-    _, wave_noise = _apply_wave_exact(
-        static=wave_static,
-        current_box=current_box,
-        positions_frac=positions_frac,
-        forces=forces,
-        a=a,
-        xi=xi,
-        eta=eta,
-        key_wave=key_wave,
-    )
-    if wave_noise is None:
-      raise ValueError('Exact wave-space sampler unexpectedly returned None.')
-    return wave_noise
-
-  if wave_state.sqrt_fn is None:
-    raise ValueError(missing_sampler_error)
-  return wave_state.sqrt_fn(
-      key_wave,
-      positions_frac,
-  )
-
-
 def _combine_brownian_noise(
     *,
     real_noise: jnp.ndarray,
@@ -826,56 +788,6 @@ def _combine_brownian_noise(
     dt: float,
 ) -> jnp.ndarray:
   return jnp.sqrt(2.0 * kT * dt) * (real_noise + wave_noise)
-
-
-def _sample_brownian_components(
-    *,
-    brownian_key: jax.Array,
-    real_state: RealSpaceState,
-    wave_state: WaveSpaceState,
-    positions_frac: jnp.ndarray,
-    current_box: Optional[jnp.ndarray],
-    forces: jnp.ndarray,
-    state_preconditioner: Optional[Preconditioner],
-    mr_iters: int,
-    kT: float,
-    dt: float,
-    wave_static: _WaveStaticFactors,
-    a: float,
-    xi: float,
-    eta: float,
-) -> Tuple[jnp.ndarray, dict]:
-  key_real, key_wave = jax.random.split(brownian_key)
-  real_noise, rel_change, iters_used, converged = _sample_real_space_noise(
-      key_real=key_real,
-      real_state=real_state,
-      positions_frac=positions_frac,
-      state_preconditioner=state_preconditioner,
-      mr_iters=mr_iters,
-  )
-  wave_noise = _sample_wave_noise_from_state(
-      key_wave=key_wave,
-      wave_state=wave_state,
-      positions_frac=positions_frac,
-      current_box=current_box,
-      forces=forces,
-      wave_static=wave_static,
-      a=a,
-      xi=xi,
-      eta=eta,
-  )
-  noise = _combine_brownian_noise(
-      real_noise=real_noise,
-      wave_noise=wave_noise,
-      kT=kT,
-      dt=dt,
-  )
-  info = {
-      'real_solver_rel_change': rel_change,
-      'real_solver_iters': iters_used,
-      'real_solver_converged': converged,
-  }
-  return noise, info
 
 
 # -----------------------------------------------------------------------------
@@ -1083,7 +995,7 @@ def build_rpy_mobility(space_fns,
         theta=theta_,
         fractional_coordinates=True,
         attach_sqrt=include_brownian,
-        attach_fused=False,
+        attach_fused=include_brownian,
     )
 
   # -- init_fn: allocate neighbor list and wave-space arrays ---------------
@@ -1115,29 +1027,39 @@ def build_rpy_mobility(space_fns,
         preconditioner=precond,
     )
 
-  # -- Deterministic mobility: v = (M_r + M_w) · f -------------------------
-  def _apply_deterministic_components(
-      state: RpyState,
+  def _resolve_current_box(dim: int, combined_kwargs) -> Optional[jnp.ndarray]:
+    if has_box_fn:
+      return current_box_matrix(displacement_fn, box_fn, dim, **combined_kwargs)
+    return None
+
+  def _finalize_step(
+      *,
+      Ur: jnp.ndarray,
+      Uw: jnp.ndarray,
+      real_state: RealSpaceState,
+      wave_state: WaveSpaceState,
+      state_preconditioner: Optional[Preconditioner],
+  ) -> Tuple[jnp.ndarray, RpyState]:
+    velocities = Ur + Uw if real_space_first else Uw + Ur
+    next_state = _compose_next_state(
+        real_state=real_state,
+        wave_state=wave_state,
+        preconditioner=state_preconditioner,
+    )
+    return velocities, next_state
+
+  def _apply_wave_components(
+      *,
+      wave_state: WaveSpaceState,
       positions_frac: jnp.ndarray,
       forces: jnp.ndarray,
-      dim: int,
-      combined_kwargs,
-  ):
-    # Resolve the current box matrix (None for rigid boxes).
-    if has_box_fn:
-      current_box = current_box_matrix(displacement_fn, box_fn, dim, **combined_kwargs)
-    else:
-      current_box = None
-
-    # Real-space contribution via neighbor-list pairwise sum.
-    Ur, real_state = Mr_apply(state.real, positions_frac, forces, **combined_kwargs)
-
-    # Wave-space contribution via FFT spread/gather on the live box.
-    wave_state = state.wave
+      current_box: Optional[jnp.ndarray],
+      key_wave: Optional[jax.Array] = None,
+  ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], WaveSpaceState]:
+    # Exact live-box path: one call yields deterministic wave velocity and
+    # optional stochastic wave sample.
     if current_box is not None:
-      # In traced loops (lax.scan/fori_loop), avoid rebuilding WaveSpaceState objects.
-      # We evaluate the exact live-box wave operator with pure JAX arrays instead.
-      Uw, _ = _apply_wave_exact(
+      Uw, wave_noise = _apply_wave_exact(
           static=wave_static,
           current_box=current_box,
           positions_frac=positions_frac,
@@ -1145,53 +1067,35 @@ def build_rpy_mobility(space_fns,
           a=a,
           xi=xi,
           eta=eta,
+          key_wave=key_wave,
       )
       if not isinstance(current_box, jax_core.Tracer):
         wave_state = _build_wave_state_for_box(current_box)
-    else:
+      return Uw, wave_noise, wave_state
+
+    # Static-box deterministic-only path.
+    if key_wave is None:
       if wave_state.apply_fn is None:
         raise ValueError('wave-space operator missing from state; run init_fn first.')
-      Uw = wave_state.apply_fn(positions_frac, forces)
+      return wave_state.apply_fn(positions_frac, forces), None, wave_state
 
-    # Sum contributions and package updated state.
-    velocities = Ur + Uw if real_space_first else Uw + Ur
-    next_state = _compose_next_state(
-        real_state=real_state,
-        wave_state=wave_state,
-        preconditioner=state.preconditioner,
-    )
-    return velocities, next_state, current_box, real_state, wave_state
+    # Static-box stochastic path: prefer fused deterministic+stochastic wave call.
+    if wave_state.fused_fn is not None:
+      Uw, wave_noise = wave_state.fused_fn(
+          key_wave,
+          positions_frac,
+          forces,
+      )
+      return Uw, wave_noise, wave_state
 
-  # -- Stochastic sampling: √(2 kT dt) M^{1/2} z ---------------------------
-  def _apply_stochastic_components(
-      *,
-      brownian_key: jax.Array,
-      real_state: RealSpaceState,
-      wave_state: WaveSpaceState,
-      positions_frac: jnp.ndarray,
-      current_box: Optional[jnp.ndarray],
-      forces: jnp.ndarray,
-      state_preconditioner: Optional[Preconditioner],
-      mr_iters: int,
-      kT: float,
-      dt: float,
-  ):
-    return _sample_brownian_components(
-        brownian_key=brownian_key,
-        real_state=real_state,
-        wave_state=wave_state,
-        positions_frac=positions_frac,
-        current_box=current_box,
-        forces=forces,
-        state_preconditioner=state_preconditioner,
-        mr_iters=mr_iters,
-        kT=kT,
-        dt=dt,
-        wave_static=wave_static,
-        a=a,
-        xi=xi,
-        eta=eta,
-    )
+    # Defensive fallback when fused_fn is unavailable.
+    if wave_state.apply_fn is None:
+      raise ValueError('wave-space operator missing from state; run init_fn first.')
+    if wave_state.sqrt_fn is None:
+      raise ValueError('wave-space sampler missing from state; run init_fn first.')
+    Uw = wave_state.apply_fn(positions_frac, forces)
+    wave_noise = wave_state.sqrt_fn(key_wave, positions_frac)
+    return Uw, wave_noise, wave_state
 
   # -- apply_fn: deterministic + optional Brownian in one call -------------
   def apply_fn(state: RpyState,
@@ -1208,36 +1112,66 @@ def build_rpy_mobility(space_fns,
 
     dim = int(positions_frac.shape[1])
     combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
-    velocities, next_state, current_box, real_state, wave_state = _apply_deterministic_components(
-        state,
-        positions_frac,
-        forces,
-        dim,
-        combined_kwargs,
-    )
+    current_box = _resolve_current_box(dim, combined_kwargs)
+    Ur, real_state = Mr_apply(state.real, positions_frac, forces, **combined_kwargs)
 
     if brownian_key is None:
+      Uw, _, wave_state = _apply_wave_components(
+          wave_state=state.wave,
+          positions_frac=positions_frac,
+          forces=forces,
+          current_box=current_box,
+      )
+      velocities, next_state = _finalize_step(
+          Ur=Ur,
+          Uw=Uw,
+          real_state=real_state,
+          wave_state=wave_state,
+          state_preconditioner=state.preconditioner,
+      )
       return velocities, next_state
 
     if not include_brownian:
       raise ValueError('Brownian sampling was disabled; rebuild with include_brownian=True.')
-    if wave_state.sqrt_fn is None:
-      raise ValueError('wave-space sampler missing from state; run init_fn first.')
     if kT is None or dt is None:
       raise ValueError('kT and dt are required when requesting Brownian noise.')
 
-    noise, info = _apply_stochastic_components(
-        brownian_key=brownian_key,
+    key_real, key_wave = jax.random.split(brownian_key)
+    real_noise, rel_change, iters_used, converged = _sample_real_space_noise(
+        key_real=key_real,
         real_state=real_state,
-        wave_state=wave_state,
         positions_frac=positions_frac,
-        current_box=current_box,
-        forces=forces,
         state_preconditioner=state.preconditioner,
         mr_iters=mr_iters,
+    )
+    Uw, wave_noise, wave_state = _apply_wave_components(
+        wave_state=state.wave,
+        positions_frac=positions_frac,
+        forces=forces,
+        current_box=current_box,
+        key_wave=key_wave,
+    )
+    if wave_noise is None:
+      raise ValueError('Wave-space stochastic sampler returned None in Brownian mode.')
+
+    velocities, next_state = _finalize_step(
+        Ur=Ur,
+        Uw=Uw,
+        real_state=real_state,
+        wave_state=wave_state,
+        state_preconditioner=state.preconditioner,
+    )
+    noise = _combine_brownian_noise(
+        real_noise=real_noise,
+        wave_noise=wave_noise,
         kT=kT,
         dt=dt,
     )
+    info = {
+        'real_solver_rel_change': rel_change,
+        'real_solver_iters': iters_used,
+        'real_solver_converged': converged,
+    }
     return velocities, noise, next_state, info
 
   # -- Convenience wrapper: always returns Brownian components --------------
@@ -1298,18 +1232,9 @@ def brownian_increment(key: jax.Array,
       state_preconditioner=state.preconditioner,
       mr_iters=mr_iters,
   )
-  wave_sample_real = _sample_wave_noise_from_state(
-      key_wave=key_wave,
-      wave_state=state.wave,
-      positions_frac=positions_frac,
-      current_box=None,
-      forces=None,
-      wave_static=None,
-      a=None,
-      xi=None,
-      eta=None,
-      missing_sampler_error='wave-space sampler missing; rebuild with include_brownian=True.',
-  )
+  if state.wave.sqrt_fn is None:
+    raise ValueError('wave-space sampler missing; rebuild with include_brownian=True.')
+  wave_sample_real = state.wave.sqrt_fn(key_wave, positions_frac)
   return _combine_brownian_noise(
       real_noise=real_sample_real,
       wave_noise=wave_sample_real,
