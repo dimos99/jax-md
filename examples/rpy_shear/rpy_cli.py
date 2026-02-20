@@ -1,11 +1,38 @@
 """CLI parsing and static config for RPY shear."""
 
 import argparse
+from decimal import Decimal
+from decimal import InvalidOperation
 import math
 
 from rpy_console import get_console
 
 _CONSOLE = get_console()
+
+
+def _parse_int_like(value: str) -> int:
+  """Parses integer-like CLI values, including scientific notation (e.g. 6e6)."""
+  s = str(value).strip()
+  try:
+    return int(s, 10)
+  except ValueError:
+    pass
+  try:
+    d = Decimal(s)
+  except InvalidOperation as err:
+    raise argparse.ArgumentTypeError(
+      f'Expected integer value, got {value!r}.'
+    ) from err
+  if not d.is_finite():
+    raise argparse.ArgumentTypeError(
+      f'Expected finite integer value, got {value!r}.'
+    )
+  integral = d.to_integral_value()
+  if d != integral:
+    raise argparse.ArgumentTypeError(
+      f'Expected integer value, got {value!r}.'
+    )
+  return int(integral)
 
 
 def parse_args():
@@ -15,7 +42,7 @@ def parse_args():
   # Experiment-facing controls.
   parser.add_argument(
     '--n_particles',
-    type=int,
+    type=_parse_int_like,
     default=None,
     help='Particle count for random initialization mode (required without --init-traj).',
   )
@@ -34,25 +61,25 @@ def parse_args():
   )
   parser.add_argument('--xi', type=float, default=0.5,
                       help='RPY splitting parameter xi passed as xi_override.')
-  parser.add_argument('--n_steps', type=int, default=30000)
-  parser.add_argument('--thermalize_steps', type=int, default=0)
+  parser.add_argument('--n_steps', type=_parse_int_like, default=30000)
+  parser.add_argument('--thermalize_steps', type=_parse_int_like, default=0)
   parser.add_argument(
     '--buffer-steps',
-    type=int,
+    type=_parse_int_like,
     default=1000,
     help='Simulation chunk size in steps before returning to Python/output.',
   )
-  parser.add_argument('--n_runs', type=int, default=8)
+  parser.add_argument('--n_runs', type=_parse_int_like, default=8)
   parser.add_argument(
     '--runs_per_batch',
-    type=int,
+    type=_parse_int_like,
     default=None,
     help='How many runs to execute simultaneously; remaining runs execute sequentially.')
-  parser.add_argument('--stress_every', type=int, default=0,
+  parser.add_argument('--stress_every', type=_parse_int_like, default=0,
                       help='Set to 0 to disable stress calculation/output.')
-  parser.add_argument('--traj_every', type=int, default=100,
+  parser.add_argument('--traj_every', type=_parse_int_like, default=100,
                       help='Set to 0 to disable trajectory output.')
-  parser.add_argument('--progress_every', type=int, default=1000)
+  parser.add_argument('--progress_every', type=_parse_int_like, default=1000)
   parser.add_argument(
     '--mr-skin',
     '--mr-dr-threshold',
@@ -61,7 +88,7 @@ def parse_args():
     default=0.5,
     help='Real-space mobility neighbor-list skin (dr_threshold).',
   )
-  parser.add_argument('--seed', type=int, default=42)
+  parser.add_argument('--seed', type=_parse_int_like, default=42)
   parser.add_argument(
     '--out_dir',
     '--out',

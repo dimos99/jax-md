@@ -113,6 +113,9 @@ python examples/rpy_shear/rpy_shear.py \
 - `--traj_every 100` (`0` disables trajectory output)
 - `--stress_every 0` (`0` disables stress calculation/output)
 
+For integer-valued count/step flags, scientific notation is accepted as long as
+the value is still an integer (example: `--n_steps 6e6`).
+
 ## 9. Thermalization and outputs
 
 Thermalization (`--thermalize_steps`) always runs at equilibrium (`Pe=0`) and writes no production data.
