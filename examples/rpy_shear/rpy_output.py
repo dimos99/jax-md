@@ -1,0 +1,280 @@
+"""Output formatting/serialization and trajectory dumping utilities."""
+
+import os
+
+import numpy as np
+
+
+def _to_jsonable(x):
+  if isinstance(x, (str, int, float, bool)) or x is None:
+    return x
+  if isinstance(x, (np.floating, np.integer)):
+    return x.item()
+  if isinstance(x, np.ndarray):
+    return x.tolist()
+  try:
+    if hasattr(x, '__array__'):
+      return np.asarray(x).tolist()
+  except Exception:
+    pass
+  if isinstance(x, dict):
+    return {str(k): _to_jsonable(v) for k, v in x.items()}
+  if isinstance(x, (list, tuple)):
+    return [_to_jsonable(v) for v in x]
+  return str(x)
+
+def _serialize_rpy_parameter_estimate(estimate) -> dict:
+  """Converts an RpyParameterEstimate object into a JSON-safe dict."""
+  diagnostics = getattr(estimate, 'diagnostics', None)
+  diagnostics_dict = None
+  if diagnostics is not None:
+    diagnostics_dict = {
+      'sigma_min': float(diagnostics.sigma_min),
+      'lattice_extent': int(diagnostics.lattice_extent),
+      'L_mean': float(diagnostics.L_mean),
+      'L_max': float(diagnostics.L_max),
+      'eps_r_target': float(diagnostics.eps_r_target),
+      'eps_w_target': float(diagnostics.eps_w_target),
+      'eps_q_target': float(diagnostics.eps_q_target),
+      'eps_r_est': float(diagnostics.eps_r_est),
+      'eps_w_est': float(diagnostics.eps_w_est),
+      'eps_q_est': float(diagnostics.eps_q_est),
+      'quadrature_lambda_max': float(diagnostics.quadrature_lambda_max),
+      'quadrature_safety_nodes': int(diagnostics.quadrature_safety_nodes),
+      'shear_remap': bool(diagnostics.shear_remap),
+      'shear_schedule_provided': bool(diagnostics.shear_schedule_provided),
+      'N': int(diagnostics.N),
+      'phi': float(diagnostics.phi),
+      'd_f': float(diagnostics.d_f),
+      'n_iter': int(diagnostics.n_iter),
+    }
+
+  return {
+    'xi': float(estimate.xi),
+    'P': int(estimate.P),
+    'M': int(estimate.M),
+    'grid_shape': [int(x) for x in estimate.grid_shape],
+    'rcut': float(estimate.rcut),
+    'kcut': float(estimate.kcut),
+    'theta': float(estimate.theta),
+    'm': float(estimate.m),
+    'lattice_extent': int(estimate.lattice_extent),
+    'diagnostics': diagnostics_dict,
+  }
+
+def _run_label(run_id: int) -> str:
+  return f'{int(run_id):03d}'
+
+class RunDumper:
+  """Streams per-run stress and trajectory data to disk."""
+
+  def __init__(
+    self,
+    out_dir: str,
+    run_id: int,
+    box_size: float,
+    dim: int,
+    dt: float,
+    traj_every: int,
+    stress_every: int = 0,
+    box_fn=None,
+    base_box=None,
+    shear_rate: float = 0.0,
+    shear_remap: bool = True,
+    unwrap_trajectory: bool = True,
+  ):
+    label = _run_label(run_id)
+    self.box_size = float(box_size)
+    self.dim = int(dim)
+    self.dt = float(dt)
+    self.traj_every = int(traj_every)
+    self.stress_every = int(stress_every)
+    self.box_fn = box_fn
+    self.shear_rate = float(shear_rate)
+    self.shear_remap = bool(shear_remap)
+    self.unwrap_trajectory = bool(unwrap_trajectory)
+    self.prev_frac_unwrapped = None
+    self.base_box = None
+    if base_box is not None:
+      self.base_box = np.asarray(base_box, dtype=float)
+      if self.base_box.ndim == 1:
+        self.base_box = np.diag(self.base_box)
+    else:
+      # Default to t=0 box if not explicitly provided.
+      self.base_box = self._box_matrix_at_time(0.0)
+    self.stress_filename = os.path.join(out_dir, f'stress_{label}.dat')
+    self.traj_filename = os.path.join(out_dir, f'traj_{label}.dump')
+
+    if self.stress_every > 0:
+      self.stress_file = open(self.stress_filename, 'w')
+      if self.dim == 3:
+        stress_labels = ['sigma_xx', 'sigma_yy', 'sigma_zz', 'sigma_xy', 'sigma_xz', 'sigma_yz']
+      elif self.dim == 2:
+        stress_labels = ['sigma_xx', 'sigma_yy', 'sigma_xy']
+      else:
+        axes = ('x', 'y', 'z')[:self.dim]
+        stress_labels = [f'sigma_{a}{b}' for a in axes for b in axes]
+      self.stress_file.write('# time strain ' + ' '.join(stress_labels) + '\n')
+    else:
+      self.stress_file = None
+
+    if self.traj_every > 0:
+      self.traj_file = open(self.traj_filename, 'w')
+    else:
+      self.traj_file = None
+
+  def _box_matrix_at_time(self, t: float) -> np.ndarray:
+    if self.box_fn is None:
+      return np.eye(self.dim, dtype=float) * self.box_size
+    box = np.asarray(self.box_fn(t=t), dtype=float)
+    if box.ndim == 0:
+      return np.eye(self.dim, dtype=float) * float(box)
+    if box.ndim == 1:
+      return np.diag(box)
+    return box
+
+  def _estimate_shear_wrap_counts(self, t: float):
+    """Infer cumulative remap wrap counts from unwrapped strain gamma(t)."""
+    if not self.shear_remap:
+      return 0, 0, 0
+    gamma_xy = self.shear_rate * float(t)
+    n_xy = int(np.floor(gamma_xy + 0.5))
+    # This simulator only applies xy shear.
+    return n_xy, 0, 0
+
+  def _deremap_fractional(self, frac: np.ndarray, t: float) -> np.ndarray:
+    """Map remapped fractional coords back to unwrapped-lab fractional coords."""
+    out = np.asarray(frac, dtype=float).copy()
+    if not self.shear_remap or out.size == 0:
+      return out
+
+    n_xy, n_xz, n_yz = self._estimate_shear_wrap_counts(t)
+    if self.dim >= 3:
+      # Inverse of simulate._apply_fractional_shear_remap (3D):
+      #   y' = y + myz*z
+      #   x' = x + mxy*y + (mxz + mxy*myz)*z
+      # Solve for (x, y) using z unchanged. Note x depends on the *unremapped* y.
+      z_r = out[:, 2].copy()
+      y_r = out[:, 1].copy()
+      y_un = y_r - n_yz * z_r
+      x_un = out[:, 0] - n_xy * y_un - (n_xz + n_xy * n_yz) * z_r
+      out[:, 1] = y_un
+      out[:, 0] = x_un
+    elif self.dim == 2:
+      y_r = out[:, 1]
+      out[:, 0] = out[:, 0] - n_xy * y_r
+    return out
+
+  def _unwrapped_box_matrix_at_time(self, t: float) -> np.ndarray:
+    """Returns the continuously deformed triclinic box with gamma(t)=shear_rate*t."""
+    base = np.asarray(self.base_box, dtype=float)
+    box_t = np.array(base, copy=True)
+    if self.dim >= 2:
+      gamma_xy = self.shear_rate * float(t)
+      box_t[0, 1] = float(base[0, 1]) + float(gamma_xy) * float(base[1, 1])
+    return box_t
+
+  def _unwrap_fractional_continuously(self, frac: np.ndarray) -> np.ndarray:
+    """Unwrap fractional trajectory over time by nearest-image continuity."""
+    if not self.unwrap_trajectory:
+      return frac
+    if self.prev_frac_unwrapped is None:
+      self.prev_frac_unwrapped = np.asarray(frac, dtype=float).copy()
+      return self.prev_frac_unwrapped
+
+    diff = np.asarray(frac, dtype=float) - self.prev_frac_unwrapped
+    diff -= np.round(diff)
+    self.prev_frac_unwrapped = self.prev_frac_unwrapped + diff
+    return self.prev_frac_unwrapped
+
+  def dump(
+    self,
+    stress_times,
+    stress_strains,
+    stress,
+    traj_times=None,
+    traj_positions=None,
+  ):
+    def _ordered_stress_components(s):
+      s = np.asarray(s)
+      if self.dim == 3:
+        return np.array([s[0, 0], s[1, 1], s[2, 2], s[0, 1], s[0, 2], s[1, 2]])
+      if self.dim == 2:
+        return np.array([s[0, 0], s[1, 1], s[0, 1]])
+      return s.reshape(-1)
+
+    if (
+      self.stress_file is not None
+      and stress_times is not None
+      and stress_strains is not None
+      and stress is not None
+    ):
+      lines = []
+      for t, g, s in zip(stress_times, stress_strains, stress):
+        comps = _ordered_stress_components(s)
+        values = ' '.join(f'{val:.6e}' for val in comps)
+        lines.append(f'{t:.6e} {g:.6e} {values}\n')
+      if lines:
+        self.stress_file.writelines(lines)
+
+    if self.traj_file is None or traj_times is None or traj_positions is None:
+      return
+
+    traj_lines = []
+    for t, pos_frac in zip(traj_times, traj_positions):
+      timestep = int(round(float(t) / self.dt))
+      box_t = self._box_matrix_at_time(float(t))
+      pos_frac = np.asarray(pos_frac, dtype=float)
+      pos_frac = self._deremap_fractional(pos_frac, float(t))
+      pos_frac = self._unwrap_fractional_continuously(pos_frac)
+      traj_lines.append('ITEM: TIMESTEP\n')
+      traj_lines.append(f'{timestep}\n')
+      traj_lines.append('ITEM: NUMBER OF ATOMS\n')
+      traj_lines.append(f'{len(pos_frac)}\n')
+      if self.dim == 3:
+        lx = float(box_t[0, 0])
+        ly = float(box_t[1, 1])
+        lz = float(box_t[2, 2])
+        xy = float(box_t[0, 1])
+        xz = float(box_t[0, 2])
+        yz = float(box_t[1, 2])
+
+        # LAMMPS triclinic bounds format.
+        xlo = 0.0
+        xhi = lx
+        ylo = 0.0
+        yhi = ly
+        zlo = 0.0
+        zhi = lz
+        xlo_bound = xlo + min(0.0, xy, xz, xy + xz)
+        xhi_bound = xhi + max(0.0, xy, xz, xy + xz)
+        ylo_bound = ylo + min(0.0, yz)
+        yhi_bound = yhi + max(0.0, yz)
+        zlo_bound = zlo
+        zhi_bound = zhi
+
+        traj_lines.append('ITEM: BOX BOUNDS xy xz yz pp pp pp\n')
+        traj_lines.append(f'{xlo_bound:.6e} {xhi_bound:.6e} {xy:.6e}\n')
+        traj_lines.append(f'{ylo_bound:.6e} {yhi_bound:.6e} {xz:.6e}\n')
+        traj_lines.append(f'{zlo_bound:.6e} {zhi_bound:.6e} {yz:.6e}\n')
+      else:
+        traj_lines.append('ITEM: BOX BOUNDS pp pp pp\n')
+        traj_lines.append(f'0 {self.box_size:.6e}\n')
+        traj_lines.append(f'0 {self.box_size:.6e}\n')
+        traj_lines.append('0 1.000000e+00\n')
+      traj_lines.append('ITEM: ATOMS id x y z\n')
+      unwrapped_box_t = self._unwrapped_box_matrix_at_time(float(t))
+      for i, p in enumerate(pos_frac):
+        p_real = np.asarray(unwrapped_box_t @ np.asarray(p), dtype=float)
+        if self.dim == 2:
+          traj_lines.append(f'{i} {p_real[0]:.6e} {p_real[1]:.6e} 0.0\n')
+        else:
+          traj_lines.append(f'{i} {p_real[0]:.6e} {p_real[1]:.6e} {p_real[2]:.6e}\n')
+    if traj_lines:
+      self.traj_file.writelines(traj_lines)
+
+  def close(self):
+    if self.stress_file is not None:
+      self.stress_file.close()
+    if self.traj_file is not None:
+      self.traj_file.close()
