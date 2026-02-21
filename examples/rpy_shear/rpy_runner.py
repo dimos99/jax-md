@@ -5,6 +5,7 @@ RPY shear runner with pluggable pair-interaction potentials.
 import json
 import math
 import os
+import shutil
 
 import jax
 import jax.numpy as jnp
@@ -24,12 +25,14 @@ from rpy_cli import parse_args
 from rpy_console import get_console
 from rpy_init import _box_size_from_phi
 from rpy_init import _build_reduced_xy_box_fn
+from rpy_init import _load_initial_state_from_data
 from rpy_init import _load_initial_state_from_dump
 from rpy_init import _min_pair_distance
 from rpy_init import _relax_positions
 from rpy_output import RunDumper
 from rpy_output import _serialize_rpy_parameter_estimate
 from rpy_output import _to_jsonable
+from rpy_output import write_lammps_data
 from rpy_potential import _resolve_potential
 
 _CONSOLE = get_console()
@@ -363,8 +366,32 @@ def main():
   dim = 3
   diameter = 2.0 * a
   init_mode = 'random_relax'
+  data_info = None
   dump_info = None
-  if args.init_traj is not None:
+  if args.init_data is not None:
+    init_mode = 'data'
+    data_info = _load_initial_state_from_data(
+      args.init_data,
+      dim=dim,
+      radius=a,
+    )
+    n_particles = int(data_info['n_particles'])
+    phi = float(data_info['phi'])
+    if n_particles <= 1:
+      raise ValueError(f'Data-derived n_particles must be > 1, got {n_particles}.')
+    if not math.isfinite(phi) or phi <= 0.0:
+      raise ValueError(f'Data-derived phi must be finite and > 0, got {phi}.')
+    if phi > 0.74:
+      _CONSOLE.warn(
+        f'data-derived phi={phi:.6g} exceeds hard-sphere close packing '
+        '(~0.74). This can lead to severe overlaps and NaNs in the RPY mobility.'
+      )
+    base_box = jnp.asarray(data_info['box_matrix'])
+    _CONSOLE.info(
+      f'Loaded initialization from data {args.init_data}: '
+      f'n_particles={n_particles}, atom_style={data_info.get("atom_style", "") or "unspecified"}'
+    )
+  elif args.init_traj is not None:
     init_mode = 'dump'
     dump_info = _load_initial_state_from_dump(
       args.init_traj,
@@ -451,9 +478,10 @@ def main():
   # Build the initial particle configuration in fractional coordinates.
   key = random.PRNGKey(args.seed)
   key, init_key, thermalize_key, run_key = random.split(key, 4)
-  if init_mode == 'dump':
+  if init_mode in ('dump', 'data'):
+    init_info = dump_info if init_mode == 'dump' else data_info
     R0 = jnp.asarray(
-      dump_info['positions_fractional'],
+      init_info['positions_fractional'],
       dtype=base_box.dtype,
     )
   else:
@@ -744,6 +772,11 @@ def main():
 
   out_dir = args.out_dir
   os.makedirs(out_dir, exist_ok=True)
+  confin_path = None
+  if args.init_data is not None:
+    confin_path = os.path.join(out_dir, 'confin.data')
+    shutil.copyfile(args.init_data, confin_path)
+    _CONSOLE.info(f'Copied init data file to {confin_path}')
 
   # Persist full runtime configuration once before launching trajectories.
   params = {
@@ -765,6 +798,7 @@ def main():
       'seed': args.seed,
       'out_dir': args.out_dir,
       'init_traj': args.init_traj,
+      'init_data': args.init_data,
       'potential': args.potential,
     },
     'internal': {
@@ -808,6 +842,11 @@ def main():
       'dump_truncated_tail': (
         bool(dump_info['truncated_tail']) if dump_info is not None else None
       ),
+      'data_source_path': args.init_data,
+      'data_atom_style': (
+        str(data_info.get('atom_style', '')) if data_info is not None else None
+      ),
+      'confin_path': confin_path,
       'planned_steps': planned_steps,
       'buffer_steps': buffer_steps,
       'thermalize_chunk_steps': thermalize_chunk_steps,
@@ -882,9 +921,16 @@ def main():
       f'Dump initialization enabled: starting a fresh run from step 0 '
       f'with positions loaded from {args.init_traj}.'
     )
+  elif init_mode == 'data':
+    _CONSOLE.info(
+      f'Data initialization enabled: starting a fresh run from step 0 '
+      f'with positions loaded from {args.init_data}.'
+    )
 
   # Execute runs batch-wise; each batch thermalizes (optional) then produces data.
   target_step = int(args.n_steps)
+  final_positions_frac = [None] * args.n_runs
+  final_times = [None] * args.n_runs
   try:
     for batch_idx, batch_start in enumerate(range(0, args.n_runs, runs_per_batch), start=1):
       batch_end = min(batch_start + runs_per_batch, args.n_runs)
@@ -1066,6 +1112,36 @@ def main():
             f'Batch {batch_idx}/{n_batches} step '
             f'{min(steps_done, planned_steps)}/{planned_steps}'
           )
+
+      batch_final_pos = np.asarray(state.mobility_position, dtype=float)
+      batch_final_time = np.asarray(state.time, dtype=float)
+      for local_i, run_id in enumerate(batch_ids):
+        final_positions_frac[run_id] = np.mod(batch_final_pos[local_i], 1.0)
+        final_times[run_id] = float(batch_final_time[local_i])
+
+    for run_id in range(args.n_runs):
+      if final_positions_frac[run_id] is None or final_times[run_id] is None:
+        raise RuntimeError(f'Missing final state for run {run_id}.')
+
+      final_box = np.asarray(dump_box_fn(t=final_times[run_id]), dtype=float)
+      pos_frac = np.asarray(final_positions_frac[run_id], dtype=float)
+      pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
+
+      confout_path = os.path.join(out_dir, f'confout_{run_id:03d}.data')
+      write_lammps_data(
+        confout_path,
+        final_box,
+        pos_real,
+        comment=(
+          'Generated by examples/rpy_shear/rpy_shear.py '
+          f'(run={run_id:03d}, step={int(round(final_times[run_id] / dt))})'
+        ),
+      )
+
+    confout_000 = os.path.join(out_dir, 'confout_000.data')
+    confout_single = os.path.join(out_dir, 'confout.data')
+    shutil.copyfile(confout_000, confout_single)
+    _CONSOLE.info(f'Wrote final data snapshots confout_XXX.data and {confout_single}')
   finally:
     for dumper in dumpers:
       dumper.close()

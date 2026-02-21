@@ -51,6 +51,11 @@ Choose exactly one:
 - do not pass `--n_particles` or `--phi`
 - `n_particles`, `phi`, and box are derived from dump
 - run starts at fresh `t=0`, `step=0`
+3. LAMMPS data mode:
+- provide `--init-data path/to/confin.data`
+- do not pass `--n_particles` or `--phi`
+- `n_particles`, `phi`, and box are derived from the data file
+- run starts at fresh `t=0`, `step=0`
 
 ## 5. Potential module contract
 
@@ -99,6 +104,16 @@ python examples/rpy_shear/rpy_shear.py \
   --init-traj examples/out/rpy_random/traj_000.dump
 ```
 
+LAMMPS data initialization:
+
+```bash
+python examples/rpy_shear/rpy_shear.py \
+  --potential examples/rpy_shear/potentials/ao_wca.py \
+  --dt 2e-5 \
+  --out_dir examples/out/rpy_from_data \
+  --init-data examples/out/rpy_from_data/confin.data
+```
+
 ## 8. Important optional controls (defaults)
 
 - `--peclet 0.0`
@@ -126,6 +141,9 @@ Production files in `--out_dir` (depending on settings):
 - `params.json`
 - `stress_XXX.dat` (only if `--stress_every > 0`)
 - `traj_XXX.dump` (only if `--traj_every > 0`)
+- `confin.data` (only when `--init-data` is used; exact copy of input)
+- `confout_XXX.data` (always; final frame for each run)
+- `confout.data` (always; copy of `confout_000.data`)
 
 ## 10. Common errors
 
@@ -133,6 +151,7 @@ Production files in `--out_dir` (depending on settings):
 - `--dt is required`
 - `--out_dir is required`
 - `Random initialization mode requires both --n_particles and --phi`
-- `When --init-traj is provided, do not pass --n_particles or --phi`
+- `--init-traj and --init-data cannot be used together`
+- `When --init-traj or --init-data is provided, do not pass --n_particles or --phi`
 - `potential module must define POTENTIAL_PARAMS`
 - `potential module must define POTENTIAL_NEIGHBOR_PARAMS`

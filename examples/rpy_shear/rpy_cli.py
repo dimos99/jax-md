@@ -44,13 +44,13 @@ def parse_args():
     '--n_particles',
     type=_parse_int_like,
     default=None,
-    help='Particle count for random initialization mode (required without --init-traj).',
+    help='Particle count for random initialization mode (required without --init-traj/--init-data).',
   )
   parser.add_argument(
     '--phi',
     type=float,
     default=None,
-    help='Packing fraction for random initialization mode (required without --init-traj).',
+    help='Packing fraction for random initialization mode (required without --init-traj/--init-data).',
   )
   parser.add_argument('--peclet', type=float, default=0.0)
   parser.add_argument(
@@ -104,6 +104,12 @@ def parse_args():
     help='Optional LAMMPS dump file; initialize from its last complete frame.',
   )
   parser.add_argument(
+    '--init-data',
+    type=str,
+    default=None,
+    help='Optional LAMMPS data file; initialize from its Atoms section.',
+  )
+  parser.add_argument(
     '--potential',
     type=str,
     default=None,
@@ -141,11 +147,13 @@ def parse_args():
     raise ValueError('progress_every must be >= 0.')
   if args.mr_skin < 0.0:
     raise ValueError('mr_skin must be >= 0.')
-  if args.init_traj is not None:
+  if args.init_traj is not None and args.init_data is not None:
+    raise ValueError('--init-traj and --init-data cannot be used together.')
+  if args.init_traj is not None or args.init_data is not None:
     if args.n_particles is not None or args.phi is not None:
       raise ValueError(
-        'When --init-traj is provided, do not pass --n_particles or --phi. '
-        'These are derived from the dump file.'
+        'When --init-traj or --init-data is provided, do not pass '
+        '--n_particles or --phi. These are derived from the input file.'
       )
     return args
   if args.n_particles is None or args.phi is None:
