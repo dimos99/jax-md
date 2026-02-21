@@ -141,7 +141,8 @@ Production files in `--out_dir` (depending on settings):
 - `params.json`
 - `stress_XXX.dat` (only if `--stress_every > 0`)
 - `traj_XXX.dump` (only if `--traj_every > 0`)
-- `confin.data` (only when `--init-data` is used; exact copy of input)
+- `confin.data` (always; start-of-run configuration)
+- for `--init-data`, `confin.data` is an exact copy of input
 - `confout_XXX.data` (always; final frame for each run)
 - `confout.data` (always; copy of `confout_000.data`)
 
