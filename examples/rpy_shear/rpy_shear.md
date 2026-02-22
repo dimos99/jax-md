@@ -78,6 +78,7 @@ Available in:
 
 - `examples/rpy_shear/potentials/ao_wca.py`
 - `examples/rpy_shear/potentials/high_exp_lj.py`
+- `examples/rpy_shear/potentials/varga_ao_rpy_overlap.py`
 
 You can copy one and edit it, or pass either directly via `--potential`.
 
@@ -145,6 +146,7 @@ Production files in `--out_dir` (depending on settings):
 - for `--init-data`, `confin.data` is an exact copy of input
 - `confout_XXX.data` (always; final frame for each run)
 - `confout.data` (always; copy of `confout_000.data`)
+- `confout*` step metadata is written from exact integer step counters
 
 ## 10. Common errors
 
