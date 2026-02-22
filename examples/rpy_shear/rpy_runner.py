@@ -131,9 +131,30 @@ def _stack_neighbor_lists(neighbors):
   return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *aligned)
 
 
-def _predict_xy_remapped_positions_for_next_force(state, dt: float, shear_rate: float):
-  gamma_prev = shear_rate * state.time
-  gamma_next = shear_rate * (state.time + dt)
+def _time_from_step(step, *, dt: float, t0: float, dtype):
+  step_arr = jnp.asarray(step, dtype=jnp.int32)
+  dt_arr = jnp.asarray(dt, dtype=dtype)
+  t0_arr = jnp.asarray(t0, dtype=dtype)
+  return t0_arr + step_arr.astype(dtype) * dt_arr
+
+
+def _state_time_from_step(state, *, dt: float, t0: float):
+  return _time_from_step(state.step, dt=dt, t0=t0, dtype=state.time.dtype)
+
+
+def _state_next_time_from_step(state, *, dt: float, t0: float):
+  next_step = jnp.asarray(state.step, dtype=jnp.int32) + jnp.int32(1)
+  return _time_from_step(next_step, dt=dt, t0=t0, dtype=state.time.dtype)
+
+
+def _predict_xy_remapped_positions_for_next_force(
+  state,
+  dt: float,
+  shear_rate: float,
+  t0: float,
+):
+  gamma_prev = shear_rate * _state_time_from_step(state, dt=dt, t0=t0)
+  gamma_next = shear_rate * _state_next_time_from_step(state, dt=dt, t0=t0)
   m_prev = jnp.floor(gamma_prev + 0.5)
   m_next = jnp.floor(gamma_next + 0.5)
   dm = (m_next - m_prev).astype(jnp.int32)
@@ -428,6 +449,7 @@ def main():
 
   D0 = kT / (6.0 * math.pi * viscosity * a)
   shear_rate = 2.0 * args.peclet * D0 / (a ** 2)
+  shear_t0 = 0.0
   shear_schedule = {'xy': lambda t: shear_rate * t}
   shear_vector_schedule = lambda t: (shear_rate * t, 0.0, 0.0)
 
@@ -451,6 +473,10 @@ def main():
     interaction_neighbor_defaults['capacity_multiplier'])
   pair_potential_fn = potential_cfg['pair_fn']
   potential_params = dict(potential_cfg['params'])
+  # Keep overlap-repulsion timestep consistent with the integrator timestep.
+  # If the selected potential exposes `repulsion_dt`, bind it to --dt.
+  if 'repulsion_dt' in potential_params:
+    potential_params['repulsion_dt'] = float(dt)
   potential_r_cut = float(potential_cfg['r_cut'])
   potential_name = str(potential_cfg['name'])
   potential_source = str(potential_cfg['source'])
@@ -599,6 +625,7 @@ def main():
     xi=xi,
     eta=viscosity,
     shear_vector_schedule=shear_vector_schedule,
+    t0=shear_t0,
     neighbor_format=format_map[mr_neighbor_format],
     dr_threshold=mr_dr_threshold,
     capacity_multiplier=mr_capacity_multiplier,
@@ -671,13 +698,11 @@ def main():
       f'{sample_period}.'
     )
   if args.n_steps % buffer_steps != 0:
-    planned_steps = ((args.n_steps // buffer_steps) + 1) * buffer_steps
     _CONSOLE.warn(
       f'n_steps={args.n_steps} is not a multiple of buffer_steps={buffer_steps}. '
-      f'Running {planned_steps} steps.'
+      f'Running a final tail chunk to end exactly at n_steps.'
     )
-  else:
-    planned_steps = args.n_steps
+  planned_steps = args.n_steps
 
   thermalize_chunk_steps = buffer_steps
   if args.thermalize_steps > 0:
@@ -693,9 +718,10 @@ def main():
 
     def _inner(_, inner_carry):
       s, pn = inner_carry
-      next_box = box_of(t=s.time + dt)
+      next_time = _state_next_time_from_step(s, dt=dt, t0=shear_t0)
+      next_box = box_of(t=next_time)
       pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-        s, dt=dt, shear_rate=shear_rate)
+        s, dt=dt, shear_rate=shear_rate, t0=shear_t0)
       pn = pn.update(pos_for_neighbor, box=next_box)
       s = apply_fn(s, interaction_neighbor=pn)
       return s, pn
@@ -703,7 +729,8 @@ def main():
     if not do_stress and not do_traj:
       state_out, interaction_neighbor_out = lax.fori_loop(
         0, buffer_steps, _inner, (state_in, interaction_neighbor_in))
-      curr_box = box_of(t=state_out.time)
+      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
       interaction_neighbor_out = interaction_neighbor_out.update(
         state_out.mobility_position, box=curr_box)
       return (state_out, interaction_neighbor_out), ()
@@ -713,7 +740,8 @@ def main():
 
       state, interaction_neighbor = lax.fori_loop(
         0, steps_per_scan, _inner, (state, interaction_neighbor))
-      curr_box = box_of(t=state.time)
+      curr_time = _state_time_from_step(state, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
       interaction_neighbor = interaction_neighbor.update(state.mobility_position, box=curr_box)
       if do_stress:
         stress = stress_fn(
@@ -722,13 +750,14 @@ def main():
           neighbor=interaction_neighbor,
           fractional_coordinates=True,
         )
-        strain = shear_rate * state.time
+        strain = shear_rate * curr_time
+        step = state.step.astype(jnp.int32)
         if do_traj:
-          out = (state.time, strain, stress, state.mobility_position)
+          out = (step, strain, stress, state.mobility_position)
         else:
-          out = (state.time, strain, stress)
+          out = (step, strain, stress)
       else:
-        out = (state.time, state.mobility_position)
+        out = (state.step.astype(jnp.int32), state.mobility_position)
       return (state, interaction_neighbor), out
 
     (state_out, interaction_neighbor_out), scan_out = lax.scan(
@@ -739,28 +768,61 @@ def main():
     )
 
     if do_stress and do_traj:
-      times, strains, stresses, positions = scan_out
-      stress_times = times[::stress_stride]
+      steps, strains, stresses, positions = scan_out
+      stress_steps = steps[::stress_stride]
       stress_strains = strains[::stress_stride]
       stress_out = stresses[::stress_stride]
-      traj_times = times[::traj_stride]
+      traj_steps = steps[::traj_stride]
       traj_positions = positions[::traj_stride]
       return (
         (state_out, interaction_neighbor_out),
-        (stress_times, stress_strains, stress_out, traj_times, traj_positions),
+        (stress_steps, stress_strains, stress_out, traj_steps, traj_positions),
       )
     if do_stress:
-      times, strains, stresses = scan_out
-      stress_times = times[::stress_stride]
+      steps, strains, stresses = scan_out
+      stress_steps = steps[::stress_stride]
       stress_strains = strains[::stress_stride]
       stress_out = stresses[::stress_stride]
-      return (state_out, interaction_neighbor_out), (stress_times, stress_strains, stress_out)
-    times, positions = scan_out
-    traj_times = times[::traj_stride]
+      return (state_out, interaction_neighbor_out), (stress_steps, stress_strains, stress_out)
+    steps, positions = scan_out
+    traj_steps = steps[::traj_stride]
     traj_positions = positions[::traj_stride]
-    return (state_out, interaction_neighbor_out), (traj_times, traj_positions)
+    return (state_out, interaction_neighbor_out), (traj_steps, traj_positions)
 
   run_chunk = jax.jit(jax.vmap(_run_chunk_single))
+
+  @jax.jit
+  @jax.vmap
+  def run_one_step(state_in, interaction_neighbor_in):
+    next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
+    next_box = box_of(t=next_time)
+    pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
+      state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+    interaction_neighbor_out = interaction_neighbor_in.update(
+      pos_for_neighbor, box=next_box)
+    state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
+    curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
+    curr_box = box_of(t=curr_time)
+    interaction_neighbor_out = interaction_neighbor_out.update(
+      state_out.mobility_position, box=curr_box)
+    return state_out, interaction_neighbor_out
+
+  evaluate_stress = None
+  if do_stress:
+    @jax.jit
+    @jax.vmap
+    def evaluate_stress(state_in, interaction_neighbor_in):
+      curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
+      stress = stress_fn(
+        state_in.mobility_position,
+        box=curr_box,
+        neighbor=interaction_neighbor_in,
+        fractional_coordinates=True,
+      )
+      strain = shear_rate * curr_time
+      return state_in.step.astype(jnp.int32), curr_time, strain, stress
+
   thermalize_runner_cache = {}
 
   def _get_thermalize_runner(step_count: int):
@@ -942,7 +1004,7 @@ def main():
   # Execute runs batch-wise; each batch thermalizes (optional) then produces data.
   target_step = int(args.n_steps)
   final_positions_frac = [None] * args.n_runs
-  final_times = [None] * args.n_runs
+  final_steps = [None] * args.n_runs
   try:
     for batch_idx, batch_start in enumerate(range(0, args.n_runs, runs_per_batch), start=1):
       batch_end = min(batch_start + runs_per_batch, args.n_runs)
@@ -1010,7 +1072,7 @@ def main():
         for local_i, run_id in enumerate(batch_ids)
       ]
       state = _stack_states(state_list)
-      box_t0 = box_of(t=0.0)
+      box_t0 = box_of(t=shear_t0)
       interaction_neighbor = _stack_neighbor_lists([
         interaction_neighbor_fn.allocate(s.mobility_position, box=box_t0)
         for s in state_list
@@ -1026,7 +1088,7 @@ def main():
 
       # Write the initial configuration (t=0) before the loop
       # so the trajectory file always starts from the very first frame.
-      t0 = float(state_list[0].time)
+      t0 = float(shear_t0)
       for local_i, run_id in enumerate(batch_ids):
         dumper = dumpers[run_id]
         pos0 = np.asarray(positions_init[local_i], dtype=float)
@@ -1040,32 +1102,32 @@ def main():
           )
 
       steps_done = 0
-      while steps_done < planned_steps:
+      while steps_done + buffer_steps <= planned_steps:
         if do_stress and do_traj:
           (state, interaction_neighbor), (
-            stress_times,
+            stress_steps,
             stress_strains,
             stresses,
-            traj_times,
+            traj_steps,
             traj_positions,
           ) = run_chunk((state, interaction_neighbor))
         elif do_stress:
-          (state, interaction_neighbor), (stress_times, stress_strains, stresses) = run_chunk(
+          (state, interaction_neighbor), (stress_steps, stress_strains, stresses) = run_chunk(
             (state, interaction_neighbor))
-          traj_times = None
+          traj_steps = None
           traj_positions = None
         elif do_traj:
-          (state, interaction_neighbor), (traj_times, traj_positions) = run_chunk(
+          (state, interaction_neighbor), (traj_steps, traj_positions) = run_chunk(
             (state, interaction_neighbor))
-          stress_times = None
+          stress_steps = None
           stress_strains = None
           stresses = None
         else:
           (state, interaction_neighbor), _ = run_chunk((state, interaction_neighbor))
-          stress_times = None
+          stress_steps = None
           stress_strains = None
           stresses = None
-          traj_times = None
+          traj_steps = None
           traj_positions = None
 
         if not _check_nan_positions(state, f'shear step {steps_done + buffer_steps}'):
@@ -1080,10 +1142,10 @@ def main():
         ):
           return
 
-        stress_times_np = np.asarray(stress_times) if do_stress else None
+        stress_steps_np = np.asarray(stress_steps, dtype=np.int64) if do_stress else None
         stress_strains_np = np.asarray(stress_strains) if do_stress else None
         stresses_np = np.asarray(stresses) if do_stress else None
-        traj_times_np = np.asarray(traj_times) if do_traj else None
+        traj_steps_np = np.asarray(traj_steps, dtype=np.int64) if do_traj else None
         traj_positions_np = np.asarray(traj_positions) if do_traj else None
 
         if do_stress or do_traj:
@@ -1091,9 +1153,9 @@ def main():
             dumper = dumpers[run_id]
 
             if do_stress:
-              stress_steps = np.rint(stress_times_np[local_i] / dt).astype(np.int64)
-              stress_mask = stress_steps <= target_step
-              out_stress_times = stress_times_np[local_i][stress_mask]
+              stress_mask = stress_steps_np[local_i] <= target_step
+              out_stress_steps = stress_steps_np[local_i][stress_mask]
+              out_stress_times = out_stress_steps.astype(float) * dt + float(shear_t0)
               out_stress_strains = stress_strains_np[local_i][stress_mask]
               out_stresses = stresses_np[local_i][stress_mask]
             else:
@@ -1102,9 +1164,9 @@ def main():
               out_stresses = None
 
             if do_traj:
-              traj_steps = np.rint(traj_times_np[local_i] / dt).astype(np.int64)
-              traj_mask = traj_steps <= target_step
-              out_traj_times = traj_times_np[local_i][traj_mask]
+              traj_mask = traj_steps_np[local_i] <= target_step
+              out_traj_steps = traj_steps_np[local_i][traj_mask]
+              out_traj_times = out_traj_steps.astype(float) * dt + float(shear_t0)
               out_traj_positions = traj_positions_np[local_i][traj_mask]
             else:
               out_traj_times = None
@@ -1125,17 +1187,93 @@ def main():
             f'{min(steps_done, planned_steps)}/{planned_steps}'
           )
 
+      tail_steps = planned_steps - steps_done
+      while tail_steps > 0:
+        state, interaction_neighbor = run_one_step(state, interaction_neighbor)
+        steps_done += 1
+        tail_steps -= 1
+
+        if not _check_nan_positions(state, f'shear step {steps_done}'):
+          return
+        if not _check_neighbor_status(
+          state, f'shear step {steps_done}', run_offset=batch_start):
+          return
+        if not _check_interaction_neighbor_status(
+          interaction_neighbor,
+          f'shear step {steps_done}',
+          run_offset=batch_start,
+        ):
+          return
+
+        emit_stress = do_stress and (steps_done % args.stress_every == 0)
+        emit_traj = do_traj and (steps_done % args.traj_every == 0)
+        if emit_stress:
+          stress_steps, stress_times, stress_strains, stresses = evaluate_stress(
+            state, interaction_neighbor)
+          stress_steps_np = np.asarray(stress_steps, dtype=np.int64)
+          stress_times_np = np.asarray(stress_times)
+          stress_strains_np = np.asarray(stress_strains)
+          stresses_np = np.asarray(stresses)
+        else:
+          stress_steps_np = None
+          stress_times_np = None
+          stress_strains_np = None
+          stresses_np = None
+
+        if emit_stress or emit_traj:
+          traj_steps_np = np.asarray(state.step, dtype=np.int64) if emit_traj else None
+          traj_times_np = (
+            traj_steps_np.astype(float) * dt + float(shear_t0)
+            if emit_traj else None
+          )
+          traj_positions_np = np.asarray(state.mobility_position) if emit_traj else None
+          for local_i, run_id in enumerate(batch_ids):
+            dumper = dumpers[run_id]
+            if emit_stress:
+              # Use step-derived times for deterministic frame metadata.
+              out_stress_times = np.array(
+                [stress_steps_np[local_i] * dt + float(shear_t0)], dtype=float)
+              out_stress_strains = np.array([stress_strains_np[local_i]], dtype=float)
+              out_stresses = stresses_np[local_i][np.newaxis]
+            else:
+              out_stress_times = None
+              out_stress_strains = None
+              out_stresses = None
+
+            if emit_traj:
+              out_traj_times = np.array([traj_times_np[local_i]], dtype=float)
+              out_traj_positions = traj_positions_np[local_i][np.newaxis]
+            else:
+              out_traj_times = None
+              out_traj_positions = None
+
+            dumper.dump(
+              out_stress_times,
+              out_stress_strains,
+              out_stresses,
+              out_traj_times,
+              out_traj_positions,
+            )
+
+        if args.progress_every > 0 and (steps_done % args.progress_every == 0):
+          _CONSOLE.progress(
+            f'Batch {batch_idx}/{n_batches} step '
+            f'{min(steps_done, planned_steps)}/{planned_steps}'
+          )
+
       batch_final_pos = np.asarray(state.mobility_position, dtype=float)
-      batch_final_time = np.asarray(state.time, dtype=float)
+      batch_final_step = np.asarray(state.step, dtype=np.int64)
       for local_i, run_id in enumerate(batch_ids):
         final_positions_frac[run_id] = np.mod(batch_final_pos[local_i], 1.0)
-        final_times[run_id] = float(batch_final_time[local_i])
+        final_steps[run_id] = int(batch_final_step[local_i])
 
     for run_id in range(args.n_runs):
-      if final_positions_frac[run_id] is None or final_times[run_id] is None:
+      if final_positions_frac[run_id] is None or final_steps[run_id] is None:
         raise RuntimeError(f'Missing final state for run {run_id}.')
 
-      final_box = np.asarray(dump_box_fn(t=final_times[run_id]), dtype=float)
+      final_step = int(final_steps[run_id])
+      final_time = float(final_step * dt + shear_t0)
+      final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
       pos_frac = np.asarray(final_positions_frac[run_id], dtype=float)
       pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
 
@@ -1146,7 +1284,7 @@ def main():
         pos_real,
         comment=(
           'Generated by examples/rpy_shear/rpy_shear.py '
-          f'(run={run_id:03d}, step={int(round(final_times[run_id] / dt))})'
+          f'(run={run_id:03d}, step={final_step})'
         ),
       )
 
