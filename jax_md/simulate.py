@@ -1516,6 +1516,7 @@ class ShearedRPYState:
   mobility_position: Array
   rpy_state: hydro_rpy.RpyState
   rng: Array
+  step: Array
   time: float
   force: Array
 
@@ -1655,20 +1656,20 @@ def _step_reduced_shear_and_remap(
     sf_xy,
     sf_xz,
     sf_yz,
-    time,
-    dt,
+    time_prev,
+    time_next,
     dim: int,
     remap: bool,
     fractional_coordinates: bool,
 ) -> Tuple[Array, Array, Array, Array]:
   if remap:
-    prev_xy = f32(sf_xy(time))
-    curr_xy = f32(sf_xy(time + dt))
+    prev_xy = f32(sf_xy(time_prev))
+    curr_xy = f32(sf_xy(time_next))
     if dim >= 3:
-      prev_xz = f32(sf_xz(time))
-      curr_xz = f32(sf_xz(time + dt))
-      prev_yz = f32(sf_yz(time))
-      curr_yz = f32(sf_yz(time + dt))
+      prev_xz = f32(sf_xz(time_prev))
+      curr_xz = f32(sf_xz(time_next))
+      prev_yz = f32(sf_yz(time_prev))
+      curr_yz = f32(sf_yz(time_next))
     else:
       prev_xz = curr_xz = prev_yz = curr_yz = f32(0.0)
 
@@ -1684,10 +1685,10 @@ def _step_reduced_shear_and_remap(
       mobility_position = _apply_fractional_shear_remap(
           mobility_position, m_xy, m_xz, m_yz, dim)
   else:
-    curr_xy = f32(sf_xy(time + dt))
+    curr_xy = f32(sf_xy(time_next))
     if dim >= 3:
-      curr_xz = f32(sf_xz(time + dt))
-      curr_yz = f32(sf_yz(time + dt))
+      curr_xz = f32(sf_xz(time_next))
+      curr_yz = f32(sf_yz(time_next))
     else:
       curr_xz = curr_yz = f32(0.0)
   return mobility_position, curr_xy, curr_xz, curr_yz
@@ -1839,7 +1840,8 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
 
   Stress diagnostics are not accumulated inside the integrator; derive a stress
   callable with `rheo.make_pairwise_stress_fn` and evaluate it externally if
-  required.
+  required. Runtime time is step-based with
+  `state.time = t0 + state.step * dt`.
   """
   if len(space_fns) < 3:
     raise ValueError(
@@ -1899,11 +1901,15 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     else:
       position_real0 = mobility_position
 
+    step0 = jnp.array(0, dtype=jnp.int32)
+    time0 = t0 + _dt * step0.astype(_dt.dtype)
+
     return ShearedRPYState(position=position_real0,
                            mobility_position=mobility_position,
                            rpy_state=rpy_state,
                            rng=key,
-                           time=t0,
+                           step=step0,
+                           time=time0,
                            force=F0)
 
   def apply_fn(state, **kwargs):
@@ -1915,15 +1921,18 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     position_real = state.position
     rpy_state = state.rpy_state
     key = state.rng
-    time = state.time
+    prev_step = jnp.asarray(state.step, dtype=jnp.int32)
+    next_step = prev_step + jnp.int32(1)
+    time_prev = t0 + _dt * prev_step.astype(_dt.dtype)
+    time_next = t0 + _dt * next_step.astype(_dt.dtype)
 
     mobility_position, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
         mobility_position,
         sf_xy=sf_xy,
         sf_xz=sf_xz,
         sf_yz=sf_yz,
-        time=time,
-        dt=_dt,
+        time_prev=time_prev,
+        time_next=time_next,
         dim=dim,
         remap=remap,
         fractional_coordinates=fractional_coordinates,
@@ -1955,7 +1964,8 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
                            mobility_position=mobility_position,
                            rpy_state=rpy_state,
                            rng=key,
-                           time=time + _dt,
+                           step=next_step,
+                           time=time_next,
                            force=force)
 
   return init_fn, apply_fn
