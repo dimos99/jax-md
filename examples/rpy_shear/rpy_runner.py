@@ -138,13 +138,47 @@ def _time_from_step(step, *, dt: float, t0: float, dtype):
   return t0_arr + step_arr.astype(dtype) * dt_arr
 
 
+def _state_step(state, *, dt: float, t0: float):
+  """Returns an integer step, deriving it from time for legacy states."""
+  state_step = getattr(state, 'step', None)
+  if state_step is not None:
+    return jnp.asarray(state_step, dtype=jnp.int32)
+  time_arr = jnp.asarray(state.time)
+  dt_arr = jnp.asarray(dt, dtype=time_arr.dtype)
+  t0_arr = jnp.asarray(t0, dtype=time_arr.dtype)
+  step_float = (time_arr - t0_arr) / dt_arr
+  return jnp.asarray(jnp.floor(step_float + 0.5), dtype=jnp.int32)
+
+
 def _state_time_from_step(state, *, dt: float, t0: float):
-  return _time_from_step(state.step, dt=dt, t0=t0, dtype=state.time.dtype)
+  state_step = getattr(state, 'step', None)
+  state_time = getattr(state, 'time', None)
+  if state_step is not None:
+    if state_time is not None:
+      time_dtype = jnp.asarray(state_time).dtype
+    else:
+      time_dtype = state.mobility_position.dtype
+    return _time_from_step(state_step, dt=dt, t0=t0, dtype=time_dtype)
+  if state_time is None:
+    raise AttributeError('State must provide either step or time.')
+  return jnp.asarray(state_time)
 
 
 def _state_next_time_from_step(state, *, dt: float, t0: float):
-  next_step = jnp.asarray(state.step, dtype=jnp.int32) + jnp.int32(1)
-  return _time_from_step(next_step, dt=dt, t0=t0, dtype=state.time.dtype)
+  state_step = getattr(state, 'step', None)
+  state_time = getattr(state, 'time', None)
+  if state_step is not None:
+    next_step = jnp.asarray(state_step, dtype=jnp.int32) + jnp.int32(1)
+    if state_time is not None:
+      time_dtype = jnp.asarray(state_time).dtype
+    else:
+      time_dtype = state.mobility_position.dtype
+    return _time_from_step(next_step, dt=dt, t0=t0, dtype=time_dtype)
+  if state_time is None:
+    raise AttributeError('State must provide either step or time.')
+  time_arr = jnp.asarray(state_time)
+  dt_arr = jnp.asarray(dt, dtype=time_arr.dtype)
+  return time_arr + dt_arr
 
 
 def _predict_xy_remapped_positions_for_next_force(
@@ -751,13 +785,13 @@ def main():
           fractional_coordinates=True,
         )
         strain = shear_rate * curr_time
-        step = state.step.astype(jnp.int32)
+        step = _state_step(state, dt=dt, t0=shear_t0)
         if do_traj:
           out = (step, strain, stress, state.mobility_position)
         else:
           out = (step, strain, stress)
       else:
-        out = (state.step.astype(jnp.int32), state.mobility_position)
+        out = (_state_step(state, dt=dt, t0=shear_t0), state.mobility_position)
       return (state, interaction_neighbor), out
 
     (state_out, interaction_neighbor_out), scan_out = lax.scan(
@@ -821,7 +855,7 @@ def main():
         fractional_coordinates=True,
       )
       strain = shear_rate * curr_time
-      return state_in.step.astype(jnp.int32), curr_time, strain, stress
+      return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
 
   thermalize_runner_cache = {}
 
@@ -1221,7 +1255,10 @@ def main():
           stresses_np = None
 
         if emit_stress or emit_traj:
-          traj_steps_np = np.asarray(state.step, dtype=np.int64) if emit_traj else None
+          traj_steps_np = (
+            np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
+            if emit_traj else None
+          )
           traj_times_np = (
             traj_steps_np.astype(float) * dt + float(shear_t0)
             if emit_traj else None
@@ -1262,7 +1299,7 @@ def main():
           )
 
       batch_final_pos = np.asarray(state.mobility_position, dtype=float)
-      batch_final_step = np.asarray(state.step, dtype=np.int64)
+      batch_final_step = np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
       for local_i, run_id in enumerate(batch_ids):
         final_positions_frac[run_id] = np.mod(batch_final_pos[local_i], 1.0)
         final_steps[run_id] = int(batch_final_step[local_i])
