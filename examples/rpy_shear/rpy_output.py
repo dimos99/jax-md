@@ -62,10 +62,6 @@ def _serialize_rpy_parameter_estimate(estimate) -> dict:
     'diagnostics': diagnostics_dict,
   }
 
-def _run_label(run_id: int) -> str:
-  return f'{int(run_id):03d}'
-
-
 def _lammps_data_bounds_from_box(box_matrix: np.ndarray):
   box = np.asarray(box_matrix, dtype=float)
   if box.ndim == 1:
@@ -172,12 +168,11 @@ def write_lammps_data(
     handle.write('\n'.join(lines) + '\n')
 
 class RunDumper:
-  """Streams per-run stress and trajectory data to disk."""
+  """Streams stress and trajectory data to disk."""
 
   def __init__(
     self,
     out_dir: str,
-    run_id: int,
     box_size: float,
     dim: int,
     dt: float,
@@ -190,7 +185,6 @@ class RunDumper:
     shear_remap: bool = True,
     unwrap_trajectory: bool = True,
   ):
-    label = _run_label(run_id)
     self.box_size = float(box_size)
     self.dim = int(dim)
     self.dt = float(dt)
@@ -210,8 +204,8 @@ class RunDumper:
     else:
       # Default to t=0 box if not explicitly provided.
       self.base_box = self._box_matrix_at_time(0.0)
-    self.stress_filename = os.path.join(out_dir, f'stress_{label}.dat')
-    self.traj_filename = os.path.join(out_dir, f'traj_{label}.dump')
+    self.stress_filename = os.path.join(out_dir, 'stress.dat')
+    self.traj_filename = os.path.join(out_dir, 'traj.dump')
 
     if self.stress_every > 0:
       self.stress_file = open(self.stress_filename, 'w')

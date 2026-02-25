@@ -6,6 +6,7 @@ import json
 import math
 import os
 import shutil
+import time
 
 import jax
 import jax.numpy as jnp
@@ -47,7 +48,7 @@ def _wrap_neighbor_energy(energy_neighbor_fn, energy_all_pairs_fn=None):
   return _wrapped
 
 
-def _neighbor_list_health(neighbors, stage: str, run_offset: int, label: str) -> bool:
+def _neighbor_list_health(neighbors, stage: str, label: str) -> bool:
   if neighbors is None:
     _CONSOLE.error(f'Missing {label} in stage={stage}.')
     return False
@@ -55,81 +56,22 @@ def _neighbor_list_health(neighbors, stage: str, run_offset: int, label: str) ->
   cell_small = np.asarray(neighbors.cell_size_too_small)
   malformed = np.asarray(neighbors.malformed_box)
   if np.any(overflow):
-    idx = _first_true_index(overflow)
-    run_id = (run_offset + idx) if idx is not None else 'unknown'
     _CONSOLE.error(
-      f'{label} overflow in stage={stage}, run={run_id}. '
+      f'{label} overflow in stage={stage}. '
       'Try increasing capacity_multiplier or dr_threshold.'
     )
     return False
   if np.any(cell_small):
-    idx = _first_true_index(cell_small)
-    run_id = (run_offset + idx) if idx is not None else 'unknown'
     _CONSOLE.error(
-      f'{label} cell size too small in stage={stage}, run={run_id}.'
+      f'{label} cell size too small in stage={stage}.'
     )
     return False
   if np.any(malformed):
-    idx = _first_true_index(malformed)
-    run_id = (run_offset + idx) if idx is not None else 'unknown'
     _CONSOLE.error(
-      f'{label} malformed box in stage={stage}, run={run_id}.'
+      f'{label} malformed box in stage={stage}.'
     )
     return False
   return True
-
-
-def _pad_neighbor_list_capacity(
-  nbr: partition.NeighborList,
-  target_capacity: int,
-) -> partition.NeighborList:
-  if nbr is None:
-    return nbr
-  current_capacity = int(nbr.max_occupancy)
-  if current_capacity >= target_capacity:
-    return nbr
-  n_particles = int(nbr.reference_position.shape[0])
-  pad_width = target_capacity - current_capacity
-  fill_value = n_particles
-  pad_cfg = [(0, 0)] * nbr.idx.ndim
-  pad_cfg[-1] = (0, pad_width)
-  new_idx = jnp.pad(
-    nbr.idx,
-    tuple(pad_cfg),
-    mode='constant',
-    constant_values=fill_value,
-  )
-  return nbr.set(idx=new_idx, max_occupancy=target_capacity)
-
-
-def _align_neighbor_static_fields(
-  nbr: partition.NeighborList,
-  canonical: partition.NeighborList,
-) -> partition.NeighborList:
-  if nbr is None or canonical is None:
-    return nbr
-  return nbr.set(
-    cell_list_capacity=canonical.cell_list_capacity,
-    max_occupancy=canonical.max_occupancy,
-    format=canonical.format,
-    cell_size=canonical.cell_size,
-    cell_list_fn=canonical.cell_list_fn,
-    update_fn=canonical.update_fn,
-  )
-
-
-def _stack_neighbor_lists(neighbors):
-  if not neighbors:
-    raise ValueError('Expected at least one neighbor list to stack.')
-  occupancies = [int(n.max_occupancy) for n in neighbors]
-  target_capacity = max(occupancies)
-  template = _pad_neighbor_list_capacity(neighbors[0], target_capacity)
-  aligned = []
-  for nbr in neighbors:
-    padded = _pad_neighbor_list_capacity(nbr, target_capacity)
-    aligned.append(_align_neighbor_static_fields(padded, template))
-  return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *aligned)
-
 
 def _time_from_step(step, *, dt: float, t0: float, dtype):
   step_arr = jnp.asarray(step, dtype=jnp.int32)
@@ -201,18 +143,12 @@ def _predict_xy_remapped_positions_for_next_force(
   return lax.cond(jnp.not_equal(dm, 0), _apply, lambda R: R, state.mobility_position)
 
 
-def _first_true_index(x: np.ndarray):
-  hits = np.where(np.asarray(x).reshape(-1))[0]
-  return int(hits[0]) if hits.size else None
-
-
-def _check_neighbor_status(state, stage: str, run_offset: int = 0) -> bool:
+def _check_neighbor_status(state, stage: str) -> bool:
   """Returns True if the neighbor state is healthy; otherwise prints and fails."""
   neighbors = state.rpy_state.real.neighbors
   return _neighbor_list_health(
     neighbors,
     stage=stage,
-    run_offset=run_offset,
     label='RPY real-space neighbor list',
   )
 
@@ -220,12 +156,10 @@ def _check_neighbor_status(state, stage: str, run_offset: int = 0) -> bool:
 def _check_interaction_neighbor_status(
   interaction_neighbor,
   stage: str,
-  run_offset: int = 0,
 ) -> bool:
   return _neighbor_list_health(
     interaction_neighbor,
     stage=stage,
-    run_offset=run_offset,
     label='pair-interaction neighbor list',
   )
 
@@ -239,106 +173,8 @@ def _check_nan_positions(state, stage: str) -> bool:
   return True
 
 
-def _stack_states(states):
-  """Stacks a list of per-run states into one batched pytree state."""
-  if not states:
-    raise ValueError('Expected at least one state to stack.')
-  template = states[0]
-  target_neighbor_occupancy = None
-  template_neighbor = None
-
-  def _pad_neighbor_list_capacity(
-    nbr: partition.NeighborList,
-    target_capacity: int,
-  ) -> partition.NeighborList:
-    if nbr is None:
-      return nbr
-    current_capacity = int(nbr.max_occupancy)
-    if current_capacity == target_capacity:
-      return nbr
-    if current_capacity > target_capacity:
-      # Keep existing allocation if already larger.
-      return nbr
-
-    n_particles = int(nbr.reference_position.shape[0])
-    pad_width = target_capacity - current_capacity
-    fill_value = n_particles
-
-    if partition.is_sparse(nbr.format):
-      # Sparse/ordered sparse: idx has shape [2, max_occupancy].
-      pad_cfg = ((0, 0), (0, pad_width))
-    else:
-      # Dense: idx has shape [N, max_occupancy].
-      pad_cfg = ((0, 0), (0, pad_width))
-    new_idx = jnp.pad(nbr.idx, pad_cfg, mode='constant', constant_values=fill_value)
-    return nbr.set(idx=new_idx, max_occupancy=target_capacity)
-
-  if (hasattr(template, 'rpy_state')
-      and hasattr(template.rpy_state, 'real')
-      and getattr(template.rpy_state.real, 'neighbors', None) is not None):
-    occupancies = [int(s.rpy_state.real.neighbors.max_occupancy) for s in states]
-    target_neighbor_occupancy = max(occupancies)
-    template_neighbor = _pad_neighbor_list_capacity(
-      template.rpy_state.real.neighbors, target_neighbor_occupancy)
-
-  def _align_neighbor_static_fields(
-    nbr: partition.NeighborList,
-    canonical: partition.NeighborList,
-  ) -> partition.NeighborList:
-    if nbr is None or canonical is None:
-      return nbr
-    return nbr.set(
-      cell_list_capacity=canonical.cell_list_capacity,
-      max_occupancy=canonical.max_occupancy,
-      format=canonical.format,
-      cell_size=canonical.cell_size,
-      cell_list_fn=canonical.cell_list_fn,
-      update_fn=canonical.update_fn,
-    )
-
-  def _align_static_fields(state):
-    # Some nested dataclass nodes include static callable fields (e.g., wave
-    # apply/sqrt functions). Align them to the template so pytree metadata
-    # matches across runs before stacking.
-    if not hasattr(state, 'rpy_state'):
-      return state
-
-    template_rpy = template.rpy_state
-    state_rpy = state.rpy_state
-
-    if hasattr(state_rpy, 'real') and hasattr(state_rpy.real, 'set'):
-      state_real = state_rpy.real.set(core_fn=template_rpy.real.core_fn)
-      if (target_neighbor_occupancy is not None
-          and getattr(state_real, 'neighbors', None) is not None):
-        padded = _pad_neighbor_list_capacity(
-          state_real.neighbors, target_neighbor_occupancy)
-        state_real = state_real.set(
-          neighbors=_align_neighbor_static_fields(padded, template_neighbor))
-    else:
-      state_real = state_rpy.real
-
-    if hasattr(state_rpy, 'wave') and hasattr(state_rpy.wave, 'set'):
-      state_wave = state_rpy.wave.set(
-        apply_fn=template_rpy.wave.apply_fn,
-        sqrt_fn=template_rpy.wave.sqrt_fn,
-        fused_fn=template_rpy.wave.fused_fn,
-      )
-    else:
-      state_wave = state_rpy.wave
-
-    state_rpy = state_rpy.set(
-      real=state_real,
-      wave=state_wave,
-      preconditioner=template_rpy.preconditioner,
-    )
-    return state.set(rpy_state=state_rpy)
-
-  aligned = [_align_static_fields(s) for s in states]
-  return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *aligned)
-
-
 def _build_thermalize_runner(apply_fn_eq, steps: int, base_box: jnp.ndarray):
-  """Returns a vmapped thermalization runner for exactly `steps` steps."""
+  """Returns a thermalization runner for exactly `steps` steps."""
   if steps <= 0:
     return None
 
@@ -350,11 +186,12 @@ def _build_thermalize_runner(apply_fn_eq, steps: int, base_box: jnp.ndarray):
       return s, pn
     return lax.fori_loop(0, steps, _step, (state, interaction_neighbor))
 
-  return jax.jit(jax.vmap(_single))
+  return jax.jit(_single)
 
 
 def main():
   args = parse_args()
+  wall_start = time.perf_counter()
 
   internal = build_internal_config()
   a = float(internal['a'])
@@ -701,14 +538,6 @@ def main():
       **potential_params,
     )
 
-  thermalize_keys = random.split(thermalize_key, args.n_runs)
-  run_keys = random.split(run_key, args.n_runs)
-
-  runs_per_batch = (
-    args.n_runs if args.runs_per_batch is None else min(args.runs_per_batch, args.n_runs)
-  )
-  n_batches = (args.n_runs + runs_per_batch - 1) // runs_per_batch
-
   # Choose chunk/sampling cadence based on enabled outputs.
   if do_stress and do_traj:
     scan_interval = math.gcd(args.stress_every, args.traj_every)
@@ -825,10 +654,9 @@ def main():
     traj_positions = positions[traj_offset::traj_stride]
     return (state_out, interaction_neighbor_out), (traj_steps, traj_positions)
 
-  run_chunk = jax.jit(jax.vmap(_run_chunk_single))
+  run_chunk = jax.jit(_run_chunk_single)
 
   @jax.jit
-  @jax.vmap
   def run_one_step(state_in, interaction_neighbor_in):
     next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
     next_box = box_of(t=next_time)
@@ -846,7 +674,6 @@ def main():
   evaluate_stress = None
   if do_stress:
     @jax.jit
-    @jax.vmap
     def evaluate_stress(state_in, interaction_neighbor_in):
       curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
       curr_box = box_of(t=curr_time)
@@ -893,8 +720,6 @@ def main():
     'user_args': {
       'n_particles': n_particles,
       'phi': phi,
-      'n_runs': args.n_runs,
-      'runs_per_batch': args.runs_per_batch,
       'dt': dt,
       'n_steps': args.n_steps,
       'thermalize_steps': args.thermalize_steps,
@@ -929,9 +754,6 @@ def main():
     },
     'derived': {
       'initialization_mode': init_mode,
-      'n_runs': args.n_runs,
-      'runs_per_batch': runs_per_batch,
-      'n_batches': n_batches,
       'dim': dim,
       'box_size': box_size,
       'box_matrix': _to_jsonable(base_box_np),
@@ -990,29 +812,25 @@ def main():
 
   dump_box_fn = _build_reduced_xy_box_fn(np.asarray(base_box, dtype=float), shear_rate)
   base_box_np = np.asarray(base_box, dtype=float)
-  dumpers = [
-    RunDumper(
-      out_dir,
-      i,
-      box_size,
-      dim,
-      dt,
-      args.traj_every,
-      args.stress_every,
-      box_fn=dump_box_fn,
-      base_box=base_box_np,
-      shear_rate=shear_rate,
-      time_offset=shear_t0,
-      shear_remap=True,
-      unwrap_trajectory=True,
-    )
-    for i in range(args.n_runs)
-  ]
+  dumper = RunDumper(
+    out_dir,
+    box_size,
+    dim,
+    dt,
+    args.traj_every,
+    args.stress_every,
+    box_fn=dump_box_fn,
+    base_box=base_box_np,
+    shear_rate=shear_rate,
+    time_offset=shear_t0,
+    shear_remap=True,
+    unwrap_trajectory=True,
+  )
 
   _CONSOLE.section('Run Plan')
   _CONSOLE.info(
-    f'Running {args.n_runs} sheared trajectories for {planned_steps} steps '
-    f'(requested {args.n_steps}) in {n_batches} batch(es) of up to {runs_per_batch}.'
+    f'Running one sheared trajectory for {planned_steps} steps '
+    f'(requested {args.n_steps}).'
   )
   if args.thermalize_steps > 0:
     _CONSOLE.info(
@@ -1020,11 +838,11 @@ def main():
       f'{thermalize_chunk_steps} step(s) per JAX call.'
     )
   if do_stress and do_traj:
-    _CONSOLE.info(f'Outputs: stress_XXX.dat + traj_XXX.dump in {out_dir}')
+    _CONSOLE.info(f'Outputs: stress.dat + traj.dump in {out_dir}')
   elif do_stress:
-    _CONSOLE.info(f'Outputs: stress_XXX.dat in {out_dir}')
+    _CONSOLE.info(f'Outputs: stress.dat in {out_dir}')
   elif do_traj:
-    _CONSOLE.info(f'Outputs: traj_XXX.dump in {out_dir}')
+    _CONSOLE.info(f'Outputs: traj.dump in {out_dir}')
   else:
     _CONSOLE.info('Outputs: none (both --stress_every and --traj_every are 0).')
   if init_mode == 'dump':
@@ -1038,300 +856,221 @@ def main():
       f'with positions loaded from {args.init_data}.'
     )
 
-  # Execute runs batch-wise; each batch thermalizes (optional) then produces data.
+  # Execute one run: optional thermalization followed by production.
   target_step = int(args.n_steps)
-  final_positions_frac = [None] * args.n_runs
-  final_steps = [None] * args.n_runs
   try:
-    for batch_idx, batch_start in enumerate(range(0, args.n_runs, runs_per_batch), start=1):
-      batch_end = min(batch_start + runs_per_batch, args.n_runs)
-      batch_ids = list(range(batch_start, batch_end))
-      batch_size = len(batch_ids)
+    state_eq = init_fn_eq(thermalize_key, R0)
+    interaction_neighbor_eq = interaction_neighbor_fn_0.allocate(
+      state_eq.mobility_position, box=base_box)
+    if not _check_neighbor_status(state_eq, 'equilibrium_init'):
+      return
+    if not _check_interaction_neighbor_status(interaction_neighbor_eq, 'equilibrium_init'):
+      return
 
-      _CONSOLE.progress(
-        f'Batch {batch_idx}/{n_batches}: runs '
-        f'{batch_start:03d}-{batch_end - 1:03d} (size={batch_size}).'
+    if args.thermalize_steps > 0:
+      therm_done = 0
+      next_progress_mark = args.progress_every if args.progress_every > 0 else None
+      while therm_done < args.thermalize_steps:
+        step_count = min(thermalize_chunk_steps, args.thermalize_steps - therm_done)
+        runner = _get_thermalize_runner(step_count)
+        state_eq, interaction_neighbor_eq = runner(state_eq, interaction_neighbor_eq)
+        therm_done += step_count
+
+        if not _check_nan_positions(state_eq, f'thermalization step {therm_done}'):
+          return
+        if not _check_neighbor_status(state_eq, f'thermalization step {therm_done}'):
+          return
+        if not _check_interaction_neighbor_status(
+          interaction_neighbor_eq, f'thermalization step {therm_done}'):
+          return
+        while (
+          next_progress_mark is not None
+          and therm_done >= next_progress_mark
+          and next_progress_mark <= args.thermalize_steps
+        ):
+          _CONSOLE.progress(f'Thermalize {next_progress_mark}/{args.thermalize_steps}')
+          next_progress_mark += args.progress_every
+    else:
+      _CONSOLE.info('Skipping thermalization (thermalize_steps=0).')
+
+    positions_init = state_eq.mobility_position
+    state = init_fn(run_key, positions_init)
+    box_t0 = box_of(t=shear_t0)
+    interaction_neighbor = interaction_neighbor_fn.allocate(state.mobility_position, box=box_t0)
+    if not _check_neighbor_status(state, 'shear_init'):
+      return
+    if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
+      return
+
+    # Write the initial configuration (t=0) before the loop
+    # so the trajectory file always starts from the very first frame.
+    if traj_stride is not None:
+      dumper.dump(
+        np.array([], dtype=float),        # no stress at t=0
+        np.array([], dtype=float),
+        np.zeros((0, dim, dim), dtype=float),
+        None,
+        np.asarray(positions_init, dtype=float)[np.newaxis],  # shape (1, N, dim)
+        traj_steps=np.array([0], dtype=np.int64),
       )
 
-      state_eq_list = [init_fn_eq(thermalize_keys[i], R0) for i in batch_ids]
-      state_eq = _stack_states(state_eq_list)
-      interaction_neighbor_eq = _stack_neighbor_lists([
-        interaction_neighbor_fn_0.allocate(s.mobility_position, box=base_box)
-        for s in state_eq_list
-      ])
-      if not _check_neighbor_status(state_eq, 'equilibrium_init', run_offset=batch_start):
+    steps_done = 0
+    while steps_done + buffer_steps <= planned_steps:
+      if do_stress and do_traj:
+        (state, interaction_neighbor), (
+          stress_steps,
+          stress_strains,
+          stresses,
+          traj_steps,
+          traj_positions,
+        ) = run_chunk((state, interaction_neighbor))
+      elif do_stress:
+        (state, interaction_neighbor), (stress_steps, stress_strains, stresses) = run_chunk(
+          (state, interaction_neighbor))
+        traj_steps = None
+        traj_positions = None
+      elif do_traj:
+        (state, interaction_neighbor), (traj_steps, traj_positions) = run_chunk(
+          (state, interaction_neighbor))
+        stress_steps = None
+        stress_strains = None
+        stresses = None
+      else:
+        (state, interaction_neighbor), _ = run_chunk((state, interaction_neighbor))
+        stress_steps = None
+        stress_strains = None
+        stresses = None
+        traj_steps = None
+        traj_positions = None
+
+      if not _check_nan_positions(state, f'shear step {steps_done + buffer_steps}'):
+        return
+      if not _check_neighbor_status(state, f'shear step {steps_done + buffer_steps}'):
         return
       if not _check_interaction_neighbor_status(
-        interaction_neighbor_eq,
-        'equilibrium_init',
-        run_offset=batch_start,
-      ):
+        interaction_neighbor, f'shear step {steps_done + buffer_steps}'):
         return
 
-      if args.thermalize_steps > 0:
-        therm_done = 0
-        next_progress_mark = args.progress_every if args.progress_every > 0 else None
-        while therm_done < args.thermalize_steps:
-          step_count = min(thermalize_chunk_steps, args.thermalize_steps - therm_done)
-          runner = _get_thermalize_runner(step_count)
-          state_eq, interaction_neighbor_eq = runner(state_eq, interaction_neighbor_eq)
-          therm_done += step_count
+      stress_steps_np = np.asarray(stress_steps, dtype=np.int64) if do_stress else None
+      stress_strains_np = np.asarray(stress_strains) if do_stress else None
+      stresses_np = np.asarray(stresses) if do_stress else None
+      traj_steps_np = np.asarray(traj_steps, dtype=np.int64) if do_traj else None
+      traj_positions_np = np.asarray(traj_positions) if do_traj else None
 
-          if not _check_nan_positions(state_eq, f'thermalization step {therm_done}'):
-            return
-          if not _check_neighbor_status(
-            state_eq, f'thermalization step {therm_done}', run_offset=batch_start):
-            return
-          if not _check_interaction_neighbor_status(
-            interaction_neighbor_eq,
-            f'thermalization step {therm_done}',
-            run_offset=batch_start,
-          ):
-            return
-          while (
-            next_progress_mark is not None
-            and therm_done >= next_progress_mark
-            and next_progress_mark <= args.thermalize_steps
-          ):
-            _CONSOLE.progress(
-              f'Batch {batch_idx}/{n_batches} thermalize '
-              f'{next_progress_mark}/{args.thermalize_steps}'
-            )
-            next_progress_mark += args.progress_every
-      else:
-        _CONSOLE.info(
-          f'Batch {batch_idx}/{n_batches}: skipping thermalization (thermalize_steps=0).'
+      if do_stress or do_traj:
+        if do_stress:
+          stress_mask = stress_steps_np <= target_step
+          out_stress_steps = stress_steps_np[stress_mask]
+          out_stress_times = out_stress_steps.astype(float) * dt + float(shear_t0)
+          out_stress_strains = stress_strains_np[stress_mask]
+          out_stresses = stresses_np[stress_mask]
+        else:
+          out_stress_times = None
+          out_stress_strains = None
+          out_stresses = None
+
+        if do_traj:
+          traj_mask = traj_steps_np <= target_step
+          out_traj_steps = traj_steps_np[traj_mask]
+          out_traj_positions = traj_positions_np[traj_mask]
+        else:
+          out_traj_steps = None
+          out_traj_positions = None
+
+        dumper.dump(
+          out_stress_times,
+          out_stress_strains,
+          out_stresses,
+          None,
+          out_traj_positions,
+          traj_steps=out_traj_steps,
         )
 
-      positions_init = state_eq.mobility_position
-      state_list = [
-        init_fn(run_keys[run_id], positions_init[local_i])
-        for local_i, run_id in enumerate(batch_ids)
-      ]
-      state = _stack_states(state_list)
-      box_t0 = box_of(t=shear_t0)
-      interaction_neighbor = _stack_neighbor_lists([
-        interaction_neighbor_fn.allocate(s.mobility_position, box=box_t0)
-        for s in state_list
-      ])
-      if not _check_neighbor_status(state, 'shear_init', run_offset=batch_start):
+      steps_done += buffer_steps
+      if args.progress_every > 0 and (steps_done % args.progress_every == 0):
+        _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
+
+    tail_steps = planned_steps - steps_done
+    while tail_steps > 0:
+      state, interaction_neighbor = run_one_step(state, interaction_neighbor)
+      steps_done += 1
+      tail_steps -= 1
+
+      if not _check_nan_positions(state, f'shear step {steps_done}'):
         return
-      if not _check_interaction_neighbor_status(
-        interaction_neighbor,
-        'shear_init',
-        run_offset=batch_start,
-      ):
+      if not _check_neighbor_status(state, f'shear step {steps_done}'):
+        return
+      if not _check_interaction_neighbor_status(interaction_neighbor, f'shear step {steps_done}'):
         return
 
-      # Write the initial configuration (t=0) before the loop
-      # so the trajectory file always starts from the very first frame.
-      for local_i, run_id in enumerate(batch_ids):
-        dumper = dumpers[run_id]
-        pos0 = np.asarray(positions_init[local_i], dtype=float)
-        if traj_stride is not None:
-          dumper.dump(
-            np.array([], dtype=float),        # no stress at t=0
-            np.array([], dtype=float),
-            np.zeros((0, dim, dim), dtype=float),
-            None,
-            pos0[np.newaxis],                 # shape (1, N, dim)
-            traj_steps=np.array([0], dtype=np.int64),
-          )
+      emit_stress = do_stress and (steps_done % args.stress_every == 0)
+      emit_traj = do_traj and (steps_done % args.traj_every == 0)
+      if emit_stress:
+        stress_step, _, stress_strain, stress = evaluate_stress(state, interaction_neighbor)
+        out_stress_times = np.array(
+          [int(np.asarray(stress_step)) * dt + float(shear_t0)], dtype=float)
+        out_stress_strains = np.array([float(np.asarray(stress_strain))], dtype=float)
+        out_stresses = np.asarray(stress, dtype=float)[np.newaxis]
+      else:
+        out_stress_times = None
+        out_stress_strains = None
+        out_stresses = None
 
-      steps_done = 0
-      while steps_done + buffer_steps <= planned_steps:
-        if do_stress and do_traj:
-          (state, interaction_neighbor), (
-            stress_steps,
-            stress_strains,
-            stresses,
-            traj_steps,
-            traj_positions,
-          ) = run_chunk((state, interaction_neighbor))
-        elif do_stress:
-          (state, interaction_neighbor), (stress_steps, stress_strains, stresses) = run_chunk(
-            (state, interaction_neighbor))
-          traj_steps = None
-          traj_positions = None
-        elif do_traj:
-          (state, interaction_neighbor), (traj_steps, traj_positions) = run_chunk(
-            (state, interaction_neighbor))
-          stress_steps = None
-          stress_strains = None
-          stresses = None
-        else:
-          (state, interaction_neighbor), _ = run_chunk((state, interaction_neighbor))
-          stress_steps = None
-          stress_strains = None
-          stresses = None
-          traj_steps = None
-          traj_positions = None
+      if emit_traj:
+        out_traj_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
+        out_traj_steps = np.array([out_traj_step], dtype=np.int64)
+        out_traj_positions = np.asarray(state.mobility_position, dtype=float)[np.newaxis]
+      else:
+        out_traj_steps = None
+        out_traj_positions = None
 
-        if not _check_nan_positions(state, f'shear step {steps_done + buffer_steps}'):
-          return
-        if not _check_neighbor_status(
-          state, f'shear step {steps_done + buffer_steps}', run_offset=batch_start):
-          return
-        if not _check_interaction_neighbor_status(
-          interaction_neighbor,
-          f'shear step {steps_done + buffer_steps}',
-          run_offset=batch_start,
-        ):
-          return
+      if emit_stress or emit_traj:
+        dumper.dump(
+          out_stress_times,
+          out_stress_strains,
+          out_stresses,
+          None,
+          out_traj_positions,
+          traj_steps=out_traj_steps,
+        )
 
-        stress_steps_np = np.asarray(stress_steps, dtype=np.int64) if do_stress else None
-        stress_strains_np = np.asarray(stress_strains) if do_stress else None
-        stresses_np = np.asarray(stresses) if do_stress else None
-        traj_steps_np = np.asarray(traj_steps, dtype=np.int64) if do_traj else None
-        traj_positions_np = np.asarray(traj_positions) if do_traj else None
+      if args.progress_every > 0 and (steps_done % args.progress_every == 0):
+        _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
 
-        if do_stress or do_traj:
-          for local_i, run_id in enumerate(batch_ids):
-            dumper = dumpers[run_id]
+    final_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
+    final_time = float(final_step * dt + shear_t0)
+    final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
+    pos_frac = np.mod(np.asarray(state.mobility_position, dtype=float), 1.0)
+    pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
 
-            if do_stress:
-              stress_mask = stress_steps_np[local_i] <= target_step
-              out_stress_steps = stress_steps_np[local_i][stress_mask]
-              out_stress_times = out_stress_steps.astype(float) * dt + float(shear_t0)
-              out_stress_strains = stress_strains_np[local_i][stress_mask]
-              out_stresses = stresses_np[local_i][stress_mask]
-            else:
-              out_stress_times = None
-              out_stress_strains = None
-              out_stresses = None
-
-            if do_traj:
-              traj_mask = traj_steps_np[local_i] <= target_step
-              out_traj_steps = traj_steps_np[local_i][traj_mask]
-              out_traj_positions = traj_positions_np[local_i][traj_mask]
-            else:
-              out_traj_steps = None
-              out_traj_positions = None
-
-            dumper.dump(
-              out_stress_times,
-              out_stress_strains,
-              out_stresses,
-              None,
-              out_traj_positions,
-              traj_steps=out_traj_steps,
-            )
-
-        steps_done += buffer_steps
-        if args.progress_every > 0 and (steps_done % args.progress_every == 0):
-          _CONSOLE.progress(
-            f'Batch {batch_idx}/{n_batches} step '
-            f'{min(steps_done, planned_steps)}/{planned_steps}'
-          )
-
-      tail_steps = planned_steps - steps_done
-      while tail_steps > 0:
-        state, interaction_neighbor = run_one_step(state, interaction_neighbor)
-        steps_done += 1
-        tail_steps -= 1
-
-        if not _check_nan_positions(state, f'shear step {steps_done}'):
-          return
-        if not _check_neighbor_status(
-          state, f'shear step {steps_done}', run_offset=batch_start):
-          return
-        if not _check_interaction_neighbor_status(
-          interaction_neighbor,
-          f'shear step {steps_done}',
-          run_offset=batch_start,
-        ):
-          return
-
-        emit_stress = do_stress and (steps_done % args.stress_every == 0)
-        emit_traj = do_traj and (steps_done % args.traj_every == 0)
-        if emit_stress:
-          stress_steps, stress_times, stress_strains, stresses = evaluate_stress(
-            state, interaction_neighbor)
-          stress_steps_np = np.asarray(stress_steps, dtype=np.int64)
-          stress_times_np = np.asarray(stress_times)
-          stress_strains_np = np.asarray(stress_strains)
-          stresses_np = np.asarray(stresses)
-        else:
-          stress_steps_np = None
-          stress_times_np = None
-          stress_strains_np = None
-          stresses_np = None
-
-        if emit_stress or emit_traj:
-          traj_steps_np = (
-            np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
-            if emit_traj else None
-          )
-          traj_positions_np = np.asarray(state.mobility_position) if emit_traj else None
-          for local_i, run_id in enumerate(batch_ids):
-            dumper = dumpers[run_id]
-            if emit_stress:
-              # Use step-derived times for deterministic frame metadata.
-              out_stress_times = np.array(
-                [stress_steps_np[local_i] * dt + float(shear_t0)], dtype=float)
-              out_stress_strains = np.array([stress_strains_np[local_i]], dtype=float)
-              out_stresses = stresses_np[local_i][np.newaxis]
-            else:
-              out_stress_times = None
-              out_stress_strains = None
-              out_stresses = None
-
-            if emit_traj:
-              out_traj_steps = np.array([traj_steps_np[local_i]], dtype=np.int64)
-              out_traj_positions = traj_positions_np[local_i][np.newaxis]
-            else:
-              out_traj_steps = None
-              out_traj_positions = None
-
-            dumper.dump(
-              out_stress_times,
-              out_stress_strains,
-              out_stresses,
-              None,
-              out_traj_positions,
-              traj_steps=out_traj_steps,
-            )
-
-        if args.progress_every > 0 and (steps_done % args.progress_every == 0):
-          _CONSOLE.progress(
-            f'Batch {batch_idx}/{n_batches} step '
-            f'{min(steps_done, planned_steps)}/{planned_steps}'
-          )
-
-      batch_final_pos = np.asarray(state.mobility_position, dtype=float)
-      batch_final_step = np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
-      for local_i, run_id in enumerate(batch_ids):
-        final_positions_frac[run_id] = np.mod(batch_final_pos[local_i], 1.0)
-        final_steps[run_id] = int(batch_final_step[local_i])
-
-    for run_id in range(args.n_runs):
-      if final_positions_frac[run_id] is None or final_steps[run_id] is None:
-        raise RuntimeError(f'Missing final state for run {run_id}.')
-
-      final_step = int(final_steps[run_id])
-      final_time = float(final_step * dt + shear_t0)
-      final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
-      pos_frac = np.asarray(final_positions_frac[run_id], dtype=float)
-      pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
-
-      confout_path = os.path.join(out_dir, f'confout_{run_id:03d}.data')
-      write_lammps_data(
-        confout_path,
-        final_box,
-        pos_real,
-        comment=(
-          'Generated by examples/rpy_shear/rpy_shear.py '
-          f'(run={run_id:03d}, step={final_step})'
-        ),
-      )
-
-    confout_000 = os.path.join(out_dir, 'confout_000.data')
-    confout_single = os.path.join(out_dir, 'confout.data')
-    shutil.copyfile(confout_000, confout_single)
-    _CONSOLE.info(f'Wrote final data snapshots confout_XXX.data and {confout_single}')
+    confout_path = os.path.join(out_dir, 'confout.data')
+    write_lammps_data(
+      confout_path,
+      final_box,
+      pos_real,
+      comment=(
+        'Generated by examples/rpy_shear/rpy_shear.py '
+        f'(step={final_step})'
+      ),
+    )
+    _CONSOLE.info(f'Wrote final data snapshot {confout_path}')
   finally:
-    for dumper in dumpers:
-      dumper.close()
+    dumper.close()
+
+  elapsed_s = time.perf_counter() - wall_start
+  total_steps = int(args.thermalize_steps + planned_steps)
+  _CONSOLE.section('Timing')
+  _CONSOLE.info(f'Total wall time: {elapsed_s:.3f} s')
+  if total_steps > 0 and elapsed_s > 0.0:
+    seconds_per_step = elapsed_s / float(total_steps)
+    ptps = (float(n_particles) * float(total_steps)) / elapsed_s
+    _CONSOLE.info(
+      'Time per step: '
+      f'{seconds_per_step:.6e} s/step ({seconds_per_step * 1e3:.6f} ms/step)'
+    )
+    _CONSOLE.info(f'PTPS: {ptps:.6e} particle-timesteps/s')
+  else:
+    _CONSOLE.warn('Skipping per-step timing/PTPS (no executed steps).')
 
   _CONSOLE.success('Done.')
 

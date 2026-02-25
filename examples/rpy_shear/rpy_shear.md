@@ -102,7 +102,7 @@ python examples/rpy_shear/rpy_shear.py \
   --potential examples/rpy_shear/potentials/ao_wca.py \
   --dt 2e-5 \
   --out_dir examples/out/rpy_from_dump \
-  --init-traj examples/out/rpy_random/traj_000.dump
+  --init-traj examples/out/rpy_random/traj.dump
 ```
 
 LAMMPS data initialization:
@@ -124,8 +124,6 @@ python examples/rpy_shear/rpy_shear.py \
 - `--mr-skin 0.5`
 - `--seed 42`
 - `--xi 0.5`
-- `--n_runs 8`
-- `--runs_per_batch` unset (all runs in one batch)
 - `--traj_every 100` (`0` disables trajectory output)
 - `--stress_every 0` (`0` disables stress calculation/output)
 
@@ -140,12 +138,11 @@ Only progress logs are printed during thermalization.
 Production files in `--out_dir` (depending on settings):
 
 - `params.json`
-- `stress_XXX.dat` (only if `--stress_every > 0`)
-- `traj_XXX.dump` (only if `--traj_every > 0`)
+- `stress.dat` (only if `--stress_every > 0`)
+- `traj.dump` (only if `--traj_every > 0`)
 - `confin.data` (always; start-of-run configuration)
 - for `--init-data`, `confin.data` is an exact copy of input
-- `confout_XXX.data` (always; final frame for each run)
-- `confout.data` (always; copy of `confout_000.data`)
+- `confout.data` (always; final frame)
 - `confout*` step metadata is written from exact integer step counters
 
 ## 10. Common errors

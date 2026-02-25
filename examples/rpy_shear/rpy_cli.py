@@ -69,12 +69,6 @@ def parse_args():
     default=1000,
     help='Simulation chunk size in steps before returning to Python/output.',
   )
-  parser.add_argument('--n_runs', type=_parse_int_like, default=8)
-  parser.add_argument(
-    '--runs_per_batch',
-    type=_parse_int_like,
-    default=None,
-    help='How many runs to execute simultaneously; remaining runs execute sequentially.')
   parser.add_argument('--stress_every', type=_parse_int_like, default=0,
                       help='Set to 0 to disable stress calculation/output.')
   parser.add_argument('--traj_every', type=_parse_int_like, default=100,
@@ -127,10 +121,6 @@ def parse_args():
     raise ValueError('dt must be > 0.')
   if float(args.xi) <= 0.0:
     raise ValueError('xi must be > 0.')
-  if args.n_runs <= 0:
-    raise ValueError('n_runs must be > 0.')
-  if args.runs_per_batch is not None and args.runs_per_batch <= 0:
-    raise ValueError('runs_per_batch must be > 0 when provided.')
   if args.n_steps <= 0:
     raise ValueError('n_steps must be > 0.')
   if args.peclet < 0.0:
