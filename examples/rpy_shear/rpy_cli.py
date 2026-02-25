@@ -37,7 +37,7 @@ def _parse_int_like(value: str) -> int:
 
 def parse_args():
   parser = argparse.ArgumentParser(
-    description='RPY shear runner with chunked stress/trajectory dumping.')
+    description='RPY shear runner with configurable stress/trajectory output.')
 
   # Experiment-facing controls.
   parser.add_argument(
@@ -62,12 +62,6 @@ def parse_args():
   parser.add_argument('--xi', type=float, default=0.5,
                       help='RPY splitting parameter xi passed as xi_override.')
   parser.add_argument('--n_steps', type=_parse_int_like, default=30000)
-  parser.add_argument(
-    '--buffer-steps',
-    type=_parse_int_like,
-    default=1000,
-    help='Simulation chunk size in steps before returning to Python/output.',
-  )
   parser.add_argument('--stress_every', type=_parse_int_like, default=0,
                       help='Set to 0 to disable stress calculation/output.')
   parser.add_argument('--traj_every', type=_parse_int_like, default=100,
@@ -128,8 +122,6 @@ def parse_args():
     raise ValueError('stress_every must be >= 0.')
   if args.traj_every < 0:
     raise ValueError('traj_every must be >= 0.')
-  if args.buffer_steps <= 0:
-    raise ValueError('buffer_steps must be > 0.')
   if args.progress_every < 0:
     raise ValueError('progress_every must be >= 0.')
   if args.mr_skin < 0.0:

@@ -118,7 +118,6 @@ python examples/rpy_shear/rpy_shear.py \
 ## 8. Important optional controls (defaults)
 
 - `--peclet 0.0`
-- `--buffer-steps 1000`
 - `--progress_every 1000`
 - `--mr-skin 0.5`
 - `--seed 42`

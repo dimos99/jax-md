@@ -197,8 +197,6 @@ def main():
   relax_neighbor_dr_threshold = float(internal['relax_neighbor_dr_threshold'])
   relax_neighbor_capacity_multiplier = float(internal['relax_neighbor_capacity_multiplier'])
 
-  buffer_steps_default = int(args.buffer_steps)
-
   if a <= 0.0:
     raise ValueError('internal default a must be > 0.')
   if kT <= 0.0:
@@ -221,8 +219,6 @@ def main():
     raise ValueError('internal default relax_neighbor_dr_threshold must be >= 0.')
   if relax_neighbor_capacity_multiplier <= 0.0:
     raise ValueError('internal default relax_neighbor_capacity_multiplier must be > 0.')
-  if buffer_steps_default <= 0:
-    raise ValueError('buffer_steps must be > 0.')
 
   # Resolve enum-like CLI/internal settings once, before runtime setup.
   format_map = {
@@ -475,120 +471,7 @@ def main():
       pair_potential_fn,
       **potential_params,
     )
-
-  # Choose chunk/sampling cadence based on enabled outputs.
-  if do_stress and do_traj:
-    scan_interval = math.gcd(args.stress_every, args.traj_every)
-    sample_period = math.lcm(args.stress_every, args.traj_every)
-  elif do_stress:
-    scan_interval = args.stress_every
-    sample_period = args.stress_every
-  elif do_traj:
-    scan_interval = args.traj_every
-    sample_period = args.traj_every
-  else:
-    # No sampled outputs; advance one full buffer per scan call.
-    scan_interval = buffer_steps_default
-    sample_period = 1
-
-  buffer_steps = buffer_steps_default
-  if sample_period > 1 and (buffer_steps % sample_period != 0):
-    buffer_steps = ((buffer_steps // sample_period) + 1) * sample_period
-    _CONSOLE.warn(
-      f'Adjusted buffer_steps to {buffer_steps} so it is divisible by sample period '
-      f'{sample_period}.'
-    )
-  if args.n_steps % buffer_steps != 0:
-    _CONSOLE.warn(
-      f'n_steps={args.n_steps} is not a multiple of buffer_steps={buffer_steps}. '
-      f'Running a final tail chunk to end exactly at n_steps.'
-    )
-  planned_steps = args.n_steps
-
-  steps_per_scan = scan_interval
-  scans_per_buffer = buffer_steps // steps_per_scan
-  stress_stride = (args.stress_every // scan_interval) if do_stress else None
-  traj_stride = (args.traj_every // scan_interval) if do_traj else None
-  stress_offset = (stress_stride - 1) if do_stress else None
-  traj_offset = (traj_stride - 1) if do_traj else None
-
-  def _run_chunk_single(carry_in):
-    state_in, interaction_neighbor_in = carry_in
-
-    def _inner(_, inner_carry):
-      s, pn = inner_carry
-      next_time = _state_next_time_from_step(s, dt=dt, t0=shear_t0)
-      next_box = box_of(t=next_time)
-      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-        s, dt=dt, shear_rate=shear_rate, t0=shear_t0)
-      pn = pn.update(pos_for_neighbor, box=next_box)
-      s = apply_fn(s, interaction_neighbor=pn)
-      return s, pn
-
-    if not do_stress and not do_traj:
-      state_out, interaction_neighbor_out = lax.fori_loop(
-        0, buffer_steps, _inner, (state_in, interaction_neighbor_in))
-      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
-      curr_box = box_of(t=curr_time)
-      interaction_neighbor_out = interaction_neighbor_out.update(
-        state_out.mobility_position, box=curr_box)
-      return (state_out, interaction_neighbor_out), ()
-
-    def _scan_body(carry, _):
-      state, interaction_neighbor = carry
-
-      state, interaction_neighbor = lax.fori_loop(
-        0, steps_per_scan, _inner, (state, interaction_neighbor))
-      curr_time = _state_time_from_step(state, dt=dt, t0=shear_t0)
-      curr_box = box_of(t=curr_time)
-      interaction_neighbor = interaction_neighbor.update(state.mobility_position, box=curr_box)
-      if do_stress:
-        stress = stress_fn(
-          state.mobility_position,
-          box=curr_box,
-          neighbor=interaction_neighbor,
-          fractional_coordinates=True,
-        )
-        strain = shear_rate * curr_time
-        step = _state_step(state, dt=dt, t0=shear_t0)
-        if do_traj:
-          out = (step, strain, stress, state.mobility_position)
-        else:
-          out = (step, strain, stress)
-      else:
-        out = (_state_step(state, dt=dt, t0=shear_t0), state.mobility_position)
-      return (state, interaction_neighbor), out
-
-    (state_out, interaction_neighbor_out), scan_out = lax.scan(
-      _scan_body,
-      (state_in, interaction_neighbor_in),
-      None,
-      length=scans_per_buffer,
-    )
-
-    if do_stress and do_traj:
-      steps, strains, stresses, positions = scan_out
-      stress_steps = steps[stress_offset::stress_stride]
-      stress_strains = strains[stress_offset::stress_stride]
-      stress_out = stresses[stress_offset::stress_stride]
-      traj_steps = steps[traj_offset::traj_stride]
-      traj_positions = positions[traj_offset::traj_stride]
-      return (
-        (state_out, interaction_neighbor_out),
-        (stress_steps, stress_strains, stress_out, traj_steps, traj_positions),
-      )
-    if do_stress:
-      steps, strains, stresses = scan_out
-      stress_steps = steps[stress_offset::stress_stride]
-      stress_strains = strains[stress_offset::stress_stride]
-      stress_out = stresses[stress_offset::stress_stride]
-      return (state_out, interaction_neighbor_out), (stress_steps, stress_strains, stress_out)
-    steps, positions = scan_out
-    traj_steps = steps[traj_offset::traj_stride]
-    traj_positions = positions[traj_offset::traj_stride]
-    return (state_out, interaction_neighbor_out), (traj_steps, traj_positions)
-
-  run_chunk = jax.jit(_run_chunk_single)
+  planned_steps = int(args.n_steps)
 
   @jax.jit
   def run_one_step(state_in, interaction_neighbor_in):
@@ -647,7 +530,6 @@ def main():
       'phi': phi,
       'dt': dt,
       'n_steps': args.n_steps,
-      'buffer_steps': args.buffer_steps,
       'peclet': args.peclet,
       'xi': args.xi,
       'stress_every': args.stress_every,
@@ -704,7 +586,6 @@ def main():
       ),
       'confin_path': confin_path,
       'planned_steps': planned_steps,
-      'buffer_steps': buffer_steps,
       'rpy_xi': xi,
       'rpy_rcut': rpy_rcut,
       'rpy_P': int(rpy_P),
@@ -775,7 +656,6 @@ def main():
     )
 
   # Execute one sheared run.
-  target_step = int(args.n_steps)
   try:
     state = init_fn(run_key, R0)
     positions_init = state.mobility_position
@@ -788,7 +668,7 @@ def main():
 
     # Write the initial configuration (t=0) before the loop
     # so the trajectory file always starts from the very first frame.
-    if traj_stride is not None:
+    if do_traj:
       dumper.dump(
         np.array([], dtype=float),        # no stress at t=0
         np.array([], dtype=float),
@@ -799,86 +679,9 @@ def main():
       )
 
     steps_done = 0
-    while steps_done + buffer_steps <= planned_steps:
-      if do_stress and do_traj:
-        (state, interaction_neighbor), (
-          stress_steps,
-          stress_strains,
-          stresses,
-          traj_steps,
-          traj_positions,
-        ) = run_chunk((state, interaction_neighbor))
-      elif do_stress:
-        (state, interaction_neighbor), (stress_steps, stress_strains, stresses) = run_chunk(
-          (state, interaction_neighbor))
-        traj_steps = None
-        traj_positions = None
-      elif do_traj:
-        (state, interaction_neighbor), (traj_steps, traj_positions) = run_chunk(
-          (state, interaction_neighbor))
-        stress_steps = None
-        stress_strains = None
-        stresses = None
-      else:
-        (state, interaction_neighbor), _ = run_chunk((state, interaction_neighbor))
-        stress_steps = None
-        stress_strains = None
-        stresses = None
-        traj_steps = None
-        traj_positions = None
-
-      if not _check_nan_positions(state, f'shear step {steps_done + buffer_steps}'):
-        return
-      if not _check_neighbor_status(state, f'shear step {steps_done + buffer_steps}'):
-        return
-      if not _check_interaction_neighbor_status(
-        interaction_neighbor, f'shear step {steps_done + buffer_steps}'):
-        return
-
-      stress_steps_np = np.asarray(stress_steps, dtype=np.int64) if do_stress else None
-      stress_strains_np = np.asarray(stress_strains) if do_stress else None
-      stresses_np = np.asarray(stresses) if do_stress else None
-      traj_steps_np = np.asarray(traj_steps, dtype=np.int64) if do_traj else None
-      traj_positions_np = np.asarray(traj_positions) if do_traj else None
-
-      if do_stress or do_traj:
-        if do_stress:
-          stress_mask = stress_steps_np <= target_step
-          out_stress_steps = stress_steps_np[stress_mask]
-          out_stress_times = out_stress_steps.astype(float) * dt + float(shear_t0)
-          out_stress_strains = stress_strains_np[stress_mask]
-          out_stresses = stresses_np[stress_mask]
-        else:
-          out_stress_times = None
-          out_stress_strains = None
-          out_stresses = None
-
-        if do_traj:
-          traj_mask = traj_steps_np <= target_step
-          out_traj_steps = traj_steps_np[traj_mask]
-          out_traj_positions = traj_positions_np[traj_mask]
-        else:
-          out_traj_steps = None
-          out_traj_positions = None
-
-        dumper.dump(
-          out_stress_times,
-          out_stress_strains,
-          out_stresses,
-          None,
-          out_traj_positions,
-          traj_steps=out_traj_steps,
-        )
-
-      steps_done += buffer_steps
-      if args.progress_every > 0 and (steps_done % args.progress_every == 0):
-        _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
-
-    tail_steps = planned_steps - steps_done
-    while tail_steps > 0:
+    while steps_done < planned_steps:
       state, interaction_neighbor = run_one_step(state, interaction_neighbor)
       steps_done += 1
-      tail_steps -= 1
 
       if not _check_nan_positions(state, f'shear step {steps_done}'):
         return
