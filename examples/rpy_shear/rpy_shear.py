@@ -296,7 +296,7 @@ def main():
     curr_box = box_of(t=curr_time)
     # Refresh neighbors at the accepted state so stress/output use current-step neighborhoods.
     interaction_neighbor_out = interaction_neighbor_out.update(
-      state_out.mobility_position, box=curr_box)
+      state_out.integrator_position, box=curr_box)
     return state_out, interaction_neighbor_out
 
   evaluate_stress = None
@@ -307,7 +307,7 @@ def main():
       curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
       curr_box = box_of(t=curr_time)
       stress = stress_fn(
-        state_in.mobility_position,
+        state_in.integrator_position,
         box=curr_box,
         neighbor=interaction_neighbor_in,
         fractional_coordinates=True,
@@ -432,9 +432,9 @@ def main():
   # Execute one sheared run.
   try:
     state = init_fn(run_key, R0)
-    positions_init = state.mobility_position
+    positions_init = state.integrator_position
     box_t0 = box_of(t=shear_t0)
-    interaction_neighbor = interaction_neighbor_fn.allocate(state.mobility_position, box=box_t0)
+    interaction_neighbor = interaction_neighbor_fn.allocate(state.integrator_position, box=box_t0)
     if not _check_neighbor_status(state, 'shear_init'):
       return
     if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
@@ -482,7 +482,7 @@ def main():
         # Use integer-step metadata to avoid float-time drift in long trajectories.
         out_traj_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
         out_traj_steps = np.array([out_traj_step], dtype=np.int64)
-        out_traj_positions = np.asarray(state.mobility_position, dtype=float)[np.newaxis]
+        out_traj_positions = np.asarray(state.integrator_position, dtype=float)[np.newaxis]
       else:
         out_traj_steps = None
         out_traj_positions = None
@@ -504,7 +504,7 @@ def main():
     final_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
     final_time = float(final_step * dt + shear_t0)
     final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
-    pos_frac = np.mod(np.asarray(state.mobility_position, dtype=float), 1.0)
+    pos_frac = np.mod(np.asarray(state.integrator_position, dtype=float), 1.0)
     pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
 
     confout_path = os.path.join(out_dir, 'confout.data')

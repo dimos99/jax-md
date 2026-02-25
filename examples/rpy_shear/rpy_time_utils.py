@@ -32,7 +32,7 @@ def _state_time_from_step(state, *, dt: float, t0: float):
     if state_time is not None:
       time_dtype = jnp.asarray(state_time).dtype
     else:
-      time_dtype = state.mobility_position.dtype
+      time_dtype = state.integrator_position.dtype
     return _time_from_step(state_step, dt=dt, t0=t0, dtype=time_dtype)
   if state_time is None:
     raise AttributeError('State must provide either step or time.')
@@ -48,7 +48,7 @@ def _state_next_time_from_step(state, *, dt: float, t0: float):
     if state_time is not None:
       time_dtype = jnp.asarray(state_time).dtype
     else:
-      time_dtype = state.mobility_position.dtype
+      time_dtype = state.integrator_position.dtype
     return _time_from_step(next_step, dt=dt, t0=t0, dtype=time_dtype)
   if state_time is None:
     raise AttributeError('State must provide either step or time.')
@@ -75,4 +75,4 @@ def _predict_xy_remapped_positions_for_next_force(
     x_new = jnp.mod(R[:, 0] + dm_cast * R[:, 1], 1.0)
     return R.at[:, 0].set(x_new)
 
-  return lax.cond(jnp.not_equal(dm, 0), _apply, lambda R: R, state.mobility_position)
+  return lax.cond(jnp.not_equal(dm, 0), _apply, lambda R: R, state.integrator_position)

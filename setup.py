@@ -39,7 +39,7 @@ INSTALL_REQUIRES = [
 ]
 
 EXTRAS_REQUIRE = {
-    'hydro': [],  # For hydrodynamic interactions
+    'hydro': ['colorama'],
 }
 
 setuptools.setup(

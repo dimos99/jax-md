@@ -73,10 +73,10 @@ def _check_interaction_neighbor_status(
 
 
 def _check_nan_positions(state, stage: str, console=None) -> bool:
-  """Returns True if mobility positions are finite; logs and returns False otherwise."""
+  """Returns True if integrator positions are finite; logs and returns False otherwise."""
   log = _CONSOLE if console is None else console
-  has_nan = bool(np.asarray(jnp.any(jnp.isnan(state.mobility_position))))
+  has_nan = bool(np.asarray(jnp.any(jnp.isnan(state.integrator_position))))
   if has_nan:
-    log.error(f'NaN detected in mobility positions during {stage}.')
+    log.error(f'NaN detected in integrator positions during {stage}.')
     return False
   return True

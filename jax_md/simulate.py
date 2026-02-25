@@ -1502,18 +1502,28 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
 
 @dataclasses.dataclass
 class RPYState:
-  """State for RPY Brownian dynamics with split-Ewald mobility."""
-  position: Array
-  mobility_position: Array
+  """State for RPY Brownian dynamics with split-Ewald mobility.
+
+  `integrator_position` follows the RPY coordinate convention:
+  fractional when `fractional_coordinates=True`, real when False.
+  `real_position` stores the real-space trajectory representation.
+  """
+  real_position: Array
+  integrator_position: Array
   rpy_state: hydro_rpy.RpyState
   rng: Array
 
 
 @dataclasses.dataclass
 class ShearedRPYState:
-  """State for RPY dynamics under shear."""
-  position: Array
-  mobility_position: Array
+  """State for RPY dynamics under shear.
+
+  `integrator_position` follows the RPY coordinate convention:
+  fractional when `fractional_coordinates=True`, real when False.
+  `real_position` stores the real-space trajectory representation.
+  """
+  real_position: Array
+  integrator_position: Array
   rpy_state: hydro_rpy.RpyState
   rng: Array
   step: Array
@@ -1584,18 +1594,18 @@ def _rpy_force_and_increment(
     force_fn: Callable[..., Array],
     apply_with_brownian: Callable,
     rpy_state: hydro_rpy.RpyState,
-    mobility_position: Array,
+    integrator_position: Array,
     key: Array,
     step_kwargs: Dict[str, Any],
     kT: float,
     dt: float,
     mr_iters: int,
 ) -> Tuple[Array, Array, Array, hydro_rpy.RpyState, Array]:
-  force = force_fn(mobility_position, **step_kwargs)
+  force = force_fn(integrator_position, **step_kwargs)
   key, brownian_key = random.split(key)
   velocities, dB, rpy_state, _, _, _ = apply_with_brownian(
       rpy_state,
-      mobility_position,
+      integrator_position,
       force,
       brownian_key,
       kT=kT,
@@ -1609,14 +1619,14 @@ def _rpy_force_and_increment(
 def _rpy_update_positions(
     *,
     shift_fn: Callable[..., Array],
-    mobility_position: Array,
-    position_real: Array,
+    integrator_position: Array,
+    real_position: Array,
     displacement_real: Array,
     step_kwargs: Dict[str, Any],
 ) -> Tuple[Array, Array]:
-  mobility_position = shift_fn(mobility_position, displacement_real, **step_kwargs)
-  position_real = position_real + displacement_real
-  return mobility_position, position_real
+  integrator_position = shift_fn(integrator_position, displacement_real, **step_kwargs)
+  real_position = real_position + displacement_real
+  return integrator_position, real_position
 
 
 def _shear_kwargs_from_dim(dim: int, gamma_xy, gamma_xz, gamma_yz) -> Dict[str, Array]:
@@ -1651,7 +1661,7 @@ def _init_reduced_shear(sf_xy, sf_xz, sf_yz, t0, dim: int, remap: bool):
 
 
 def _step_reduced_shear_and_remap(
-    mobility_position: Array,
+    integrator_position: Array,
     *,
     sf_xy,
     sf_xz,
@@ -1682,8 +1692,8 @@ def _step_reduced_shear_and_remap(
     m_yz = (m_curr_yz - m_prev_yz).astype(jnp.int32)
 
     if fractional_coordinates:
-      mobility_position = _apply_fractional_shear_remap(
-          mobility_position, m_xy, m_xz, m_yz, dim)
+      integrator_position = _apply_fractional_shear_remap(
+          integrator_position, m_xy, m_xz, m_yz, dim)
   else:
     curr_xy = f32(sf_xy(time_next))
     if dim >= 3:
@@ -1691,7 +1701,7 @@ def _step_reduced_shear_and_remap(
       curr_yz = f32(sf_yz(time_next))
     else:
       curr_xz = curr_yz = f32(0.0)
-  return mobility_position, curr_xy, curr_xz, curr_yz
+  return integrator_position, curr_xy, curr_xz, curr_yz
 
 
 def rpy(space_fns: Tuple[Callable, ...],
@@ -1755,12 +1765,12 @@ def rpy(space_fns: Tuple[Callable, ...],
   )
 
   def init_fn(key, R, **kwargs):
-    mobility_position = jnp.asarray(R)
-    rpy_state = rpy_init(mobility_position, **kwargs)
+    integrator_position = jnp.asarray(R)
+    rpy_state = rpy_init(integrator_position, **kwargs)
     box_matrix = rpy_state.real.box_matrix
-    position_real = space.transform(box_matrix, mobility_position)
-    return RPYState(position=position_real,
-                    mobility_position=mobility_position,
+    real_position = space.transform(box_matrix, integrator_position)
+    return RPYState(real_position=real_position,
+                    integrator_position=integrator_position,
                     rpy_state=rpy_state,
                     rng=key)
 
@@ -1769,8 +1779,8 @@ def rpy(space_fns: Tuple[Callable, ...],
     _kT = step_kwargs.pop('kT', kT)
     _mr_iters = step_kwargs.pop('mr_iters', mr_iters)
 
-    R_mobility = state.mobility_position
-    R_real = state.position
+    R_integrator = state.integrator_position
+    R_real = state.real_position
     rpy_state = state.rpy_state
     key = state.rng
 
@@ -1778,7 +1788,7 @@ def rpy(space_fns: Tuple[Callable, ...],
         force_fn=force_fn,
         apply_with_brownian=apply_with_brownian,
         rpy_state=rpy_state,
-        mobility_position=R_mobility,
+        integrator_position=R_integrator,
         key=key,
         step_kwargs=step_kwargs,
         kT=_kT,
@@ -1790,16 +1800,16 @@ def rpy(space_fns: Tuple[Callable, ...],
     # NOTE: RPY mobility already returns velocities and dB in real coordinates,
     # so no transformation is needed.
     displacement_real = _dt * velocities + dB
-    R_mobility, R_real = _rpy_update_positions(
+    R_integrator, R_real = _rpy_update_positions(
         shift_fn=shift_fn,
-        mobility_position=R_mobility,
-        position_real=R_real,
+        integrator_position=R_integrator,
+        real_position=R_real,
         displacement_real=displacement_real,
         step_kwargs=step_kwargs,
     )
 
-    return RPYState(position=R_real,
-                    mobility_position=R_mobility,
+    return RPYState(real_position=R_real,
+                    integrator_position=R_integrator,
                     rpy_state=rpy_state,
                     rng=key)
 
@@ -1885,27 +1895,27 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
   )
 
   def init_fn(key, R, **kwargs):
-    mobility_position = jnp.asarray(R)
+    integrator_position = jnp.asarray(R)
     shear_kwargs = dict(kwargs)
 
     curr_xy, curr_xz, curr_yz = _init_reduced_shear(
         sf_xy, sf_xz, sf_yz, t0, dim, remap)
     shear_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
 
-    rpy_state = rpy_init(mobility_position, **shear_kwargs)
-    F0 = force_fn(mobility_position, **shear_kwargs)
+    rpy_state = rpy_init(integrator_position, **shear_kwargs)
+    F0 = force_fn(integrator_position, **shear_kwargs)
 
     if fractional_coordinates:
       box_matrix0 = rpy_state.real.box_matrix
-      position_real0 = space.transform(box_matrix0, mobility_position)
+      real_position0 = space.transform(box_matrix0, integrator_position)
     else:
-      position_real0 = mobility_position
+      real_position0 = integrator_position
 
     step0 = jnp.array(0, dtype=jnp.int32)
     time0 = t0 + _dt * step0.astype(_dt.dtype)
 
-    return ShearedRPYState(position=position_real0,
-                           mobility_position=mobility_position,
+    return ShearedRPYState(real_position=real_position0,
+                           integrator_position=integrator_position,
                            rpy_state=rpy_state,
                            rng=key,
                            step=step0,
@@ -1917,8 +1927,8 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     _kT = step_kwargs.pop('kT', kT)
     _mr_iters = step_kwargs.pop('mr_iters', mr_iters)
 
-    mobility_position = state.mobility_position
-    position_real = state.position
+    integrator_position = state.integrator_position
+    real_position = state.real_position
     rpy_state = state.rpy_state
     key = state.rng
     prev_step = jnp.asarray(state.step, dtype=jnp.int32)
@@ -1926,8 +1936,8 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
     time_prev = t0 + _dt * prev_step.astype(_dt.dtype)
     time_next = t0 + _dt * next_step.astype(_dt.dtype)
 
-    mobility_position, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
-        mobility_position,
+    integrator_position, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
+        integrator_position,
         sf_xy=sf_xy,
         sf_xz=sf_xz,
         sf_yz=sf_yz,
@@ -1946,7 +1956,7 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
         force_fn=force_fn,
         apply_with_brownian=apply_with_brownian,
         rpy_state=rpy_state,
-        mobility_position=mobility_position,
+        integrator_position=integrator_position,
         key=key,
         step_kwargs=step_kwargs,
         kT=_kT,
@@ -1954,14 +1964,14 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
         mr_iters=_mr_iters,
     )
     displacement = _dt * velocities + dB
-    mobility_position = shift_fn(mobility_position, displacement, **step_kwargs)
+    integrator_position = shift_fn(integrator_position, displacement, **step_kwargs)
     if fractional_coordinates:
-      position_real = space.transform(current_box, mobility_position)
+      real_position = space.transform(current_box, integrator_position)
     else:
-      position_real = mobility_position
+      real_position = integrator_position
 
-    return ShearedRPYState(position=position_real,
-                           mobility_position=mobility_position,
+    return ShearedRPYState(real_position=real_position,
+                           integrator_position=integrator_position,
                            rpy_state=rpy_state,
                            rng=key,
                            step=next_step,
