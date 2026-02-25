@@ -186,6 +186,7 @@ class RunDumper:
     box_fn=None,
     base_box=None,
     shear_rate: float = 0.0,
+    time_offset: float = 0.0,
     shear_remap: bool = True,
     unwrap_trajectory: bool = True,
   ):
@@ -197,6 +198,7 @@ class RunDumper:
     self.stress_every = int(stress_every)
     self.box_fn = box_fn
     self.shear_rate = float(shear_rate)
+    self.time_offset = float(time_offset)
     self.shear_remap = bool(shear_remap)
     self.unwrap_trajectory = bool(unwrap_trajectory)
     self.prev_frac_unwrapped = None
@@ -300,6 +302,7 @@ class RunDumper:
     stress,
     traj_times=None,
     traj_positions=None,
+    traj_steps=None,
   ):
     def _ordered_stress_components(s):
       s = np.asarray(s)
@@ -323,15 +326,41 @@ class RunDumper:
       if lines:
         self.stress_file.writelines(lines)
 
-    if self.traj_file is None or traj_times is None or traj_positions is None:
+    if self.traj_file is None or traj_positions is None:
       return
 
+    if traj_steps is None and traj_times is None:
+      return
+
+    if traj_steps is not None:
+      traj_steps = np.asarray(traj_steps, dtype=np.int64).reshape(-1)
+      if len(traj_steps) != len(traj_positions):
+        raise ValueError(
+          'traj_steps and traj_positions must have the same frame count '
+          f'({len(traj_steps)} vs {len(traj_positions)}).'
+        )
+      traj_meta = [(int(step_i), float(self.time_offset + step_i * self.dt))
+                   for step_i in traj_steps]
+    else:
+      traj_times = np.asarray(traj_times, dtype=float).reshape(-1)
+      if len(traj_times) != len(traj_positions):
+        raise ValueError(
+          'traj_times and traj_positions must have the same frame count '
+          f'({len(traj_times)} vs {len(traj_positions)}).'
+        )
+      traj_meta = [
+        (
+          int(round((float(t_i) - self.time_offset) / self.dt)),
+          float(t_i),
+        )
+        for t_i in traj_times
+      ]
+
     traj_lines = []
-    for t, pos_frac in zip(traj_times, traj_positions):
-      timestep = int(round(float(t) / self.dt))
-      box_t = self._box_matrix_at_time(float(t))
+    for (timestep, t), pos_frac in zip(traj_meta, traj_positions):
+      box_t = self._box_matrix_at_time(t)
       pos_frac = np.asarray(pos_frac, dtype=float)
-      pos_frac = self._deremap_fractional(pos_frac, float(t))
+      pos_frac = self._deremap_fractional(pos_frac, t)
       pos_frac = self._unwrap_fractional_continuously(pos_frac)
       traj_lines.append('ITEM: TIMESTEP\n')
       traj_lines.append(f'{timestep}\n')

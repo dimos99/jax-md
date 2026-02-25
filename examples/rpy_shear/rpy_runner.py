@@ -746,6 +746,8 @@ def main():
   scans_per_buffer = buffer_steps // steps_per_scan
   stress_stride = (args.stress_every // scan_interval) if do_stress else None
   traj_stride = (args.traj_every // scan_interval) if do_traj else None
+  stress_offset = (stress_stride - 1) if do_stress else None
+  traj_offset = (traj_stride - 1) if do_traj else None
 
   def _run_chunk_single(carry_in):
     state_in, interaction_neighbor_in = carry_in
@@ -803,24 +805,24 @@ def main():
 
     if do_stress and do_traj:
       steps, strains, stresses, positions = scan_out
-      stress_steps = steps[::stress_stride]
-      stress_strains = strains[::stress_stride]
-      stress_out = stresses[::stress_stride]
-      traj_steps = steps[::traj_stride]
-      traj_positions = positions[::traj_stride]
+      stress_steps = steps[stress_offset::stress_stride]
+      stress_strains = strains[stress_offset::stress_stride]
+      stress_out = stresses[stress_offset::stress_stride]
+      traj_steps = steps[traj_offset::traj_stride]
+      traj_positions = positions[traj_offset::traj_stride]
       return (
         (state_out, interaction_neighbor_out),
         (stress_steps, stress_strains, stress_out, traj_steps, traj_positions),
       )
     if do_stress:
       steps, strains, stresses = scan_out
-      stress_steps = steps[::stress_stride]
-      stress_strains = strains[::stress_stride]
-      stress_out = stresses[::stress_stride]
+      stress_steps = steps[stress_offset::stress_stride]
+      stress_strains = strains[stress_offset::stress_stride]
+      stress_out = stresses[stress_offset::stress_stride]
       return (state_out, interaction_neighbor_out), (stress_steps, stress_strains, stress_out)
     steps, positions = scan_out
-    traj_steps = steps[::traj_stride]
-    traj_positions = positions[::traj_stride]
+    traj_steps = steps[traj_offset::traj_stride]
+    traj_positions = positions[traj_offset::traj_stride]
     return (state_out, interaction_neighbor_out), (traj_steps, traj_positions)
 
   run_chunk = jax.jit(jax.vmap(_run_chunk_single))
@@ -1000,6 +1002,7 @@ def main():
       box_fn=dump_box_fn,
       base_box=base_box_np,
       shear_rate=shear_rate,
+      time_offset=shear_t0,
       shear_remap=True,
       unwrap_trajectory=True,
     )
@@ -1122,7 +1125,6 @@ def main():
 
       # Write the initial configuration (t=0) before the loop
       # so the trajectory file always starts from the very first frame.
-      t0 = float(shear_t0)
       for local_i, run_id in enumerate(batch_ids):
         dumper = dumpers[run_id]
         pos0 = np.asarray(positions_init[local_i], dtype=float)
@@ -1131,8 +1133,9 @@ def main():
             np.array([], dtype=float),        # no stress at t=0
             np.array([], dtype=float),
             np.zeros((0, dim, dim), dtype=float),
-            np.array([t0], dtype=float),
+            None,
             pos0[np.newaxis],                 # shape (1, N, dim)
+            traj_steps=np.array([0], dtype=np.int64),
           )
 
       steps_done = 0
@@ -1200,18 +1203,18 @@ def main():
             if do_traj:
               traj_mask = traj_steps_np[local_i] <= target_step
               out_traj_steps = traj_steps_np[local_i][traj_mask]
-              out_traj_times = out_traj_steps.astype(float) * dt + float(shear_t0)
               out_traj_positions = traj_positions_np[local_i][traj_mask]
             else:
-              out_traj_times = None
+              out_traj_steps = None
               out_traj_positions = None
 
             dumper.dump(
               out_stress_times,
               out_stress_strains,
               out_stresses,
-              out_traj_times,
+              None,
               out_traj_positions,
+              traj_steps=out_traj_steps,
             )
 
         steps_done += buffer_steps
@@ -1259,10 +1262,6 @@ def main():
             np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
             if emit_traj else None
           )
-          traj_times_np = (
-            traj_steps_np.astype(float) * dt + float(shear_t0)
-            if emit_traj else None
-          )
           traj_positions_np = np.asarray(state.mobility_position) if emit_traj else None
           for local_i, run_id in enumerate(batch_ids):
             dumper = dumpers[run_id]
@@ -1278,18 +1277,19 @@ def main():
               out_stresses = None
 
             if emit_traj:
-              out_traj_times = np.array([traj_times_np[local_i]], dtype=float)
+              out_traj_steps = np.array([traj_steps_np[local_i]], dtype=np.int64)
               out_traj_positions = traj_positions_np[local_i][np.newaxis]
             else:
-              out_traj_times = None
+              out_traj_steps = None
               out_traj_positions = None
 
             dumper.dump(
               out_stress_times,
               out_stress_strains,
               out_stresses,
-              out_traj_times,
+              None,
               out_traj_positions,
+              traj_steps=out_traj_steps,
             )
 
         if args.progress_every > 0 and (steps_done % args.progress_every == 0):
