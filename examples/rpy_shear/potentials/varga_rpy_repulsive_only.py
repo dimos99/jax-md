@@ -17,7 +17,7 @@ POTENTIAL_NAME = "varga_rpy_repulsive_only"
 POTENTIAL_PARAMS = {
   "particle_radius": 1.0,              # a (length)
   "viscosity": 1.0 / (6.0 * jnp.pi),   # eta
-  "repulsion_dt": 1e-4,                # overridden to --dt in rpy_runner.py
+  "repulsion_dt": 1e-4,                # overridden to --dt in rpy_shear.py
   "r_cut": 2.0,                        # 2a
   "r_min": 1e-6,                       # avoids r=0 in log term
 }
