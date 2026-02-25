@@ -173,22 +173,6 @@ def _check_nan_positions(state, stage: str) -> bool:
   return True
 
 
-def _build_thermalize_runner(apply_fn_eq, steps: int, base_box: jnp.ndarray):
-  """Returns a thermalization runner for exactly `steps` steps."""
-  if steps <= 0:
-    return None
-
-  def _single(state, interaction_neighbor):
-    def _step(_, carry):
-      s, pn = carry
-      pn = pn.update(s.mobility_position, box=base_box)
-      s = apply_fn_eq(s, interaction_neighbor=pn)
-      return s, pn
-    return lax.fori_loop(0, steps, _step, (state, interaction_neighbor))
-
-  return jax.jit(_single)
-
-
 def main():
   args = parse_args()
   wall_start = time.perf_counter()
@@ -374,7 +358,7 @@ def main():
 
   # Build the initial particle configuration in fractional coordinates.
   key = random.PRNGKey(args.seed)
-  key, init_key, thermalize_key, run_key = random.split(key, 4)
+  _, init_key, run_key = random.split(key, 3)
   if init_mode in ('dump', 'data'):
     init_info = dump_info if init_mode == 'dump' else data_info
     R0 = jnp.asarray(
@@ -398,23 +382,10 @@ def main():
   _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
 
   # Construct force/energy and interaction neighbor-list operators.
-  metric_0 = space.canonicalize_displacement_or_metric(displacement_0)
   metric_shear = space.canonicalize_displacement_or_metric(displacement)
-  energy_fn_0_all_pairs = smap.pair(
-    pair_potential_fn,
-    metric_0,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
   energy_fn_all_pairs = smap.pair(
     pair_potential_fn,
     metric_shear,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
-  energy_fn_0_neighbor = smap.pair_neighbor_list(
-    pair_potential_fn,
-    metric_0,
     ignore_unused_parameters=True,
     **potential_params,
   )
@@ -424,22 +395,9 @@ def main():
     ignore_unused_parameters=True,
     **potential_params,
   )
-  energy_fn_0 = _wrap_neighbor_energy(
-    energy_fn_0_neighbor,
-    energy_all_pairs_fn=energy_fn_0_all_pairs,
-  )
   energy_fn = _wrap_neighbor_energy(
     energy_fn_neighbor,
     energy_all_pairs_fn=energy_fn_all_pairs,
-  )
-  interaction_neighbor_fn_0 = partition.neighbor_list(
-    metric_0,
-    base_box,
-    r_cutoff=potential_r_cut,
-    dr_threshold=interaction_neighbor_dr_threshold,
-    capacity_multiplier=interaction_neighbor_capacity_multiplier,
-    fractional_coordinates=True,
-    format=interaction_neighbor_format,
   )
   interaction_neighbor_fn = partition.neighbor_list(
     metric_shear,
@@ -453,7 +411,7 @@ def main():
 
   shear_t_bounds = (
     0.0,
-    float(dt * float(args.thermalize_steps + args.n_steps)),
+    float(dt * float(args.n_steps)),
   )
   rpy_params = rpy.estimate_rpy_params(
     tol=tol,
@@ -486,7 +444,7 @@ def main():
       f'(remap={diagnostics.shear_remap})'
     )
 
-  # Build equilibrium/sheared RPY integrators from the resolved parameters.
+  # Build sheared RPY integrator from the resolved parameters.
   init_fn, apply_fn = simulate.rpy_with_shear(
     (displacement, shift, box_of),
     energy_fn,
@@ -497,26 +455,6 @@ def main():
     eta=viscosity,
     shear_vector_schedule=shear_vector_schedule,
     t0=shear_t0,
-    neighbor_format=format_map[mr_neighbor_format],
-    dr_threshold=mr_dr_threshold,
-    capacity_multiplier=mr_capacity_multiplier,
-    real_space_mode=real_space_mode,
-    rcut=rpy_rcut,
-    P=rpy_P,
-    Mgrid=rpy_M,
-    theta=rpy_theta,
-    lattice_extent=rpy_lattice_extent,
-    mr_iters=mr_iters,
-  )
-
-  init_fn_eq, apply_fn_eq = simulate.rpy(
-    (displacement_0, shift_0),
-    energy_fn_0,
-    dt=dt,
-    kT=kT,
-    a=a,
-    xi=xi,
-    eta=viscosity,
     neighbor_format=format_map[mr_neighbor_format],
     dr_threshold=mr_dr_threshold,
     capacity_multiplier=mr_capacity_multiplier,
@@ -566,10 +504,6 @@ def main():
       f'Running a final tail chunk to end exactly at n_steps.'
     )
   planned_steps = args.n_steps
-
-  thermalize_chunk_steps = buffer_steps
-  if args.thermalize_steps > 0:
-    thermalize_chunk_steps = max(1, min(buffer_steps, args.thermalize_steps))
 
   steps_per_scan = scan_interval
   scans_per_buffer = buffer_steps // steps_per_scan
@@ -686,15 +620,6 @@ def main():
       strain = shear_rate * curr_time
       return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
 
-  thermalize_runner_cache = {}
-
-  def _get_thermalize_runner(step_count: int):
-    runner = thermalize_runner_cache.get(step_count, None)
-    if runner is None:
-      runner = _build_thermalize_runner(apply_fn_eq, step_count, base_box)
-      thermalize_runner_cache[step_count] = runner
-    return runner
-
   out_dir = args.out_dir
   os.makedirs(out_dir, exist_ok=True)
   confin_path = os.path.join(out_dir, 'confin.data')
@@ -722,7 +647,6 @@ def main():
       'phi': phi,
       'dt': dt,
       'n_steps': args.n_steps,
-      'thermalize_steps': args.thermalize_steps,
       'buffer_steps': args.buffer_steps,
       'peclet': args.peclet,
       'xi': args.xi,
@@ -781,7 +705,6 @@ def main():
       'confin_path': confin_path,
       'planned_steps': planned_steps,
       'buffer_steps': buffer_steps,
-      'thermalize_chunk_steps': thermalize_chunk_steps,
       'rpy_xi': xi,
       'rpy_rcut': rpy_rcut,
       'rpy_P': int(rpy_P),
@@ -832,11 +755,6 @@ def main():
     f'Running one sheared trajectory for {planned_steps} steps '
     f'(requested {args.n_steps}).'
   )
-  if args.thermalize_steps > 0:
-    _CONSOLE.info(
-      'Thermalization execution chunk: '
-      f'{thermalize_chunk_steps} step(s) per JAX call.'
-    )
   if do_stress and do_traj:
     _CONSOLE.info(f'Outputs: stress.dat + traj.dump in {out_dir}')
   elif do_stress:
@@ -856,45 +774,11 @@ def main():
       f'with positions loaded from {args.init_data}.'
     )
 
-  # Execute one run: optional thermalization followed by production.
+  # Execute one sheared run.
   target_step = int(args.n_steps)
   try:
-    state_eq = init_fn_eq(thermalize_key, R0)
-    interaction_neighbor_eq = interaction_neighbor_fn_0.allocate(
-      state_eq.mobility_position, box=base_box)
-    if not _check_neighbor_status(state_eq, 'equilibrium_init'):
-      return
-    if not _check_interaction_neighbor_status(interaction_neighbor_eq, 'equilibrium_init'):
-      return
-
-    if args.thermalize_steps > 0:
-      therm_done = 0
-      next_progress_mark = args.progress_every if args.progress_every > 0 else None
-      while therm_done < args.thermalize_steps:
-        step_count = min(thermalize_chunk_steps, args.thermalize_steps - therm_done)
-        runner = _get_thermalize_runner(step_count)
-        state_eq, interaction_neighbor_eq = runner(state_eq, interaction_neighbor_eq)
-        therm_done += step_count
-
-        if not _check_nan_positions(state_eq, f'thermalization step {therm_done}'):
-          return
-        if not _check_neighbor_status(state_eq, f'thermalization step {therm_done}'):
-          return
-        if not _check_interaction_neighbor_status(
-          interaction_neighbor_eq, f'thermalization step {therm_done}'):
-          return
-        while (
-          next_progress_mark is not None
-          and therm_done >= next_progress_mark
-          and next_progress_mark <= args.thermalize_steps
-        ):
-          _CONSOLE.progress(f'Thermalize {next_progress_mark}/{args.thermalize_steps}')
-          next_progress_mark += args.progress_every
-    else:
-      _CONSOLE.info('Skipping thermalization (thermalize_steps=0).')
-
-    positions_init = state_eq.mobility_position
-    state = init_fn(run_key, positions_init)
+    state = init_fn(run_key, R0)
+    positions_init = state.mobility_position
     box_t0 = box_of(t=shear_t0)
     interaction_neighbor = interaction_neighbor_fn.allocate(state.mobility_position, box=box_t0)
     if not _check_neighbor_status(state, 'shear_init'):
@@ -1058,7 +942,7 @@ def main():
     dumper.close()
 
   elapsed_s = time.perf_counter() - wall_start
-  total_steps = int(args.thermalize_steps + planned_steps)
+  total_steps = int(planned_steps)
   _CONSOLE.section('Timing')
   _CONSOLE.info(f'Total wall time: {elapsed_s:.3f} s')
   if total_steps > 0 and elapsed_s > 0.0:

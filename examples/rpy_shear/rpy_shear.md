@@ -118,7 +118,6 @@ python examples/rpy_shear/rpy_shear.py \
 ## 8. Important optional controls (defaults)
 
 - `--peclet 0.0`
-- `--thermalize_steps 0`
 - `--buffer-steps 1000`
 - `--progress_every 1000`
 - `--mr-skin 0.5`
@@ -130,10 +129,7 @@ python examples/rpy_shear/rpy_shear.py \
 For integer-valued count/step flags, scientific notation is accepted as long as
 the value is still an integer (example: `--n_steps 6e6`).
 
-## 9. Thermalization and outputs
-
-Thermalization (`--thermalize_steps`) always runs at equilibrium (`Pe=0`) and writes no production data.
-Only progress logs are printed during thermalization.
+## 9. Outputs
 
 Production files in `--out_dir` (depending on settings):
 

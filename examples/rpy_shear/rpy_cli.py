@@ -62,7 +62,6 @@ def parse_args():
   parser.add_argument('--xi', type=float, default=0.5,
                       help='RPY splitting parameter xi passed as xi_override.')
   parser.add_argument('--n_steps', type=_parse_int_like, default=30000)
-  parser.add_argument('--thermalize_steps', type=_parse_int_like, default=0)
   parser.add_argument(
     '--buffer-steps',
     type=_parse_int_like,
@@ -129,8 +128,6 @@ def parse_args():
     raise ValueError('stress_every must be >= 0.')
   if args.traj_every < 0:
     raise ValueError('traj_every must be >= 0.')
-  if args.thermalize_steps < 0:
-    raise ValueError('thermalize_steps must be >= 0.')
   if args.buffer_steps <= 0:
     raise ValueError('buffer_steps must be > 0.')
   if args.progress_every < 0:
