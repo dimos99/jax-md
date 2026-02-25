@@ -45,9 +45,11 @@ _CONSOLE = get_console()
 
 def main():
   """Runs one configurable RPY shear trajectory and writes run artifacts."""
+  # Parse CLI arguments and capture wall-clock start for end-of-run timing.
   args = parse_args()
   wall_start = time.perf_counter()
 
+  # Resolve runtime settings.
   # Resolve typed runtime settings from internal defaults and CLI values.
   internal = build_internal_config()
   runtime = _resolve_runtime_settings(args, internal)
@@ -55,6 +57,7 @@ def main():
   kT = runtime['kT']
   viscosity = runtime['viscosity']
   dt = runtime['dt']
+  # Keep downstream serialization/logging on a single normalized timestep value.
   args.dt = dt
   mr_iters = runtime['mr_iters']
   tol = runtime['tol']
@@ -71,6 +74,7 @@ def main():
   # Resolve enum-like settings once before building runtime operators.
   format_map = _build_format_map()
 
+  # Log backend/device context once for reproducibility diagnostics.
   devices = jax.devices()
   device_labels = ', '.join(
     f'{d.platform}:{getattr(d, "device_kind", "device")}' for d in devices)
@@ -78,6 +82,7 @@ def main():
   _CONSOLE.info(f'JAX backend: {jax.default_backend()}')
   _CONSOLE.info(f'JAX devices: {device_labels}')
 
+  # Resolve initial conditions.
   # Resolve initialization mode and initial box from CLI inputs.
   dim = 3
   diameter = 2.0 * a
@@ -89,6 +94,7 @@ def main():
   phi = initial_system['phi']
   base_box = initial_system['base_box']
 
+  # Derive box/shear dynamics.
   # Derive scalar transport and shear quantities from the resolved system.
   dynamics = _derive_system_dynamics(
     base_box=base_box,
@@ -112,6 +118,7 @@ def main():
   _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
   _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
 
+  # Resolve pair potential and interaction-neighbor defaults.
   potential_setup = _resolve_potential_setup(
     potential_arg=args.potential,
     dt=dt,
@@ -140,6 +147,7 @@ def main():
     f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
   )
 
+  # Build sheared displacement/shift operators used throughout the run.
   displacement, shift, box_of = space.shearing(
     base_box,
     shear_schedule=shear_schedule,
@@ -148,6 +156,7 @@ def main():
   )
   displacement_0, shift_0 = space.periodic_general(base_box, fractional_coordinates=True)
 
+  # Build initial particle coordinates.
   # Build the initial particle configuration in fractional coordinates.
   initial_positions = _build_initial_positions(
     init_mode=init_mode,
@@ -171,8 +180,10 @@ def main():
   min_dist = initial_positions['min_dist']
   _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
 
+  # Build force and neighbor operators.
   # Construct force/energy and interaction neighbor-list operators.
   metric_shear = space.canonicalize_displacement_or_metric(displacement)
+  # Use canonicalized metric with remapped shearing so pair distances match runtime geometry.
   energy_fn_all_pairs = smap.pair(
     pair_potential_fn,
     metric_shear,
@@ -199,10 +210,12 @@ def main():
     format=interaction_neighbor_format,
   )
 
+  # Bound the estimator over the full planned simulation time interval.
   shear_t_bounds = (
     0.0,
     float(dt * float(args.n_steps)),
   )
+  # Estimate Ewald/real-space split parameters before integrator construction.
   rpy_params = rpy.estimate_rpy_params(
     tol=tol,
     A=base_box,
@@ -234,6 +247,7 @@ def main():
       f'(remap={diagnostics.shear_remap})'
     )
 
+  # Configure integrator and optional stress path.
   # Build sheared RPY integrator from the resolved parameters.
   init_fn, apply_fn = simulate.rpy_with_shear(
     (displacement, shift, box_of),
@@ -274,11 +288,13 @@ def main():
     next_box = box_of(t=next_time)
     pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
       state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+    # Predictive update keeps pair-force neighbors aligned with the next force evaluation geometry.
     interaction_neighbor_out = interaction_neighbor_in.update(
       pos_for_neighbor, box=next_box)
     state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
     curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
     curr_box = box_of(t=curr_time)
+    # Refresh neighbors at the accepted state so stress/output use current-step neighborhoods.
     interaction_neighbor_out = interaction_neighbor_out.update(
       state_out.mobility_position, box=curr_box)
     return state_out, interaction_neighbor_out
@@ -287,6 +303,7 @@ def main():
   if do_stress:
     @jax.jit
     def evaluate_stress(state_in, interaction_neighbor_in):
+      # Stress uses the current sheared box to stay consistent with periodic triclinic geometry.
       curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
       curr_box = box_of(t=curr_time)
       stress = stress_fn(
@@ -298,6 +315,7 @@ def main():
       strain = shear_rate * curr_time
       return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
 
+  # Prepare output artifacts.
   out_dir = args.out_dir
   os.makedirs(out_dir, exist_ok=True)
   confin_path = os.path.join(out_dir, 'confin.data')
@@ -319,6 +337,7 @@ def main():
     _CONSOLE.info(f'Wrote initial configuration to {confin_path}')
 
   # Persist full runtime configuration once before launching trajectories.
+  # Persist full run metadata once so downstream analysis has complete provenance.
   params = _build_params_payload(
     args=args,
     n_particles=n_particles,
@@ -366,6 +385,7 @@ def main():
   params_path = _write_params_json(out_dir, params)
   _CONSOLE.info(f'Wrote parameters to {params_path}')
 
+  # Dumper writes reduced-box snapshots while preserving continuous unwrapped trajectories.
   dump_box_fn = _build_reduced_xy_box_fn(np.asarray(base_box, dtype=float), shear_rate)
   base_box_np = np.asarray(base_box, dtype=float)
   dumper = RunDumper(
@@ -383,6 +403,7 @@ def main():
     unwrap_trajectory=True,
   )
 
+  # Run plan summary.
   _CONSOLE.section('Run Plan')
   _CONSOLE.info(
     f'Running one sheared trajectory for {planned_steps} steps '
@@ -407,6 +428,7 @@ def main():
       f'with positions loaded from {args.init_data}.'
     )
 
+  # Execute timestepping and periodic emissions.
   # Execute one sheared run.
   try:
     state = init_fn(run_key, R0)
@@ -442,6 +464,7 @@ def main():
       if not _check_interaction_neighbor_status(interaction_neighbor, f'shear step {steps_done}'):
         return
 
+      # Stress and trajectory are emitted on independent cadences.
       emit_stress = do_stress and (steps_done % args.stress_every == 0)
       emit_traj = do_traj and (steps_done % args.traj_every == 0)
       if emit_stress:
@@ -456,6 +479,7 @@ def main():
         out_stresses = None
 
       if emit_traj:
+        # Use integer-step metadata to avoid float-time drift in long trajectories.
         out_traj_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
         out_traj_steps = np.array([out_traj_step], dtype=np.int64)
         out_traj_positions = np.asarray(state.mobility_position, dtype=float)[np.newaxis]
@@ -476,6 +500,7 @@ def main():
       if args.progress_every > 0 and (steps_done % args.progress_every == 0):
         _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
 
+    # Final snapshot uses exact integer step metadata and the corresponding reduced sheared box.
     final_step = int(np.asarray(_state_step(state, dt=dt, t0=shear_t0)))
     final_time = float(final_step * dt + shear_t0)
     final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
@@ -496,6 +521,7 @@ def main():
   finally:
     dumper.close()
 
+  # Emit wall-clock timing diagnostics.
   elapsed_s = time.perf_counter() - wall_start
   total_steps = int(planned_steps)
   _CONSOLE.section('Timing')
