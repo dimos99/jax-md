@@ -75,6 +75,15 @@ def parse_args():
     default=0.5,
     help='Real-space mobility neighbor-list skin (dr_threshold).',
   )
+  parser.add_argument(
+    '--mr-capacity-multiplier',
+    type=float,
+    default=None,
+    help=(
+      'Override real-space mobility neighbor-list capacity multiplier. '
+      'If omitted, the internal default is used.'
+    ),
+  )
   parser.add_argument('--seed', type=_parse_int_like, default=42)
   parser.add_argument(
     '--out_dir',
@@ -126,6 +135,8 @@ def parse_args():
     raise ValueError('progress_every must be >= 0.')
   if args.mr_skin < 0.0:
     raise ValueError('mr_skin must be >= 0.')
+  if args.mr_capacity_multiplier is not None and args.mr_capacity_multiplier <= 0.0:
+    raise ValueError('mr_capacity_multiplier must be > 0 when provided.')
   if args.init_traj is not None and args.init_data is not None:
     raise ValueError('--init-traj and --init-data cannot be used together.')
   if args.init_traj is not None or args.init_data is not None:

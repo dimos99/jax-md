@@ -32,7 +32,11 @@ def _resolve_runtime_settings(args, internal_cfg) -> dict:
 
   mr_neighbor_format = str(internal_cfg['mr_neighbor_format'])
   mr_dr_threshold = float(args.mr_skin)
-  mr_capacity_multiplier = float(internal_cfg['mr_capacity_multiplier'])
+  mr_capacity_multiplier = (
+    float(args.mr_capacity_multiplier)
+    if args.mr_capacity_multiplier is not None
+    else float(internal_cfg['mr_capacity_multiplier'])
+  )
   real_space_mode = str(internal_cfg['real_space_mode'])
 
   relax_steps = int(internal_cfg['relax_steps'])
@@ -53,7 +57,7 @@ def _resolve_runtime_settings(args, internal_cfg) -> dict:
   if mr_dr_threshold < 0.0:
     raise ValueError('mr_skin must be >= 0.')
   if mr_capacity_multiplier <= 0.0:
-    raise ValueError('internal default mr_capacity_multiplier must be > 0.')
+    raise ValueError('mr_capacity_multiplier must be > 0.')
   if real_space_mode not in ('auto', 'min_image', 'lattice'):
     raise ValueError("internal default real_space_mode must be one of 'auto', 'min_image', or 'lattice'.")
   if relax_steps < 0:

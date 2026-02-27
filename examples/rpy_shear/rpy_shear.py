@@ -45,6 +45,9 @@ _CONSOLE = get_console()
 
 def main():
   """Runs one configurable RPY shear trajectory and writes run artifacts."""
+  # ============================================================================
+  # PREPARATION
+  # ============================================================================
   # Parse CLI arguments and capture wall-clock start for end-of-run timing.
   args = parse_args()
   wall_start = time.perf_counter()
@@ -281,6 +284,7 @@ def main():
     )
   planned_steps = int(args.n_steps)
 
+  # This is the main JIT-compiled step function used in the inner loop of the shearing run.
   @jax.jit
   def run_one_step(state_in, interaction_neighbor_in):
     # Update interaction neighbors at the next box/time, then integrate one step.
@@ -428,13 +432,19 @@ def main():
       f'with positions loaded from {args.init_data}.'
     )
 
+
+
+  # ============================================================================
+  # SIMULATION
+  # ============================================================================
   # Execute timestepping and periodic emissions.
-  # Execute one sheared run.
-  try:
-    state = init_fn(run_key, R0)
-    positions_init = state.integrator_position
+  # Execute one shearing run.
+  try: # Ensure dumper is closed to flush buffers even if the run fails.
+    state = init_fn(run_key, R0) # Initializes integrator state (positions, forces, and RPY quadrature cache).
+    positions_init = state.integrator_position # shape (N, dim) in fractional coordinates
     box_t0 = box_of(t=shear_t0)
-    interaction_neighbor = interaction_neighbor_fn.allocate(state.integrator_position, box=box_t0)
+    # Allocate the initial neighbor list at the first box
+    interaction_neighbor = interaction_neighbor_fn.allocate(state.integrator_position, box=box_t0) 
     if not _check_neighbor_status(state, 'shear_init'):
       return
     if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
@@ -443,15 +453,26 @@ def main():
     # Write the initial configuration (t=0) before the loop
     # so the trajectory file always starts from the very first frame.
     if do_traj:
+      if do_stress:
+        stress_step, _, stress_strain, stress = evaluate_stress(state, interaction_neighbor)
+        out_stress_times = np.array(
+          [int(np.asarray(stress_step)) * dt + float(shear_t0)], dtype=float)
+        out_stress_strains = np.array([float(np.asarray(stress_strain))], dtype=float)
+        out_stresses = np.asarray(stress, dtype=float)[np.newaxis]
+      else:
+        out_stress_times = np.array([], dtype=float)
+        out_stress_strains = np.array([], dtype=float)
+        out_stresses = np.zeros((0, dim, dim), dtype=float)
       dumper.dump(
-        np.array([], dtype=float),        # no stress at t=0
-        np.array([], dtype=float),
-        np.zeros((0, dim, dim), dtype=float),
+        out_stress_times,
+        out_stress_strains,
+        out_stresses,
         None,
         np.asarray(positions_init, dtype=float)[np.newaxis],  # shape (1, N, dim)
         traj_steps=np.array([0], dtype=np.int64),
       )
 
+    # Loop over the planned number of steps, emitting stress and trajectory on independent cadences.
     steps_done = 0
     while steps_done < planned_steps:
       state, interaction_neighbor = run_one_step(state, interaction_neighbor)
@@ -521,6 +542,9 @@ def main():
   finally:
     dumper.close()
 
+  # ============================================================================
+  # OUTPUT
+  # ============================================================================
   # Emit wall-clock timing diagnostics.
   elapsed_s = time.perf_counter() - wall_start
   total_steps = int(planned_steps)
