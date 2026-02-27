@@ -165,16 +165,19 @@ The method has three independent error sources:
 
 ## Testing
 
-See `tests/rpy_test_concise.py` for fast coverage including:
-- Deterministic wave-space mobility vs `Mw_bruteforce` reference (xi sweep subset)
-- Shear invariance via the `current_box` wave-space mapping
-- Parameter validation for invalid grid/support combinations
-
-See `tests/rpy_physical_test.py` for Fiore-inspired physical validation:
+See `tests/rpy_test.py` for fast (`not slow`) Fiore-inspired coverage:
 - Analytic RPY limits (self + pair mobility) with overlap / non-overlap
-- Symmetry / PSD / translational invariance for the full RPY operator
-- Brownian covariance checks
-- Xi sweep (0.1 → 1.0) using `estimate_rpy_params`
+- Two-particle tensor-structure symmetry checks
+- Split consistency (`M = M^(r) + M^(w)`) and xi-invariance
+- Symmetry / PSD / translational / Galilean invariance
+- Lightweight fluctuation-dissipation covariance checks
+
+See `tests/rpy_validation_slow_test.py` for expensive validation (`@pytest.mark.slow`):
+- Direct lattice-sum consistency checks
+- Rigorous fluctuation-dissipation covariance checks
+- Sedimentation trend checks against dilute-theory behavior
+- Ewald parameter convergence-rate regressions
+- Real-space condition-number scaling with system size
 
 Slow tests are marked with `@pytest.mark.slow` and can be run with:
-`pytest tests/rpy_physical_test.py -m "slow" -v`
+`pytest tests/rpy_validation_slow_test.py -m "slow" -v`
