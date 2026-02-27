@@ -1,9 +1,9 @@
-"""Runtime wrappers and health checks for RPY shear simulations."""
+"""Runtime wrappers and health checks for shear simulations."""
 
 import jax.numpy as jnp
 import numpy as np
 
-from rpy_console import get_console
+from shear_console import get_console
 
 _CONSOLE = get_console()
 

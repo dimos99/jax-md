@@ -1,4 +1,4 @@
-"""Potential-module loading and validation for RPY shear."""
+"""Potential-module loading and validation for shear runners."""
 
 import hashlib
 import importlib
@@ -54,7 +54,7 @@ def _load_module_from_spec(path_or_module: str):
   if os.path.isfile(path_or_module):
     module_path = os.path.abspath(path_or_module)
     digest = hashlib.sha1(module_path.encode('utf-8')).hexdigest()[:12]
-    module_name = f'rpy_shear_potential_{digest}'
+    module_name = f'shear_potential_{digest}'
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     if spec is None or spec.loader is None:
       raise ValueError(f'Failed to load custom potential module from path: {module_path}')

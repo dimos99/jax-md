@@ -1,4 +1,4 @@
-"""Preparation helpers for configuring and initializing RPY shear runs."""
+"""Preparation helpers for configuring and initializing shear runs."""
 
 import json
 import math
@@ -10,14 +10,14 @@ import numpy as np
 
 from jax_md import partition
 
-from rpy_init import _box_size_from_phi
-from rpy_init import _load_initial_state_from_data
-from rpy_init import _load_initial_state_from_dump
-from rpy_init import _min_pair_distance
-from rpy_init import _relax_positions
-from rpy_output import _serialize_rpy_parameter_estimate
-from rpy_output import _to_jsonable
-from rpy_potential import _resolve_potential
+from shear_init import _box_size_from_phi
+from shear_init import _load_initial_state_from_data
+from shear_init import _load_initial_state_from_dump
+from shear_init import _min_pair_distance
+from shear_init import _relax_positions
+from shear_output import _serialize_rpy_parameter_estimate
+from shear_output import _to_jsonable
+from shear_potential import _resolve_potential
 
 
 def _resolve_runtime_settings(args, internal_cfg) -> dict:

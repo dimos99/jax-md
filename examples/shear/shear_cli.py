@@ -1,11 +1,11 @@
-"""CLI parsing and static config for RPY shear."""
+"""CLI parsing and static config for shear runners."""
 
 import argparse
 from decimal import Decimal
 from decimal import InvalidOperation
 import math
 
-from rpy_console import get_console
+from shear_console import get_console
 
 _CONSOLE = get_console()
 
@@ -37,7 +37,7 @@ def _parse_int_like(value: str) -> int:
 
 def parse_args():
   parser = argparse.ArgumentParser(
-    description='RPY shear runner with configurable stress/trajectory output.')
+    description='Shear runner with configurable stress/trajectory output.')
 
   # Experiment-facing controls.
   parser.add_argument(
@@ -60,7 +60,7 @@ def parse_args():
     help='Integration timestep in the current simulation units (required).',
   )
   parser.add_argument('--xi', type=float, default=0.5,
-                      help='RPY splitting parameter xi passed as xi_override.')
+                      help='RPY splitting parameter xi (used by shear_rpy.py).')
   parser.add_argument('--n_steps', type=_parse_int_like, default=30000)
   parser.add_argument('--stress_every', type=_parse_int_like, default=0,
                       help='Set to 0 to disable stress calculation/output.')

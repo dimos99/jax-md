@@ -6,7 +6,7 @@ import re
 
 import numpy as np
 
-from rpy_console import get_console
+from shear_console import get_console
 
 _CONSOLE = get_console()
 

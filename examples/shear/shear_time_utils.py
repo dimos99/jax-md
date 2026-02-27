@@ -1,4 +1,4 @@
-"""Timebase and shear-remap helper utilities for RPY shear runs."""
+"""Timebase and shear-remap helper utilities for shear runs."""
 
 import jax.numpy as jnp
 from jax import lax

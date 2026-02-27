@@ -1,8 +1,8 @@
-# `rpy_shear.py` User Guide
+# `shear_rpy.py` User Guide
 
 This guide explains how to run:
 
-`examples/rpy_shear/rpy_shear.py`
+`examples/shear/shear_rpy.py`
 
 ## 1. What this script does
 
@@ -76,9 +76,9 @@ Optional:
 
 Available in:
 
-- `examples/rpy_shear/potentials/ao_wca.py`
-- `examples/rpy_shear/potentials/high_exp_lj.py`
-- `examples/rpy_shear/potentials/varga_ao_rpy_overlap.py`
+- `examples/shear/potentials/ao_wca.py`
+- `examples/shear/potentials/high_exp_lj.py`
+- `examples/shear/potentials/varga_ao_rpy_overlap.py`
 
 You can copy one and edit it, or pass either directly via `--potential`.
 
@@ -87,10 +87,10 @@ You can copy one and edit it, or pass either directly via `--potential`.
 Random initialization:
 
 ```bash
-python examples/rpy_shear/rpy_shear.py \
-  --potential examples/rpy_shear/potentials/ao_wca.py \
+python examples/shear/shear_rpy.py \
+  --potential examples/shear/potentials/ao_wca.py \
   --dt 2e-5 \
-  --out_dir examples/out/rpy_random \
+  --out_dir examples/out/shear_random \
   --n_particles 128 \
   --phi 0.45
 ```
@@ -98,21 +98,21 @@ python examples/rpy_shear/rpy_shear.py \
 Dump initialization:
 
 ```bash
-python examples/rpy_shear/rpy_shear.py \
-  --potential examples/rpy_shear/potentials/ao_wca.py \
+python examples/shear/shear_rpy.py \
+  --potential examples/shear/potentials/ao_wca.py \
   --dt 2e-5 \
-  --out_dir examples/out/rpy_from_dump \
-  --init-traj examples/out/rpy_random/traj.dump
+  --out_dir examples/out/shear_from_dump \
+  --init-traj examples/out/shear_random/traj.dump
 ```
 
 LAMMPS data initialization:
 
 ```bash
-python examples/rpy_shear/rpy_shear.py \
-  --potential examples/rpy_shear/potentials/ao_wca.py \
+python examples/shear/shear_rpy.py \
+  --potential examples/shear/potentials/ao_wca.py \
   --dt 2e-5 \
-  --out_dir examples/out/rpy_from_data \
-  --init-data examples/out/rpy_from_data/confin.data
+  --out_dir examples/out/shear_from_data \
+  --init-data examples/out/shear_from_data/confin.data
 ```
 
 ## 8. Important optional controls (defaults)
