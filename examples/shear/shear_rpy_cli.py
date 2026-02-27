@@ -1,4 +1,4 @@
-"""CLI parsing and static config for shear runners."""
+"""CLI parsing and static config for the RPY shear runner."""
 
 import argparse
 from decimal import Decimal
@@ -164,6 +164,7 @@ def parse_args():
     )
   return args
 
+
 def build_internal_config():
   """Algorithmic defaults intentionally kept out of the user-facing CLI."""
   return {
@@ -183,4 +184,74 @@ def build_internal_config():
     'relax_neighbor_format': 'sparse',
     'relax_neighbor_dr_threshold': 0.2,
     'relax_neighbor_capacity_multiplier': 2.0,
+  }
+
+
+def resolve_runtime_settings(args, internal_cfg) -> dict:
+  """Builds validated runtime settings for RPY runs."""
+  a = float(internal_cfg['a'])
+  kT = float(internal_cfg['kT'])
+  viscosity = float(internal_cfg['viscosity'])
+  dt = float(args.dt)
+  mr_iters = int(internal_cfg['mr_iters'])
+  tol = float(internal_cfg['tol'])
+  xi_override = float(args.xi)
+
+  mr_neighbor_format = str(internal_cfg['mr_neighbor_format'])
+  mr_dr_threshold = float(args.mr_skin)
+  mr_capacity_multiplier = (
+    float(args.mr_capacity_multiplier)
+    if args.mr_capacity_multiplier is not None
+    else float(internal_cfg['mr_capacity_multiplier'])
+  )
+  real_space_mode = str(internal_cfg['real_space_mode'])
+
+  relax_steps = int(internal_cfg['relax_steps'])
+  relax_neighbor_format = str(internal_cfg['relax_neighbor_format'])
+  relax_neighbor_dr_threshold = float(internal_cfg['relax_neighbor_dr_threshold'])
+  relax_neighbor_capacity_multiplier = float(
+    internal_cfg['relax_neighbor_capacity_multiplier']
+  )
+
+  if a <= 0.0:
+    raise ValueError('internal default a must be > 0.')
+  if kT <= 0.0:
+    raise ValueError('internal default kT must be > 0.')
+  if viscosity <= 0.0:
+    raise ValueError('internal default viscosity must be > 0.')
+  if mr_iters <= 0:
+    raise ValueError('internal default mr_iters must be > 0.')
+  if tol <= 0.0:
+    raise ValueError('internal default tol must be > 0.')
+  if mr_dr_threshold < 0.0:
+    raise ValueError('mr_skin must be >= 0.')
+  if mr_capacity_multiplier <= 0.0:
+    raise ValueError('mr_capacity_multiplier must be > 0.')
+  if real_space_mode not in ('auto', 'min_image', 'lattice'):
+    raise ValueError(
+      "internal default real_space_mode must be one of 'auto', 'min_image', or 'lattice'."
+    )
+  if relax_steps < 0:
+    raise ValueError('internal default relax_steps must be >= 0.')
+  if relax_neighbor_dr_threshold < 0.0:
+    raise ValueError('internal default relax_neighbor_dr_threshold must be >= 0.')
+  if relax_neighbor_capacity_multiplier <= 0.0:
+    raise ValueError('internal default relax_neighbor_capacity_multiplier must be > 0.')
+
+  return {
+    'a': a,
+    'kT': kT,
+    'viscosity': viscosity,
+    'dt': dt,
+    'mr_iters': mr_iters,
+    'tol': tol,
+    'xi_override': xi_override,
+    'mr_neighbor_format': mr_neighbor_format,
+    'mr_dr_threshold': mr_dr_threshold,
+    'mr_capacity_multiplier': mr_capacity_multiplier,
+    'real_space_mode': real_space_mode,
+    'relax_steps': relax_steps,
+    'relax_neighbor_format': relax_neighbor_format,
+    'relax_neighbor_dr_threshold': relax_neighbor_dr_threshold,
+    'relax_neighbor_capacity_multiplier': relax_neighbor_capacity_multiplier,
   }

@@ -15,8 +15,9 @@ from jax_md import simulate
 from jax_md import smap
 from jax_md import space
 
-from shear_cli import build_internal_config
-from shear_cli import parse_args
+from shear_hard_sphere_cli import build_internal_config
+from shear_hard_sphere_cli import parse_args
+from shear_hard_sphere_cli import resolve_runtime_settings
 from shear_console import get_console
 from shear_init import _build_reduced_xy_box_fn
 from shear_output import RunDumper
@@ -27,7 +28,6 @@ from shear_prepare_utils import _build_initial_positions
 from shear_prepare_utils import _derive_system_dynamics
 from shear_prepare_utils import _resolve_initial_system
 from shear_prepare_utils import _resolve_potential_setup
-from shear_prepare_utils import _resolve_runtime_settings
 from shear_prepare_utils import _write_params_json
 from shear_runtime_utils import _check_interaction_neighbor_status
 
@@ -88,7 +88,8 @@ def _build_hs_params_payload(
   n_particles: int,
   phi: float,
   dt: float,
-  a: float,
+  hydro_radius: float,
+  hs_core_radius: float,
   kT: float,
   viscosity: float,
   mobility: float,
@@ -128,9 +129,13 @@ def _build_hs_params_payload(
       'init_traj': args.init_traj,
       'init_data': args.init_data,
       'potential': args.potential,
+      'hydro_radius': args.hydro_radius,
+      'hs_core_radius': args.hs_core_radius,
+      'max_collision_loops': args.max_collision_loops,
     },
     'internal': {
-      'a': a,
+      'hydrodynamic_radius': hydro_radius,
+      'hs_core_radius': hs_core_radius,
       'kT': kT,
       'viscosity': viscosity,
       'mobility': mobility,
@@ -187,8 +192,12 @@ def main():
   wall_start = time.perf_counter()
 
   internal = build_internal_config()
-  runtime = _resolve_runtime_settings(args, internal)
-  a = runtime['a']
+  runtime = resolve_runtime_settings(args, internal)
+  hydro_radius = (
+    float(args.hydro_radius)
+    if args.hydro_radius is not None
+    else float(runtime['a'])
+  )
   kT = runtime['kT']
   viscosity = runtime['viscosity']
   dt = runtime['dt']
@@ -198,8 +207,17 @@ def main():
   relax_neighbor_capacity_multiplier = runtime['relax_neighbor_capacity_multiplier']
 
   # Hard-sphere integrator controls kept explicit in the script.
-  diameter = 2.0 * a
-  max_collision_loops = int(1e7)
+  hs_core_radius = (
+    float(args.hs_core_radius)
+    if args.hs_core_radius is not None
+    else float(hydro_radius)
+  )
+  diameter = 2.0 * hs_core_radius
+  max_collision_loops = (
+    int(args.max_collision_loops)
+    if args.max_collision_loops is not None
+    else int(1e7)
+  )
   event_time_tol = None
 
   format_map = _build_format_map()
@@ -212,7 +230,8 @@ def main():
   _CONSOLE.info(f'JAX devices: {device_labels}')
 
   dim = 3
-  initial_system = _resolve_initial_system(args, a=a, dim=dim, console=_CONSOLE)
+  initial_system = _resolve_initial_system(
+    args, a=hs_core_radius, dim=dim, console=_CONSOLE)
   init_mode = initial_system['init_mode']
   data_info = initial_system['data_info']
   dump_info = initial_system['dump_info']
@@ -222,7 +241,7 @@ def main():
 
   dynamics = _derive_system_dynamics(
     base_box=base_box,
-    a=a,
+    a=hydro_radius,
     kT=kT,
     viscosity=viscosity,
     peclet=args.peclet,
@@ -242,6 +261,10 @@ def main():
   _CONSOLE.info(f'Equivalent box size L = {box_size:.6f}')
   _CONSOLE.info(f'D0 = {D0:.6e}')
   _CONSOLE.info(f'Mobility = {mobility:.6e}')
+  _CONSOLE.info(f'Hydrodynamic radius a = {hydro_radius:.6f}')
+  _CONSOLE.info(f'Hard-sphere core radius = {hs_core_radius:.6f}')
+  _CONSOLE.info(f'Hard-sphere diameter = {diameter:.6f}')
+  _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
   _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
   _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
 
@@ -401,7 +424,8 @@ def main():
     n_particles=n_particles,
     phi=phi,
     dt=dt,
-    a=a,
+    hydro_radius=hydro_radius,
+    hs_core_radius=hs_core_radius,
     kT=kT,
     viscosity=viscosity,
     mobility=mobility,

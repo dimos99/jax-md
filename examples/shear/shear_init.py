@@ -448,7 +448,7 @@ def _relax_positions(
   neighbor_capacity_multiplier: float,
   dr_threshold: float,
 ):
-  """Relaxes initial positions to remove large overlaps before RPY dynamics."""
+  """Relaxes initial positions to remove large overlaps before dynamics."""
   if steps <= 0:
     return R_init
   import jax

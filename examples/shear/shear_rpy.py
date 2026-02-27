@@ -17,8 +17,9 @@ from jax_md import smap
 from jax_md import space
 from jax_md.hydro import rpy
 
-from shear_cli import build_internal_config
-from shear_cli import parse_args
+from shear_rpy_cli import build_internal_config
+from shear_rpy_cli import parse_args
+from shear_rpy_cli import resolve_runtime_settings
 from shear_console import get_console
 from shear_init import _build_reduced_xy_box_fn
 from shear_output import RunDumper
@@ -29,7 +30,6 @@ from shear_prepare_utils import _build_params_payload
 from shear_prepare_utils import _derive_system_dynamics
 from shear_prepare_utils import _resolve_initial_system
 from shear_prepare_utils import _resolve_potential_setup
-from shear_prepare_utils import _resolve_runtime_settings
 from shear_prepare_utils import _write_params_json
 from shear_runtime_utils import _check_interaction_neighbor_status
 from shear_runtime_utils import _check_nan_positions
@@ -55,7 +55,7 @@ def main():
   # Resolve runtime settings.
   # Resolve typed runtime settings from internal defaults and CLI values.
   internal = build_internal_config()
-  runtime = _resolve_runtime_settings(args, internal)
+  runtime = resolve_runtime_settings(args, internal)
   a = runtime['a']
   kT = runtime['kT']
   viscosity = runtime['viscosity']
