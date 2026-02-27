@@ -44,7 +44,7 @@ POTENTIAL_PARAMS = {
 POTENTIAL_NEIGHBOR_PARAMS = {
   "format": "sparse",  # one of: dense, sparse, ordered
   "dr_threshold": 0.5,
-  "capacity_multiplier": 2.5,
+  "capacity_multiplier": 4.5,
 }
 
 
