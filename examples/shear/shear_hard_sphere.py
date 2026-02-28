@@ -109,7 +109,7 @@ def _build_hs_params_payload(
   confin_path: str,
   planned_steps: int,
   potential_name: str,
-  potential_source: str,
+  potential_source: str | None,
   potential_params,
   interaction_neighbor_defaults,
 ):
@@ -273,6 +273,7 @@ def main():
     dt=dt,
     format_map=format_map,
   )
+  use_pair_potential = bool(potential_setup['use_pair_potential'])
   interaction_neighbor_defaults = potential_setup['interaction_neighbor_defaults']
   interaction_neighbor_format_name = potential_setup['interaction_neighbor_format_name']
   interaction_neighbor_format = potential_setup['interaction_neighbor_format']
@@ -285,16 +286,22 @@ def main():
   potential_source = potential_setup['potential_source']
 
   _CONSOLE.section('Potential')
-  _CONSOLE.info(
-    f'Potential module: {args.potential} -> {potential_name} '
-    f'(source={potential_source}, r_cut={potential_r_cut:.6f})'
-  )
-  _CONSOLE.info(
-    'Interaction neighbor defaults: '
-    f'format={interaction_neighbor_format_name}, '
-    f'dr_threshold={interaction_neighbor_dr_threshold:.3g}, '
-    f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
-  )
+  if use_pair_potential:
+    _CONSOLE.info(
+      f'Potential module: {args.potential} -> {potential_name} '
+      f'(source={potential_source}, r_cut={potential_r_cut:.6f})'
+    )
+    _CONSOLE.info(
+      'Interaction neighbor defaults: '
+      f'format={interaction_neighbor_format_name}, '
+      f'dr_threshold={interaction_neighbor_dr_threshold:.3g}, '
+      f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
+    )
+  else:
+    _CONSOLE.info(
+      'No potential selected; integrating with zero potential energy.'
+    )
+    _CONSOLE.info('Pair-interaction neighbor list disabled.')
 
   displacement, shift, box_of = space.shearing(
     base_box,
@@ -327,35 +334,41 @@ def main():
   _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
 
   metric_shear = space.canonicalize_displacement_or_metric(displacement)
-  energy_fn_all_pairs = smap.pair(
-    pair_potential_fn,
-    metric_shear,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
-  energy_fn_neighbor = smap.pair_neighbor_list(
-    pair_potential_fn,
-    metric_shear,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
+  if use_pair_potential:
+    energy_fn_all_pairs = smap.pair(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
+    energy_fn_neighbor = smap.pair_neighbor_list(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
 
-  def energy_fn(R, neighbor=None, **kwargs):
-    kwargs = dict(kwargs)
-    kwargs.pop('neighbor', None)
-    if neighbor is None:
-      return energy_fn_all_pairs(R, **kwargs)
-    return energy_fn_neighbor(R, neighbor=neighbor, **kwargs)
+    def energy_fn(R, neighbor=None, **kwargs):
+      kwargs = dict(kwargs)
+      kwargs.pop('neighbor', None)
+      if neighbor is None:
+        return energy_fn_all_pairs(R, **kwargs)
+      return energy_fn_neighbor(R, neighbor=neighbor, **kwargs)
 
-  interaction_neighbor_fn = partition.neighbor_list(
-    metric_shear,
-    base_box,
-    r_cutoff=potential_r_cut,
-    dr_threshold=interaction_neighbor_dr_threshold,
-    capacity_multiplier=interaction_neighbor_capacity_multiplier,
-    fractional_coordinates=True,
-    format=interaction_neighbor_format,
-  )
+    interaction_neighbor_fn = partition.neighbor_list(
+      metric_shear,
+      base_box,
+      r_cutoff=potential_r_cut,
+      dr_threshold=interaction_neighbor_dr_threshold,
+      capacity_multiplier=interaction_neighbor_capacity_multiplier,
+      fractional_coordinates=True,
+      format=interaction_neighbor_format,
+    )
+  else:
+    def energy_fn(R, **unused_kwargs):
+      return jnp.zeros((), dtype=R.dtype)
+
+    interaction_neighbor_fn = None
 
   init_fn, apply_fn = simulate.brownian_hard_sphere(
     energy_fn,
@@ -378,19 +391,29 @@ def main():
   do_traj = args.traj_every > 0
   planned_steps = int(args.n_steps)
 
-  @jit
-  def run_one_step(state_in, interaction_neighbor_in):
-    next_time = jnp.asarray(state_in.time) + jnp.asarray(dt, dtype=state_in.time.dtype)
-    next_box = box_of(t=next_time)
-    pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-      state_in, dt=dt, shear_rate=shear_rate)
-    interaction_neighbor_out = interaction_neighbor_in.update(
-      pos_for_neighbor, box=next_box)
-    state_out = apply_fn(state_in, neighbor=interaction_neighbor_out)
-    curr_box = box_of(t=state_out.time)
-    interaction_neighbor_out = interaction_neighbor_out.update(
-      state_out.position, box=curr_box)
-    return state_out, interaction_neighbor_out
+  if use_pair_potential:
+    @jit
+    def run_one_step(state_in, interaction_neighbor_in):
+      next_time = jnp.asarray(state_in.time) + jnp.asarray(dt, dtype=state_in.time.dtype)
+      next_box = box_of(t=next_time)
+      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
+        state_in, dt=dt, shear_rate=shear_rate)
+      interaction_neighbor_out = interaction_neighbor_in.update(
+        pos_for_neighbor, box=next_box)
+      state_out = apply_fn(state_in, neighbor=interaction_neighbor_out)
+      curr_box = box_of(t=state_out.time)
+      interaction_neighbor_out = interaction_neighbor_out.update(
+        state_out.position, box=curr_box)
+      return state_out, interaction_neighbor_out
+  else:
+    @jit
+    def _run_one_step_without_pair_potential(state_in):
+      return apply_fn(state_in)
+
+    def run_one_step(state_in, interaction_neighbor_in):
+      del interaction_neighbor_in
+      state_out = _run_one_step_without_pair_potential(state_in)
+      return state_out, None
 
   @jit
   def evaluate_stress(state_in):
@@ -488,10 +511,12 @@ def main():
   # ============================================================================
   try:
     state = init_fn(run_key, R0)
-    box_t0 = box_of(t=shear_t0)
-    interaction_neighbor = interaction_neighbor_fn.allocate(state.position, box=box_t0)
-    if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
-      return
+    interaction_neighbor = None
+    if use_pair_potential:
+      box_t0 = box_of(t=shear_t0)
+      interaction_neighbor = interaction_neighbor_fn.allocate(state.position, box=box_t0)
+      if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
+        return
 
     if do_traj:
       if do_stress:
@@ -522,7 +547,8 @@ def main():
         return
       if not _check_collision_loop_status(state, f'shear step {steps_done}'):
         return
-      if not _check_interaction_neighbor_status(interaction_neighbor, f'shear step {steps_done}'):
+      if use_pair_potential and not _check_interaction_neighbor_status(
+        interaction_neighbor, f'shear step {steps_done}'):
         return
 
       emit_stress = do_stress and (steps_done % args.stress_every == 0)

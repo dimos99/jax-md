@@ -122,8 +122,23 @@ def _derive_system_dynamics(*, base_box, a, kT, viscosity, peclet) -> dict:
   }
 
 
-def _resolve_potential_setup(*, potential_arg: str, dt: float, format_map: dict) -> dict:
+def _resolve_potential_setup(*, potential_arg: str | None, dt: float, format_map: dict) -> dict:
   """Loads and validates potential configuration and interaction neighbor settings."""
+  if potential_arg is None:
+    return {
+      'use_pair_potential': False,
+      'pair_potential_fn': None,
+      'potential_params': {},
+      'potential_r_cut': 0.0,
+      'potential_name': 'none',
+      'potential_source': None,
+      'interaction_neighbor_defaults': {},
+      'interaction_neighbor_format_name': None,
+      'interaction_neighbor_format': None,
+      'interaction_neighbor_dr_threshold': 0.0,
+      'interaction_neighbor_capacity_multiplier': 0.0,
+    }
+
   potential_cfg = _resolve_potential(potential_arg)
   interaction_neighbor_defaults = potential_cfg['neighbor_defaults']
   interaction_neighbor_format_name = str(interaction_neighbor_defaults['format']).lower()
@@ -145,6 +160,7 @@ def _resolve_potential_setup(*, potential_arg: str, dt: float, format_map: dict)
   potential_source = str(potential_cfg['source'])
 
   return {
+    'use_pair_potential': True,
     'pair_potential_fn': pair_potential_fn,
     'potential_params': potential_params,
     'potential_r_cut': potential_r_cut,
@@ -247,7 +263,7 @@ def _build_params_payload(
   rpy_params,
   real_space_mode: str,
   potential_name: str,
-  potential_source: str,
+  potential_source: str | None,
   potential_params,
   interaction_neighbor_defaults,
 ) -> dict:

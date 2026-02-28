@@ -127,6 +127,7 @@ def main():
     dt=dt,
     format_map=format_map,
   )
+  use_pair_potential = bool(potential_setup['use_pair_potential'])
   interaction_neighbor_defaults = potential_setup['interaction_neighbor_defaults']
   interaction_neighbor_format_name = potential_setup['interaction_neighbor_format_name']
   interaction_neighbor_format = potential_setup['interaction_neighbor_format']
@@ -139,16 +140,22 @@ def main():
   potential_source = potential_setup['potential_source']
 
   _CONSOLE.section('Potential')
-  _CONSOLE.info(
-    f'Potential module: {args.potential} -> {potential_name} '
-    f'(source={potential_source}, r_cut={potential_r_cut:.6f})'
-  )
-  _CONSOLE.info(
-    'Interaction neighbor defaults: '
-    f'format={interaction_neighbor_format_name}, '
-    f'dr_threshold={interaction_neighbor_dr_threshold:.3g}, '
-    f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
-  )
+  if use_pair_potential:
+    _CONSOLE.info(
+      f'Potential module: {args.potential} -> {potential_name} '
+      f'(source={potential_source}, r_cut={potential_r_cut:.6f})'
+    )
+    _CONSOLE.info(
+      'Interaction neighbor defaults: '
+      f'format={interaction_neighbor_format_name}, '
+      f'dr_threshold={interaction_neighbor_dr_threshold:.3g}, '
+      f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
+    )
+  else:
+    _CONSOLE.info(
+      'No potential selected; integrating with zero potential energy.'
+    )
+    _CONSOLE.info('Pair-interaction neighbor list disabled.')
 
   # Build sheared displacement/shift operators used throughout the run.
   displacement, shift, box_of = space.shearing(
@@ -186,32 +193,38 @@ def main():
   # Build force and neighbor operators.
   # Construct force/energy and interaction neighbor-list operators.
   metric_shear = space.canonicalize_displacement_or_metric(displacement)
-  # Use canonicalized metric with remapped shearing so pair distances match runtime geometry.
-  energy_fn_all_pairs = smap.pair(
-    pair_potential_fn,
-    metric_shear,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
-  energy_fn_neighbor = smap.pair_neighbor_list(
-    pair_potential_fn,
-    metric_shear,
-    ignore_unused_parameters=True,
-    **potential_params,
-  )
-  energy_fn = _wrap_neighbor_energy(
-    energy_fn_neighbor,
-    energy_all_pairs_fn=energy_fn_all_pairs,
-  )
-  interaction_neighbor_fn = partition.neighbor_list(
-    metric_shear,
-    base_box,
-    r_cutoff=potential_r_cut,
-    dr_threshold=interaction_neighbor_dr_threshold,
-    capacity_multiplier=interaction_neighbor_capacity_multiplier,
-    fractional_coordinates=True,
-    format=interaction_neighbor_format,
-  )
+  if use_pair_potential:
+    # Use canonicalized metric with remapped shearing so pair distances match runtime geometry.
+    energy_fn_all_pairs = smap.pair(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
+    energy_fn_neighbor = smap.pair_neighbor_list(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
+    energy_fn = _wrap_neighbor_energy(
+      energy_fn_neighbor,
+      energy_all_pairs_fn=energy_fn_all_pairs,
+    )
+    interaction_neighbor_fn = partition.neighbor_list(
+      metric_shear,
+      base_box,
+      r_cutoff=potential_r_cut,
+      dr_threshold=interaction_neighbor_dr_threshold,
+      capacity_multiplier=interaction_neighbor_capacity_multiplier,
+      fractional_coordinates=True,
+      format=interaction_neighbor_format,
+    )
+  else:
+    def energy_fn(R, **unused_kwargs):
+      return jnp.zeros((), dtype=R.dtype)
+
+    interaction_neighbor_fn = None
 
   # Bound the estimator over the full planned simulation time interval.
   shear_t_bounds = (
@@ -277,47 +290,74 @@ def main():
   do_stress = args.stress_every > 0
   do_traj = args.traj_every > 0
   stress_fn = None
-  if do_stress:
+  if do_stress and use_pair_potential:
     stress_fn = rheo.make_pairwise_stress_fn(
       pair_potential_fn,
       **potential_params,
     )
+  elif do_stress:
+    _CONSOLE.warn(
+      '--stress_every > 0 with no potential selected; '
+      'writing zero pair-interaction stress.'
+    )
   planned_steps = int(args.n_steps)
 
   # This is the main JIT-compiled step function used in the inner loop of the shearing run.
-  @jax.jit
-  def run_one_step(state_in, interaction_neighbor_in):
-    # Update interaction neighbors at the next box/time, then integrate one step.
-    next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
-    next_box = box_of(t=next_time)
-    pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-      state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
-    # Predictive update keeps pair-force neighbors aligned with the next force evaluation geometry.
-    interaction_neighbor_out = interaction_neighbor_in.update(
-      pos_for_neighbor, box=next_box)
-    state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
-    curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
-    curr_box = box_of(t=curr_time)
-    # Refresh neighbors at the accepted state so stress/output use current-step neighborhoods.
-    interaction_neighbor_out = interaction_neighbor_out.update(
-      state_out.integrator_position, box=curr_box)
-    return state_out, interaction_neighbor_out
+  if use_pair_potential:
+    @jax.jit
+    def run_one_step(state_in, interaction_neighbor_in):
+      # Update interaction neighbors at the next box/time, then integrate one step.
+      next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
+      next_box = box_of(t=next_time)
+      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
+        state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+      # Predictive update keeps pair-force neighbors aligned with the next force evaluation geometry.
+      interaction_neighbor_out = interaction_neighbor_in.update(
+        pos_for_neighbor, box=next_box)
+      state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
+      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
+      # Refresh neighbors at the accepted state so stress/output use current-step neighborhoods.
+      interaction_neighbor_out = interaction_neighbor_out.update(
+        state_out.integrator_position, box=curr_box)
+      return state_out, interaction_neighbor_out
+  else:
+    @jax.jit
+    def _run_one_step_without_pair_potential(state_in):
+      return apply_fn(state_in)
+
+    def run_one_step(state_in, interaction_neighbor_in):
+      del interaction_neighbor_in
+      state_out = _run_one_step_without_pair_potential(state_in)
+      return state_out, None
 
   evaluate_stress = None
   if do_stress:
-    @jax.jit
-    def evaluate_stress(state_in, interaction_neighbor_in):
-      # Stress uses the current sheared box to stay consistent with periodic triclinic geometry.
-      curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
-      curr_box = box_of(t=curr_time)
-      stress = stress_fn(
-        state_in.integrator_position,
-        box=curr_box,
-        neighbor=interaction_neighbor_in,
-        fractional_coordinates=True,
-      )
-      strain = shear_rate * curr_time
-      return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
+    if use_pair_potential:
+      @jax.jit
+      def evaluate_stress(state_in, interaction_neighbor_in):
+        # Stress uses the current sheared box to stay consistent with periodic triclinic geometry.
+        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
+        curr_box = box_of(t=curr_time)
+        stress = stress_fn(
+          state_in.integrator_position,
+          box=curr_box,
+          neighbor=interaction_neighbor_in,
+          fractional_coordinates=True,
+        )
+        strain = shear_rate * curr_time
+        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
+    else:
+      @jax.jit
+      def _evaluate_stress_without_pair_potential(state_in):
+        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
+        strain = shear_rate * curr_time
+        stress = jnp.zeros((dim, dim), dtype=state_in.integrator_position.dtype)
+        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
+
+      def evaluate_stress(state_in, interaction_neighbor_in):
+        del interaction_neighbor_in
+        return _evaluate_stress_without_pair_potential(state_in)
 
   # Prepare output artifacts.
   out_dir = args.out_dir
@@ -442,12 +482,15 @@ def main():
   try: # Ensure dumper is closed to flush buffers even if the run fails.
     state = init_fn(run_key, R0) # Initializes integrator state (positions, forces, and RPY quadrature cache).
     positions_init = state.integrator_position # shape (N, dim) in fractional coordinates
-    box_t0 = box_of(t=shear_t0)
-    # Allocate the initial neighbor list at the first box
-    interaction_neighbor = interaction_neighbor_fn.allocate(state.integrator_position, box=box_t0) 
+    interaction_neighbor = None
+    if use_pair_potential:
+      box_t0 = box_of(t=shear_t0)
+      # Allocate the initial neighbor list at the first box
+      interaction_neighbor = interaction_neighbor_fn.allocate(
+        state.integrator_position, box=box_t0)
     if not _check_neighbor_status(state, 'shear_init'):
       return
-    if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
+    if use_pair_potential and not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
       return
 
     # Write the initial configuration (t=0) before the loop
@@ -482,7 +525,8 @@ def main():
         return
       if not _check_neighbor_status(state, f'shear step {steps_done}'):
         return
-      if not _check_interaction_neighbor_status(interaction_neighbor, f'shear step {steps_done}'):
+      if use_pair_potential and not _check_interaction_neighbor_status(
+        interaction_neighbor, f'shear step {steps_done}'):
         return
 
       # Stress and trajectory are emitted on independent cadences.

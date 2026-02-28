@@ -109,12 +109,13 @@ def parse_args():
     '--potential',
     type=str,
     default=None,
-    help='Python module path/name providing pair_potential(dr, **params) and defaults.',
+    help=(
+      'Optional Python module path/name providing pair_potential(dr, **params) '
+      'and defaults. If omitted, the run uses zero potential energy.'
+    ),
   )
 
   args = parser.parse_args()
-  if args.potential is None:
-    raise ValueError('--potential is required (module path or importable module name).')
   if args.dt is None:
     raise ValueError('--dt is required.')
   if args.out_dir is None:
