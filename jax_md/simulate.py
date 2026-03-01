@@ -2469,6 +2469,9 @@ class HardSphereBrownianState:
     stress: Collisional stress tensor from hard-sphere constraints at the
       latest step (shape [dim, dim], excludes ideal term).
     collided: Boolean mask of particles that collided during the latest step.
+    step: Integer step counter (jnp.int32 scalar).
+    integrator_position: Alias for position, for compatibility with shared
+      shear-time utilities.
   """
   position: Array
   mobility: Array
@@ -2477,6 +2480,8 @@ class HardSphereBrownianState:
   stress: Array
   collided: Array
   reached_max_collision_loops: Array
+  step: Array
+  integrator_position: Array
 
 
 def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
@@ -2595,7 +2600,8 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     stress0 = jnp.zeros((R.shape[1], R.shape[1]), dtype=R.dtype)
     collided0 = jnp.zeros((R.shape[0],), dtype=bool)
     reached_max0 = jnp.array(False)
-    state = HardSphereBrownianState(R, mu, key, time0, stress0, collided0, reached_max0)
+    step0 = jnp.array(0, dtype=jnp.int32)
+    state = HardSphereBrownianState(R, mu, key, time0, stress0, collided0, reached_max0, step0, R)
     state = canonicalize_mobility(state)
     return state
 
@@ -2676,7 +2682,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     step_kwargs = dict(kwargs)
     _kT = step_kwargs.pop('kT', kT)
 
-    R_start, mu, key, time, _, _, _ = dataclasses.astuple(state)
+    R_start, mu, key, time, _, _, _, prev_step, _ = dataclasses.astuple(state)
     dim = R_start.shape[1]
     N = R_start.shape[0]
     t_zero = jnp.asarray(0.0, dtype=dt.dtype)
@@ -3155,6 +3161,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     # pressure tensor), matching common rheology/Irving-Kirkwood conventions.
     stress = -stress_accum / (volume * dt) if compute_stress else stress_zero
     
-    return HardSphereBrownianState(R_final, mu, key, time + dt, stress, collided_accum, is_unfinished)
+    next_step = prev_step + jnp.int32(1)
+    return HardSphereBrownianState(R_final, mu, key, time + dt, stress, collided_accum, is_unfinished, next_step, R_final)
 
   return init_fn, apply_fn
