@@ -30,23 +30,21 @@ from shear_prepare_utils import _resolve_initial_system
 from shear_prepare_utils import _resolve_potential_setup
 from shear_prepare_utils import _write_params_json
 from shear_runtime_utils import _check_interaction_neighbor_status
+from shear_time_utils import _time_from_step
 
 _CONSOLE = get_console()
 
 
-def _state_step_from_time(state, *, dt: float, t0: float):
-  """Returns nearest integer step from state time."""
-  time_arr = jnp.asarray(state.time)
-  dt_arr = jnp.asarray(dt, dtype=time_arr.dtype)
-  t0_arr = jnp.asarray(t0, dtype=time_arr.dtype)
-  step_float = (time_arr - t0_arr) / dt_arr
-  return jnp.asarray(jnp.floor(step_float + 0.5), dtype=jnp.int32)
+def _predict_xy_remapped_positions(position, *, step, dt, shear_rate, t0):
+  """Predicts fractional positions after any pending xy shear remap.
 
-
-def _predict_xy_remapped_positions_for_next_force(state, *, dt: float, shear_rate: float):
-  """Predicts fractional positions after any pending xy shear remap."""
-  gamma_prev = jnp.asarray(shear_rate) * jnp.asarray(state.time)
-  gamma_next = jnp.asarray(shear_rate) * (jnp.asarray(state.time) + jnp.asarray(dt))
+  Uses integer-step-based time reconstruction to avoid accumulated float drift.
+  """
+  dtype = position.dtype
+  t_curr = _time_from_step(step, dt=dt, t0=t0, dtype=dtype)
+  t_next = _time_from_step(step + 1, dt=dt, t0=t0, dtype=dtype)
+  gamma_prev = jnp.asarray(shear_rate, dtype=dtype) * t_curr
+  gamma_next = jnp.asarray(shear_rate, dtype=dtype) * t_next
   m_prev = jnp.floor(gamma_prev + 0.5)
   m_next = jnp.floor(gamma_next + 0.5)
   dm = (m_next - m_prev).astype(jnp.int32)
@@ -56,7 +54,7 @@ def _predict_xy_remapped_positions_for_next_force(state, *, dt: float, shear_rat
     x_new = jnp.mod(R[:, 0] + dm_cast * R[:, 1], 1.0)
     return R.at[:, 0].set(x_new)
 
-  return lax.cond(jnp.not_equal(dm, 0), _apply, lambda R: R, state.position)
+  return lax.cond(jnp.not_equal(dm, 0), _apply, lambda R: R, position)
 
 
 def _check_nan_positions(state, stage: str, console=None) -> bool:
@@ -393,15 +391,17 @@ def main():
 
   if use_pair_potential:
     @jit
-    def run_one_step(state_in, interaction_neighbor_in):
-      next_time = jnp.asarray(state_in.time) + jnp.asarray(dt, dtype=state_in.time.dtype)
+    def run_one_step(state_in, interaction_neighbor_in, step_in):
+      dtype = state_in.position.dtype
+      next_time = _time_from_step(step_in + 1, dt=dt, t0=shear_t0, dtype=dtype)
       next_box = box_of(t=next_time)
-      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-        state_in, dt=dt, shear_rate=shear_rate)
+      pos_for_neighbor = _predict_xy_remapped_positions(
+        state_in.position, step=step_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
       interaction_neighbor_out = interaction_neighbor_in.update(
         pos_for_neighbor, box=next_box)
       state_out = apply_fn(state_in, neighbor=interaction_neighbor_out)
-      curr_box = box_of(t=state_out.time)
+      post_time = _time_from_step(step_in + 1, dt=dt, t0=shear_t0, dtype=dtype)
+      curr_box = box_of(t=post_time)
       interaction_neighbor_out = interaction_neighbor_out.update(
         state_out.position, box=curr_box)
       return state_out, interaction_neighbor_out
@@ -410,15 +410,14 @@ def main():
     def _run_one_step_without_pair_potential(state_in):
       return apply_fn(state_in)
 
-    def run_one_step(state_in, interaction_neighbor_in):
-      del interaction_neighbor_in
+    def run_one_step(state_in, interaction_neighbor_in, step_in):
+      del interaction_neighbor_in, step_in
       state_out = _run_one_step_without_pair_potential(state_in)
       return state_out, None
 
   @jit
-  def evaluate_stress(state_in):
-    step = _state_step_from_time(state_in, dt=dt, t0=shear_t0)
-    curr_time = jnp.asarray(state_in.time)
+  def evaluate_stress(state_in, step):
+    curr_time = _time_from_step(step, dt=dt, t0=shear_t0, dtype=state_in.position.dtype)
     strain = jnp.asarray(shear_rate, dtype=curr_time.dtype) * curr_time
     return step, curr_time, strain, state_in.stress
 
@@ -520,7 +519,7 @@ def main():
 
     if do_traj:
       if do_stress:
-        stress_step, _, stress_strain, stress = evaluate_stress(state)
+        stress_step, _, stress_strain, stress = evaluate_stress(state, jnp.int32(0))
         out_stress_times = np.array(
           [int(np.asarray(stress_step)) * dt + float(shear_t0)], dtype=float)
         out_stress_strains = np.array([float(np.asarray(stress_strain))], dtype=float)
@@ -540,7 +539,8 @@ def main():
 
     steps_done = 0
     while steps_done < planned_steps:
-      state, interaction_neighbor = run_one_step(state, interaction_neighbor)
+      state, interaction_neighbor = run_one_step(
+        state, interaction_neighbor, jnp.int32(steps_done))
       steps_done += 1
 
       if not _check_nan_positions(state, f'shear step {steps_done}'):
@@ -554,7 +554,8 @@ def main():
       emit_stress = do_stress and (steps_done % args.stress_every == 0)
       emit_traj = do_traj and (steps_done % args.traj_every == 0)
       if emit_stress:
-        stress_step, _, stress_strain, stress = evaluate_stress(state)
+        stress_step, _, stress_strain, stress = evaluate_stress(
+          state, jnp.int32(steps_done))
         out_stress_times = np.array(
           [int(np.asarray(stress_step)) * dt + float(shear_t0)], dtype=float)
         out_stress_strains = np.array([float(np.asarray(stress_strain))], dtype=float)
@@ -565,8 +566,7 @@ def main():
         out_stresses = None
 
       if emit_traj:
-        out_traj_step = int(np.asarray(_state_step_from_time(state, dt=dt, t0=shear_t0)))
-        out_traj_steps = np.array([out_traj_step], dtype=np.int64)
+        out_traj_steps = np.array([steps_done], dtype=np.int64)
         out_traj_positions = np.asarray(state.position, dtype=float)[np.newaxis]
       else:
         out_traj_steps = None
@@ -585,7 +585,7 @@ def main():
       if args.progress_every > 0 and (steps_done % args.progress_every == 0):
         _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
 
-    final_step = int(np.asarray(_state_step_from_time(state, dt=dt, t0=shear_t0)))
+    final_step = steps_done
     final_time = float(final_step * dt + shear_t0)
     final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
     pos_frac = np.mod(np.asarray(state.position, dtype=float), 1.0)
