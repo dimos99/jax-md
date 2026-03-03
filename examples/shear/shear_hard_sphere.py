@@ -37,6 +37,84 @@ from shear_time_utils import _state_time_from_step
 _CONSOLE = get_console()
 
 
+def _as_box_matrix(box, *, dim: int) -> np.ndarray:
+  """Returns a square box matrix for scalar/vector/matrix box encodings."""
+  arr = np.asarray(box, dtype=float)
+  if arr.ndim == 0:
+    return np.eye(dim, dtype=float) * float(arr)
+  if arr.ndim == 1:
+    return np.diag(arr)
+  return arr
+
+
+def _fractional_cell_size_for_cutoff(box, cutoff: float) -> float:
+  """Mirrors `partition._fractional_cell_size` for build-box selection."""
+  cutoff = float(cutoff)
+  if cutoff <= 0.0:
+    raise ValueError('cutoff must be > 0.')
+
+  box_arr = np.asarray(box, dtype=float)
+  if box_arr.ndim == 0:
+    return float(cutoff / float(box_arr))
+  if box_arr.ndim == 1:
+    return float(cutoff / float(np.min(box_arr)))
+  if box_arr.ndim != 2:
+    raise ValueError(
+      'Expected box to be either a scalar, a vector, or a matrix.'
+    )
+
+  dim = int(box_arr.shape[0])
+  if dim == 1:
+    nmin = int(np.floor(float(box_arr[0, 0]) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  if dim == 2:
+    xx = float(box_arr[0, 0])
+    yy = float(box_arr[1, 1])
+    xy = float(box_arr[0, 1] / yy)
+    nx = xx / float(np.sqrt(1.0 + xy ** 2))
+    ny = yy
+    nmin = int(np.floor(min(nx, ny) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  if dim == 3:
+    xx = float(box_arr[0, 0])
+    yy = float(box_arr[1, 1])
+    zz = float(box_arr[2, 2])
+    xy = float(box_arr[0, 1] / yy)
+    xz = float(box_arr[0, 2] / zz)
+    yz = float(box_arr[1, 2] / zz)
+    nx = xx / float(np.sqrt(1.0 + xy ** 2 + (xy * yz - xz) ** 2))
+    ny = yy / float(np.sqrt(1.0 + yz ** 2))
+    nz = zz
+    nmin = int(np.floor(min(nx, ny, nz) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  raise ValueError(
+    'Expected box to be either 1-, 2-, or 3-dimensional '
+    f'found {dim}.'
+  )
+
+
+def _resolve_worst_xy_remap_build_box(*, box_of, base_box, cutoff: float) -> dict:
+  """Selects the build box from gamma_xy in {-0.5, 0.0, +0.5}."""
+  dim = int(np.asarray(base_box).shape[0])
+  candidates = []
+  for gamma_xy in (-0.5, 0.0, 0.5):
+    candidate_box = _as_box_matrix(
+      box_of(gamma={'xy': float(gamma_xy), 'xz': 0.0, 'yz': 0.0}),
+      dim=dim,
+    )
+    candidate_fractional_cell_size = _fractional_cell_size_for_cutoff(
+      candidate_box, cutoff)
+    candidates.append({
+      'gamma_xy': float(gamma_xy),
+      'box': candidate_box,
+      'fractional_cell_size': float(candidate_fractional_cell_size),
+    })
+  return max(candidates, key=lambda c: c['fractional_cell_size'])
+
+
 def _check_nan_positions(state, stage: str, console=None) -> bool:
   """Returns True if state positions are finite; logs and returns False otherwise."""
   log = _CONSOLE if console is None else console
@@ -58,6 +136,69 @@ def _check_collision_loop_status(state, stage: str, console=None) -> bool:
     )
     return False
   return True
+
+
+def _check_collision_neighbor_status(collision_neighbor, stage: str, console=None) -> bool:
+  """Checks the hard-sphere collision neighbor list health flags."""
+  log = _CONSOLE if console is None else console
+  if collision_neighbor is None:
+    log.error(f'Missing collision neighbor list in stage={stage}.')
+    return False
+  overflow = np.asarray(collision_neighbor.did_buffer_overflow)
+  cell_small = np.asarray(collision_neighbor.cell_size_too_small)
+  malformed = np.asarray(collision_neighbor.malformed_box)
+  if np.any(overflow):
+    log.error(
+      f'Collision neighbor list overflow in stage={stage}. '
+      'Try increasing --collision-neighbor-capacity-multiplier or '
+      '--collision-neighbor-skin.'
+    )
+    return False
+  if np.any(cell_small):
+    log.error(f'Collision neighbor list cell size too small in stage={stage}.')
+    return False
+  if np.any(malformed):
+    log.error(f'Collision neighbor list malformed box in stage={stage}.')
+    return False
+  return True
+
+
+def _resolve_collision_neighbor_settings(
+  *,
+  args,
+  diameter: float,
+  D0: float,
+  dt: float,
+  format_map: dict,
+) -> dict:
+  """Resolves the hard-sphere collision neighbor-list settings."""
+  collision_neighbor_format_name = 'sparse'
+  collision_neighbor_format = format_map[collision_neighbor_format_name]
+  collision_neighbor_zsigma = float(args.collision_neighbor_zsigma)
+  collision_neighbor_capacity_multiplier = float(
+    args.collision_neighbor_capacity_multiplier
+  )
+  sigma_rel = float(np.sqrt(4.0 * D0 * dt))
+  skin_from_cli = args.collision_neighbor_skin is not None
+  if skin_from_cli:
+    collision_neighbor_skin = float(args.collision_neighbor_skin)
+  else:
+    collision_neighbor_skin = float(collision_neighbor_zsigma * sigma_rel)
+  collision_neighbor_r_cutoff = float(diameter + collision_neighbor_zsigma * sigma_rel)
+  collision_neighbor_threshold = float(
+    collision_neighbor_r_cutoff + collision_neighbor_skin
+  )
+  return {
+    'format_name': collision_neighbor_format_name,
+    'format': collision_neighbor_format,
+    'zsigma': collision_neighbor_zsigma,
+    'skin': collision_neighbor_skin,
+    'sigma_rel': sigma_rel,
+    'r_cutoff': collision_neighbor_r_cutoff,
+    'threshold': collision_neighbor_threshold,
+    'capacity_multiplier': collision_neighbor_capacity_multiplier,
+    'skin_from_cli': skin_from_cli,
+  }
 
 
 def _build_hs_params_payload(
@@ -90,6 +231,7 @@ def _build_hs_params_payload(
   potential_source: str | None,
   potential_params,
   interaction_neighbor_defaults,
+  collision_neighbor_settings,
 ):
   """Builds a `params.json` payload for hard-sphere shear runs."""
   return {
@@ -110,6 +252,11 @@ def _build_hs_params_payload(
       'hydro_radius': args.hydro_radius,
       'hs_core_radius': args.hs_core_radius,
       'max_collision_loops': args.max_collision_loops,
+      'collision_neighbor_zsigma': args.collision_neighbor_zsigma,
+      'collision_neighbor_skin': args.collision_neighbor_skin,
+      'collision_neighbor_capacity_multiplier': (
+        args.collision_neighbor_capacity_multiplier
+      ),
     },
     'internal': {
       'hydrodynamic_radius': hydro_radius,
@@ -157,6 +304,24 @@ def _build_hs_params_payload(
       'r_cut': potential_r_cut,
       'params': _to_jsonable(potential_params),
       'neighbor_defaults': _to_jsonable(interaction_neighbor_defaults),
+    },
+    'collision_neighbor': {
+      'format': str(collision_neighbor_settings['format_name']),
+      'zsigma': float(collision_neighbor_settings['zsigma']),
+      'sigma_rel': float(collision_neighbor_settings['sigma_rel']),
+      'r_cutoff': float(collision_neighbor_settings['r_cutoff']),
+      'skin': float(collision_neighbor_settings['skin']),
+      'threshold': float(collision_neighbor_settings['threshold']),
+      'skin_from_cli': bool(collision_neighbor_settings['skin_from_cli']),
+      'capacity_multiplier': float(
+        collision_neighbor_settings['capacity_multiplier']
+      ),
+      'build_policy': str(collision_neighbor_settings['build_policy']),
+      'build_gamma_xy': float(collision_neighbor_settings['build_gamma_xy']),
+      'build_box': _to_jsonable(collision_neighbor_settings['build_box']),
+      'build_fractional_cell_size': float(
+        collision_neighbor_settings['build_fractional_cell_size']
+      ),
     },
   }
 
@@ -234,6 +399,24 @@ def main():
 
   # kT * mobility = D0 for isolated spheres.
   mobility = D0 / kT
+  collision_neighbor_settings = _resolve_collision_neighbor_settings(
+    args=args,
+    diameter=diameter,
+    D0=D0,
+    dt=dt,
+    format_map=format_map,
+  )
+  collision_neighbor_format_name = collision_neighbor_settings['format_name']
+  collision_neighbor_format = collision_neighbor_settings['format']
+  collision_neighbor_zsigma = collision_neighbor_settings['zsigma']
+  collision_neighbor_skin = collision_neighbor_settings['skin']
+  collision_neighbor_sigma_rel = collision_neighbor_settings['sigma_rel']
+  collision_neighbor_r_cutoff = collision_neighbor_settings['r_cutoff']
+  collision_neighbor_threshold = collision_neighbor_settings['threshold']
+  collision_neighbor_skin_from_cli = collision_neighbor_settings['skin_from_cli']
+  collision_neighbor_capacity_multiplier = collision_neighbor_settings[
+    'capacity_multiplier'
+  ]
 
   _CONSOLE.section('System')
   _CONSOLE.info(f'Equivalent box size L = {box_size:.6f}')
@@ -245,6 +428,17 @@ def main():
   _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
   _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
   _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
+  _CONSOLE.info(
+    'Collision neighbors: '
+    f'format={collision_neighbor_format_name}, '
+    f'zsigma={collision_neighbor_zsigma:.3g}, '
+    f'sigma_rel={collision_neighbor_sigma_rel:.6e}, '
+    f'r_cutoff={collision_neighbor_r_cutoff:.6f}, '
+    f'skin={collision_neighbor_skin:.6f}'
+    f'({"cli" if collision_neighbor_skin_from_cli else "auto"}), '
+    f'threshold={collision_neighbor_threshold:.6f}, '
+    f'capacity_multiplier={collision_neighbor_capacity_multiplier:.3g}'
+  )
 
   potential_setup = _resolve_potential_setup(
     potential_arg=args.potential,
@@ -309,9 +503,44 @@ def main():
   R0 = initial_positions['R0']
   run_key = initial_positions['run_key']
   min_dist = initial_positions['min_dist']
-  _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
+  if init_mode == 'random_relax':
+    _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
+  else:
+    _CONSOLE.info(f'Loaded minimum pair distance: {min_dist:.6f}')
 
   metric_shear = space.canonicalize_displacement_or_metric(displacement)
+  collision_build_box_info = _resolve_worst_xy_remap_build_box(
+    box_of=box_of,
+    base_box=base_box,
+    cutoff=collision_neighbor_threshold,
+  )
+  collision_neighbor_settings['build_policy'] = 'worst_xy_remap_corner'
+  collision_neighbor_settings['build_gamma_xy'] = collision_build_box_info[
+    'gamma_xy'
+  ]
+  collision_neighbor_settings['build_box'] = np.asarray(
+    collision_build_box_info['box'], dtype=float)
+  collision_neighbor_settings['build_fractional_cell_size'] = float(
+    collision_build_box_info['fractional_cell_size']
+  )
+  _CONSOLE.info(
+    'Collision build box: '
+    'policy=worst_xy_remap_corner, '
+    f'gamma_xy={collision_build_box_info["gamma_xy"]:+.3f}, '
+    f'r_cutoff={collision_neighbor_r_cutoff:.6f}, '
+    f'threshold={collision_neighbor_threshold:.6f}, '
+    f'fractional_cell_size={collision_build_box_info["fractional_cell_size"]:.6f}'
+  )
+
+  collision_neighbor_fn = partition.neighbor_list(
+    metric_shear,
+    base_box,
+    r_cutoff=collision_neighbor_r_cutoff,
+    dr_threshold=collision_neighbor_skin,
+    capacity_multiplier=collision_neighbor_capacity_multiplier,
+    fractional_coordinates=True,
+    format=collision_neighbor_format,
+  )
   if use_pair_potential:
     energy_fn_all_pairs = smap.pair(
       pair_potential_fn,
@@ -326,12 +555,13 @@ def main():
       **potential_params,
     )
 
-    def energy_fn(R, neighbor=None, **kwargs):
+    def energy_fn(R, interaction_neighbor=None, **kwargs):
       kwargs = dict(kwargs)
+      kwargs.pop('interaction_neighbor', None)
       kwargs.pop('neighbor', None)
-      if neighbor is None:
+      if interaction_neighbor is None:
         return energy_fn_all_pairs(R, **kwargs)
-      return energy_fn_neighbor(R, neighbor=neighbor, **kwargs)
+      return energy_fn_neighbor(R, neighbor=interaction_neighbor, **kwargs)
 
     interaction_neighbor_fn = partition.neighbor_list(
       metric_shear,
@@ -342,11 +572,28 @@ def main():
       fractional_coordinates=True,
       format=interaction_neighbor_format,
     )
+    interaction_neighbor_threshold = float(
+      potential_r_cut + interaction_neighbor_dr_threshold
+    )
+    interaction_build_box_info = _resolve_worst_xy_remap_build_box(
+      box_of=box_of,
+      base_box=base_box,
+      cutoff=interaction_neighbor_threshold,
+    )
+    _CONSOLE.info(
+      'Interaction build box: '
+      'policy=worst_xy_remap_corner, '
+      f'gamma_xy={interaction_build_box_info["gamma_xy"]:+.3f}, '
+      f'r_cutoff={potential_r_cut:.6f}, '
+      f'threshold={interaction_neighbor_threshold:.6f}, '
+      f'fractional_cell_size={interaction_build_box_info["fractional_cell_size"]:.6f}'
+    )
   else:
     def energy_fn(R, **unused_kwargs):
       return jnp.zeros((), dtype=R.dtype)
 
     interaction_neighbor_fn = None
+    interaction_build_box_info = None
 
   init_fn, apply_fn = simulate.brownian_hard_sphere(
     energy_fn,
@@ -371,28 +618,52 @@ def main():
 
   if use_pair_potential:
     @jit
-    def run_one_step(state_in, interaction_neighbor_in):
+    def run_one_step(
+      state_in,
+      collision_neighbor_in,
+      interaction_neighbor_in,
+    ):
       next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
       next_box = box_of(t=next_time)
       pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
         state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+      collision_neighbor_out = collision_neighbor_in.update(
+        pos_for_neighbor, box=next_box)
       interaction_neighbor_out = interaction_neighbor_in.update(
         pos_for_neighbor, box=next_box)
-      state_out = apply_fn(state_in, neighbor=interaction_neighbor_out)
+      state_out = apply_fn(
+        state_in,
+        neighbor=collision_neighbor_out,
+        interaction_neighbor=interaction_neighbor_out,
+      )
       curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
       curr_box = box_of(t=curr_time)
+      collision_neighbor_out = collision_neighbor_out.update(
+        state_out.position, box=curr_box)
       interaction_neighbor_out = interaction_neighbor_out.update(
         state_out.position, box=curr_box)
-      return state_out, interaction_neighbor_out
+      return state_out, collision_neighbor_out, interaction_neighbor_out
   else:
     @jit
-    def _run_one_step_without_pair_potential(state_in):
-      return apply_fn(state_in)
+    def _run_one_step_without_pair_potential(state_in, collision_neighbor_in):
+      next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
+      next_box = box_of(t=next_time)
+      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
+        state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+      collision_neighbor_out = collision_neighbor_in.update(
+        pos_for_neighbor, box=next_box)
+      state_out = apply_fn(state_in, neighbor=collision_neighbor_out)
+      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
+      collision_neighbor_out = collision_neighbor_out.update(
+        state_out.position, box=curr_box)
+      return state_out, collision_neighbor_out
 
-    def run_one_step(state_in, interaction_neighbor_in):
+    def run_one_step(state_in, collision_neighbor_in, interaction_neighbor_in):
       del interaction_neighbor_in
-      state_out = _run_one_step_without_pair_potential(state_in)
-      return state_out, None
+      state_out, collision_neighbor_out = _run_one_step_without_pair_potential(
+        state_in, collision_neighbor_in)
+      return state_out, collision_neighbor_out, None
 
   @jit
   def evaluate_stress(state_in):
@@ -450,6 +721,7 @@ def main():
     potential_source=potential_source,
     potential_params=potential_params,
     interaction_neighbor_defaults=interaction_neighbor_defaults,
+    collision_neighbor_settings=collision_neighbor_settings,
   )
   params_path = _write_params_json(out_dir, params)
   _CONSOLE.info(f'Wrote parameters to {params_path}')
@@ -490,10 +762,21 @@ def main():
   # ============================================================================
   try:
     state = init_fn(run_key, R0)
+    # `box` is the physical/reference box at t0; `build_box` is the
+    # worst-remap envelope used only for conservative cell-list sizing.
+    box_t0 = box_of(t=shear_t0)
+    collision_build_box = jnp.asarray(
+      collision_build_box_info['box'], dtype=base_box.dtype)
+    collision_neighbor = collision_neighbor_fn.allocate(
+      state.position, box=box_t0, build_box=collision_build_box)
+    if not _check_collision_neighbor_status(collision_neighbor, 'shear_init'):
+      return
     interaction_neighbor = None
     if use_pair_potential:
-      box_t0 = box_of(t=shear_t0)
-      interaction_neighbor = interaction_neighbor_fn.allocate(state.position, box=box_t0)
+      interaction_build_box = jnp.asarray(
+        interaction_build_box_info['box'], dtype=base_box.dtype)
+      interaction_neighbor = interaction_neighbor_fn.allocate(
+        state.position, box=box_t0, build_box=interaction_build_box)
       if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
         return
 
@@ -519,12 +802,19 @@ def main():
 
     steps_done = 0
     while steps_done < planned_steps:
-      state, interaction_neighbor = run_one_step(state, interaction_neighbor)
+      state, collision_neighbor, interaction_neighbor = run_one_step(
+        state,
+        collision_neighbor,
+        interaction_neighbor,
+      )
       steps_done += 1
 
       if not _check_nan_positions(state, f'shear step {steps_done}'):
         return
       if not _check_collision_loop_status(state, f'shear step {steps_done}'):
+        return
+      if not _check_collision_neighbor_status(
+        collision_neighbor, f'shear step {steps_done}'):
         return
       if use_pair_potential and not _check_interaction_neighbor_status(
         interaction_neighbor, f'shear step {steps_done}'):

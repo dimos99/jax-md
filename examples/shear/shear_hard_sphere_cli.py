@@ -84,6 +84,31 @@ def parse_args():
     help='Maximum hard-sphere collision-resolution loops per timestep.',
   )
   parser.add_argument(
+    '--collision-neighbor-zsigma',
+    type=float,
+    default=6.0,
+    help=(
+      'Collision-neighbor cutoff multiplier z where '
+      'r_cutoff = diameter + z*sqrt(4*D0*dt). Must be > 0.'
+    ),
+  )
+  parser.add_argument(
+    '--collision-neighbor-skin',
+    type=float,
+    default=None,
+    help=(
+      'Optional collision-neighbor skin added to r_cutoff via dr_threshold; '
+      'search threshold is r_cutoff + skin. If omitted, defaults to '
+      'zsigma*sqrt(4*D0*dt).'
+    ),
+  )
+  parser.add_argument(
+    '--collision-neighbor-capacity-multiplier',
+    type=float,
+    default=2.5,
+    help='Capacity multiplier for hard-sphere collision neighbor list (must be > 0).',
+  )
+  parser.add_argument(
     '--out_dir',
     '--out',
     dest='out_dir',
@@ -136,6 +161,15 @@ def parse_args():
     raise ValueError('hs_core_radius must be > 0 when provided.')
   if args.max_collision_loops is not None and int(args.max_collision_loops) <= 0:
     raise ValueError('max_collision_loops must be > 0 when provided.')
+  if float(args.collision_neighbor_zsigma) <= 0.0:
+    raise ValueError('collision_neighbor_zsigma must be > 0.')
+  if (
+    args.collision_neighbor_skin is not None
+    and float(args.collision_neighbor_skin) < 0.0
+  ):
+    raise ValueError('collision_neighbor_skin must be >= 0 when provided.')
+  if float(args.collision_neighbor_capacity_multiplier) <= 0.0:
+    raise ValueError('collision_neighbor_capacity_multiplier must be > 0.')
   if args.init_traj is not None and args.init_data is not None:
     raise ValueError('--init-traj and --init-data cannot be used together.')
   if args.init_traj is not None or args.init_data is not None:
