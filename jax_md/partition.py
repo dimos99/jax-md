@@ -808,6 +808,11 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       for details about the different choices for formats. Defaults to `Dense`.
     **static_kwargs: kwargs that get threaded through the calculation of
       example positions.
+
+  Runtime kwargs for ``NeighborListFns.allocate`` / ``NeighborListFns.update``:
+    box: Physical box used for geometry, remap checks, and build references.
+    build_box: Optional box used only for cell-list sizing at build/rebuild.
+      If omitted, sizing defaults to ``box``.
   Returns:
     A NeighborListFns object that contains a method to allocate a new neighbor
     list and a method to update an existing neighbor list.
@@ -920,11 +925,19 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
                        neighbors = None,
                        extra_capacity: int = 0,
                        **kwargs) -> NeighborList:
+    runtime_kwargs = dict(kwargs)
+    build_box = runtime_kwargs.pop('build_box', None)
+    if (not fractional_coordinates and build_box is not None and
+        util.is_array(build_box) and hasattr(build_box, 'ndim') and
+        build_box.ndim == 2):
+      raise ValueError('neighbor_list: matrix `build_box` only supported with '
+                       'fractional_coordinates=True.')
+
     # Auto-remap fractional positions only when a discrete lattice-equivalent
     # flip occurs (off-diagonal wrap count changes). This preserves real-space
     # continuity across canonical remap flips but avoids remapping on small
     # shear updates where fractional positions should remain fixed.
-    H_new = kwargs.get('box', None)
+    H_new = runtime_kwargs.get('box', None)
     if (neighbors is not None and fractional_coordinates and
         (H_new is not None) and hasattr(neighbors, 'last_box') and
         (neighbors.last_box is not None)):
@@ -951,20 +964,22 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
       position, err = position_and_error
       N = position.shape[0]
 
-      # Remember the physical box used for this build/reference.
-      # For fractional coordinates, callers can pass a triclinic matrix via kwargs['box'].
-      box_for_ref = kwargs.get('box', box)
+      # Keep physical/reference geometry tied to `box` while letting `build_box`
+      # provide a conservative cell-size envelope. This separation avoids
+      # conflating "current physics box" with "worst-case sizing box".
+      box_for_ref = runtime_kwargs.get('box', box)
+      box_for_sizing = build_box if build_box is not None else box_for_ref
 
       cl_fn = None
       cl = None
       cell_size = None
       if not disable_cell_list:
         if neighbors is None:
-          _box = kwargs.get('box', box)
+          _box = box_for_sizing
           cell_size = cutoff
           if fractional_coordinates:
-            err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(_box)))
-            cell_size = _fractional_cell_size(_box, cutoff)
+            err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(box_for_ref)))
+            cell_size = _fractional_cell_size(box_for_sizing, cutoff)
             _box = 1.0
           if jnp.all(cell_size < _box / 3.):
             cl_fn = cell_list(_box, cell_size, capacity_multiplier)
@@ -989,9 +1004,9 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         idx = custom_mask_function(idx)
 
       if is_sparse(format):
-        idx, occupancy = prune_neighbor_list_sparse(position, idx, **kwargs)
+        idx, occupancy = prune_neighbor_list_sparse(position, idx, **runtime_kwargs)
       else:
-        idx, occupancy = prune_neighbor_list_dense(position, idx, **kwargs)
+        idx, occupancy = prune_neighbor_list_dense(position, idx, **runtime_kwargs)
 
       if max_occupancy is None:
         _extra_capacity = (extra_capacity if not is_sparse(format)
@@ -1043,18 +1058,20 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
 
     # If the box has been updated, then check that fractional coordinates are
     # enabled and that the cell list has big enough cells.
-    if 'box' in kwargs and not disable_cell_list:
+    if 'box' in runtime_kwargs and not disable_cell_list:
       if not fractional_coordinates:
         raise ValueError('Neighbor list cannot accept a box keyword argument '
                          'if fractional_coordinates is not enabled.')
       # `cell_size` is really the minimum cell size.
       cur_cell_size = _cell_size(1.0, nbrs.cell_size)
-      new_cell_size = _cell_size(1.0, _fractional_cell_size(kwargs['box'], cutoff))
+      new_cell_size = _cell_size(
+          1.0, _fractional_cell_size(runtime_kwargs['box'], cutoff))
       err = nbrs.error.update(PEC.CELL_SIZE_TOO_SMALL, new_cell_size > cur_cell_size)
-      err = err.update(PEC.MALFORMED_BOX, jnp.logical_not(is_box_valid(kwargs['box'])))
+      err = err.update(PEC.MALFORMED_BOX,
+                       jnp.logical_not(is_box_valid(runtime_kwargs['box'])))
       nbrs = dataclasses.replace(nbrs, error=err)
 
-    d = partial(metric_sq, **kwargs)
+    d = partial(metric_sq, **runtime_kwargs)
     d = vmap(d)
     # Per-particle squared displacement since build (real units; disp_fn already uses current H)
     d_sq = d(position, nbrs.reference_position)
@@ -1070,9 +1087,9 @@ def neighbor_list(displacement_or_metric: DisplacementOrMetricFn,
         return b
       return jnp.diag(jnp.ones((dim,), dtype=f32(b))) * f32(b)
 
-    if 'box' in kwargs and fractional_coordinates:
+    if 'box' in runtime_kwargs and fractional_coordinates:
       dim = position.shape[1]
-      H_now = _as_matrix(kwargs['box'], dim)
+      H_now = _as_matrix(runtime_kwargs['box'], dim)
       H_ref = _as_matrix(nbrs.box_at_build if hasattr(nbrs, 'box_at_build') else box, dim)
       H_now_c = _canonicalize_upper_triangular_box(H_now)
       H_ref_c = _canonicalize_upper_triangular_box(H_ref)
