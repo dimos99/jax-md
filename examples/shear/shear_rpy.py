@@ -43,6 +43,84 @@ from shear_time_utils import _state_time_from_step
 _CONSOLE = get_console()
 
 
+def _as_box_matrix(box, *, dim: int) -> np.ndarray:
+  """Returns a square box matrix for scalar/vector/matrix box encodings."""
+  arr = np.asarray(box, dtype=float)
+  if arr.ndim == 0:
+    return np.eye(dim, dtype=float) * float(arr)
+  if arr.ndim == 1:
+    return np.diag(arr)
+  return arr
+
+
+def _fractional_cell_size_for_cutoff(box, cutoff: float) -> float:
+  """Mirrors `partition._fractional_cell_size` for build-box selection."""
+  cutoff = float(cutoff)
+  if cutoff <= 0.0:
+    raise ValueError('cutoff must be > 0.')
+
+  box_arr = np.asarray(box, dtype=float)
+  if box_arr.ndim == 0:
+    return float(cutoff / float(box_arr))
+  if box_arr.ndim == 1:
+    return float(cutoff / float(np.min(box_arr)))
+  if box_arr.ndim != 2:
+    raise ValueError(
+      'Expected box to be either a scalar, a vector, or a matrix.'
+    )
+
+  dim = int(box_arr.shape[0])
+  if dim == 1:
+    nmin = int(np.floor(float(box_arr[0, 0]) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  if dim == 2:
+    xx = float(box_arr[0, 0])
+    yy = float(box_arr[1, 1])
+    xy = float(box_arr[0, 1] / yy)
+    nx = xx / float(np.sqrt(1.0 + xy ** 2))
+    ny = yy
+    nmin = int(np.floor(min(nx, ny) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  if dim == 3:
+    xx = float(box_arr[0, 0])
+    yy = float(box_arr[1, 1])
+    zz = float(box_arr[2, 2])
+    xy = float(box_arr[0, 1] / yy)
+    xz = float(box_arr[0, 2] / zz)
+    yz = float(box_arr[1, 2] / zz)
+    nx = xx / float(np.sqrt(1.0 + xy ** 2 + (xy * yz - xz) ** 2))
+    ny = yy / float(np.sqrt(1.0 + yz ** 2))
+    nz = zz
+    nmin = int(np.floor(min(nx, ny, nz) / cutoff))
+    nmin = max(nmin, 1)
+    return float(1.0 / nmin)
+  raise ValueError(
+    'Expected box to be either 1-, 2-, or 3-dimensional '
+    f'found {dim}.'
+  )
+
+
+def _resolve_worst_xy_remap_build_box(*, box_of, base_box, cutoff: float) -> dict:
+  """Selects the build box from gamma_xy in {-0.5, 0.0, +0.5}."""
+  dim = int(np.asarray(base_box).shape[0])
+  candidates = []
+  for gamma_xy in (-0.5, 0.0, 0.5):
+    candidate_box = _as_box_matrix(
+      box_of(gamma={'xy': float(gamma_xy), 'xz': 0.0, 'yz': 0.0}),
+      dim=dim,
+    )
+    candidate_fractional_cell_size = _fractional_cell_size_for_cutoff(
+      candidate_box, cutoff)
+    candidates.append({
+      'gamma_xy': float(gamma_xy),
+      'box': candidate_box,
+      'fractional_cell_size': float(candidate_fractional_cell_size),
+    })
+  return max(candidates, key=lambda c: c['fractional_cell_size'])
+
+
 def main():
   """Runs one configurable RPY shear trajectory and writes run artifacts."""
   # ============================================================================
@@ -188,7 +266,10 @@ def main():
   R0 = initial_positions['R0']
   run_key = initial_positions['run_key']
   min_dist = initial_positions['min_dist']
-  _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
+  if init_mode == 'random_relax':
+    _CONSOLE.info(f'Post-relax minimum pair distance: {min_dist:.6f}')
+  else:
+    _CONSOLE.info(f'Loaded minimum pair distance: {min_dist:.6f}')
 
   # Build force and neighbor operators.
   # Construct force/energy and interaction neighbor-list operators.
@@ -220,11 +301,28 @@ def main():
       fractional_coordinates=True,
       format=interaction_neighbor_format,
     )
+    interaction_neighbor_threshold = float(
+      potential_r_cut + interaction_neighbor_dr_threshold
+    )
+    interaction_build_box_info = _resolve_worst_xy_remap_build_box(
+      box_of=box_of,
+      base_box=base_box,
+      cutoff=interaction_neighbor_threshold,
+    )
+    _CONSOLE.info(
+      'Interaction build box: '
+      'policy=worst_xy_remap_corner, '
+      f'gamma_xy={interaction_build_box_info["gamma_xy"]:+.3f}, '
+      f'r_cutoff={potential_r_cut:.6f}, '
+      f'threshold={interaction_neighbor_threshold:.6f}, '
+      f'fractional_cell_size={interaction_build_box_info["fractional_cell_size"]:.6f}'
+    )
   else:
     def energy_fn(R, **unused_kwargs):
       return jnp.zeros((), dtype=R.dtype)
 
     interaction_neighbor_fn = None
+    interaction_build_box_info = None
 
   # Bound the estimator over the full planned simulation time interval.
   shear_t_bounds = (
@@ -484,10 +582,16 @@ def main():
     positions_init = state.integrator_position # shape (N, dim) in fractional coordinates
     interaction_neighbor = None
     if use_pair_potential:
+      # `box` keeps the physical/reference build box at t0; `build_box` is a
+      # conservative shear envelope so cell sizing stays safe at remap corners.
       box_t0 = box_of(t=shear_t0)
-      # Allocate the initial neighbor list at the first box
+      interaction_build_box = jnp.asarray(
+        interaction_build_box_info['box'], dtype=base_box.dtype)
       interaction_neighbor = interaction_neighbor_fn.allocate(
-        state.integrator_position, box=box_t0)
+        state.integrator_position,
+        box=box_t0,
+        build_box=interaction_build_box,
+      )
     if not _check_neighbor_status(state, 'shear_init'):
       return
     if use_pair_potential and not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
