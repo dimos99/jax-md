@@ -469,33 +469,47 @@ def _compute_gammas(schedule: ShearSchedule,
   planes = schedule.planes
   g = {}
 
+  def _as_float_array(value):
+    arr = jnp.asarray(value)
+    dtype = jnp.result_type(arr, f32)
+    return arr.astype(dtype)
+
+  def _reduce_gamma(value):
+    gamma_arr = _as_float_array(value)
+    half = jnp.asarray(0.5, dtype=gamma_arr.dtype)
+    return gamma_arr - jnp.floor(gamma_arr + half)
+
   if gamma is not None:
     if isinstance(gamma, dict):
       for k in planes:
         if k in gamma:
-          g[k] = f32(gamma[k])
+          g[k] = _as_float_array(gamma[k])
     else:
       if 'xy' in planes:
-        g['xy'] = f32(gamma)
+        g['xy'] = _as_float_array(gamma)
 
   for k, val in (('xy', gamma_xy), ('xz', gamma_xz), ('yz', gamma_yz)):
     if val is not None and k in planes:
-      g[k] = f32(val)
+      g[k] = _as_float_array(val)
 
   missing = [k for k in planes if k not in g]
   if missing:
     if t is None:
       raise ValueError("Either gamma/gamma_* or t must be provided.")
-    t_val = f32(t)
+    t_val = _as_float_array(t)
     for k in missing:
       fn = schedule.fn_map.get(k, None)
-      g[k] = f32(fn(t_val)) if fn is not None else f32(0.0)
+      g[k] = (
+        _as_float_array(fn(t_val))
+        if fn is not None
+        else jnp.zeros((), dtype=t_val.dtype)
+      )
   elif remap:
     # No missing planes and remap requested: early return after wrapping.
-    return {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
+    return {k: _reduce_gamma(v) for k, v in g.items()}
 
   if remap:
-    g = {k: (v - jnp.floor(v + f32(0.5))) for k, v in g.items()}
+    g = {k: _reduce_gamma(v) for k, v in g.items()}
   return g
 # --------------------------------------
 
