@@ -40,6 +40,7 @@ from typing import Any, Callable, TypeVar, Union, Tuple, Dict, Optional, Sequenc
 import functools
 
 import jax
+import numpy as np
 
 from jax import grad
 from jax import jit
@@ -1101,10 +1102,18 @@ def _normalize_shear_schedule(
     shear_schedule: Union[Callable[[Array], Array], Dict[str, Callable[[Array], Array]], None]
 ) -> Tuple[Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]]:
   """Return per-plane shear callables for xy/xz/yz with zero fallbacks."""
+  def _as_shear_float(value, ref=None):
+    arr = jnp.asarray(value)
+    if ref is None:
+      dtype = jnp.result_type(arr, f32)
+    else:
+      dtype = jnp.result_type(arr, jnp.asarray(ref), f32)
+    return arr.astype(dtype)
+
   def _wrap(fn):
     if fn is None:
-      return lambda t: f32(0.0)
-    return lambda t: f32(fn(t))
+      return lambda t: _as_shear_float(0.0, t)
+    return lambda t: _as_shear_float(fn(t), t)
 
   if isinstance(shear_schedule, dict):
     return (
@@ -1122,8 +1131,16 @@ def _normalize_rpy_shear_vector_schedule(
 ) -> Tuple[Callable[[Array], Array], Callable[[Array], Array], Callable[[Array], Array]]:
   """Return shear callables (xy, xz, yz) from a vector schedule."""
 
+  def _as_shear_float(value, ref=None):
+    arr = jnp.asarray(value)
+    if ref is None:
+      dtype = jnp.result_type(arr, f32)
+    else:
+      dtype = jnp.result_type(arr, jnp.asarray(ref), f32)
+    return arr.astype(dtype)
+
   def _zero(t):
-    return f32(0.0)
+    return _as_shear_float(0.0, t)
 
   if shear_vector_schedule is None:
     return _zero, _zero, _zero
@@ -1138,7 +1155,11 @@ def _normalize_rpy_shear_vector_schedule(
       raise ValueError(
           "shear_vector_schedule(t) must return (gamma_xy, gamma_xz, gamma_yz)."
       ) from err
-    return f32(gamma_xy), f32(gamma_xz), f32(gamma_yz)
+    return (
+        _as_shear_float(gamma_xy, t),
+        _as_shear_float(gamma_xz, t),
+        _as_shear_float(gamma_yz, t),
+    )
 
   return (
       lambda t: _eval_vec(t)[0],
@@ -1149,25 +1170,41 @@ def _normalize_rpy_shear_vector_schedule(
 
 def _make_shear_at(sf_xy, sf_xz, sf_yz):
   """Return a `(time, dim) -> (gamma_xy, gamma_xz, gamma_yz)` shear helper."""
-  def _shear_at(time, dim):
-    gamma_xy = f32(sf_xy(time))
-    if dim >= 3:
-      gamma_xz = f32(sf_xz(time))
-      gamma_yz = f32(sf_yz(time))
+  def _as_shear_float(value, ref=None):
+    arr = jnp.asarray(value)
+    if ref is None:
+      dtype = jnp.result_type(arr, f32)
     else:
-      gamma_xz = gamma_yz = f32(0.0)
+      dtype = jnp.result_type(arr, jnp.asarray(ref), f32)
+    return arr.astype(dtype)
+
+  def _shear_at(time, dim):
+    gamma_xy = _as_shear_float(sf_xy(time), time)
+    if dim >= 3:
+      gamma_xz = _as_shear_float(sf_xz(time), time)
+      gamma_yz = _as_shear_float(sf_yz(time), time)
+    else:
+      gamma_xz = gamma_yz = _as_shear_float(0.0, gamma_xy)
     return gamma_xy, gamma_xz, gamma_yz
   return _shear_at
 
 
 def _reduce_shear_strain(gamma_xy, gamma_xz, gamma_yz, dim):
   """Reduce shear strain into [-0.5, 0.5) and return integer remap counters."""
-  m_xy = jnp.floor(gamma_xy + f32(0.5))
+  gamma_xy = jnp.asarray(gamma_xy)
+  gamma_xy = gamma_xy.astype(jnp.result_type(gamma_xy, f32))
+  half_xy = jnp.asarray(0.5, dtype=gamma_xy.dtype)
+  m_xy = jnp.floor(gamma_xy + half_xy)
   if dim >= 3:
-    m_xz = jnp.floor(gamma_xz + f32(0.5))
-    m_yz = jnp.floor(gamma_yz + f32(0.5))
+    gamma_xz = jnp.asarray(gamma_xz).astype(jnp.result_type(gamma_xz, gamma_xy))
+    gamma_yz = jnp.asarray(gamma_yz).astype(jnp.result_type(gamma_yz, gamma_xy))
+    half_xz = jnp.asarray(0.5, dtype=gamma_xz.dtype)
+    half_yz = jnp.asarray(0.5, dtype=gamma_yz.dtype)
+    m_xz = jnp.floor(gamma_xz + half_xz)
+    m_yz = jnp.floor(gamma_yz + half_yz)
   else:
-    m_xz = m_yz = f32(0.0)
+    gamma_xz = gamma_yz = jnp.zeros((), dtype=gamma_xy.dtype)
+    m_xz = m_yz = jnp.zeros((), dtype=jnp.int32)
   return (
       gamma_xy - m_xy,
       gamma_xz - m_xz,
@@ -2489,7 +2526,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
                          shift_fn: ShiftFn,
                          dt: float,
                          kT: float = 1.0,
-                         diameter: float = 2.0,
+                         diameter: Union[float, Array] = 2.0,
                          mobility: Union[float, Array] = 1.0,
                          max_collision_loops: int = 1e7,
                          event_time_tol: Optional[float] = None,
@@ -2507,7 +2544,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     shift_fn: Function to shift positions. See 'space' module.
     dt: Time step. In units of a^2/D.
     kT: Thermal energy. Defaults to 1.0.
-    diameter: Hard sphere diameter (sigma). Defaults to 2.0.
+    diameter: Hard sphere diameter (sigma). Can be a scalar or a per-particle
+      array with shape ``[N]`` or ``[N, 1]``. Pair contacts use
+      ``sigma_ij = 0.5 * (sigma_i + sigma_j)``. Defaults to 2.0.
     mobility: Mobility coefficient. Defaults to 1.0. Viscosity 1/6pi then.
     max_collision_loops: Safety cap on collision events per step. Defaults to 1e7.
     event_time_tol: Absolute tolerance for treating near-zero collision times
@@ -2539,8 +2578,14 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       in real space.
     - Within each `dt`, the Brownian increment is interpreted as a constant
       peculiar velocity (Strating), and overlaps are removed by processing
-      elastic binary collisions in temporal order using the total relative
-      velocity (peculiar + affine-from-shear).
+      pairwise hard-sphere reflection events in temporal order using the total
+      relative velocity (peculiar + affine-from-shear).
+    - For polydisperse hard spheres this is an overdamped Brownian extension
+      of Strating's equal-sphere reflection idea: inertia is absent, Newtonian
+      momentum is not conserved, and the normal collision correction is split
+      by mobility. Hard-core geometry is controlled only by `diameter`, while
+      overdamped transport / collision splitting is controlled only by
+      `mobility`.
     - With `space.shearing(..., remap=True)`, reduced shear is discontinuous at
       half-integer gamma. When using fractional coordinates, the corresponding
       unimodular coordinate remap must be applied at the crossing time to keep
@@ -2548,18 +2593,37 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     - The returned state includes `stress`, the collisional hard-sphere stress
       over the last step computed from collision-induced velocity kicks as
         σ = -(1 / (V dt)) Σ ((Δv_i dt) ⊗ r_c),
-      where r_c = diameter * n is the separation vector at contact and
-      Δv_i = v_i^* - v_i is the collision-induced jump in the peculiar velocity
-      of one particle. For equal masses, Δv_rel = (v_i^* - v_j^*) - (v_i - v_j)
-      satisfies Δv_rel = 2 Δv_i, so if you only track the relative change you
-      should use 0.5 * Δv_rel. If no `box`/`box_fn` is provided, `stress` is
-      returned as zeros.
+      where ``r_c = sigma_ij * n`` is the pair contact vector and ``Δv_i`` is
+      the mobility-weighted collision-induced jump in the peculiar velocity of
+      one particle. In the polydisperse case this remains an overdamped
+      collisional diagnostic rather than a literal inertial momentum-transfer
+      quantity. If no `box`/`box_fn` is provided, `stress` is returned as
+      zeros.
   """
   force_fn = quantity.canonicalize_force(energy_or_force_fn)
-  dt = jnp.asarray(dt)
-  diameter = jnp.asarray(diameter)
-  diameter_sq = diameter ** 2
-  t0 = jnp.asarray(t0, dtype=dt.dtype)
+  input_dt = jnp.asarray(dt)
+  use_x64 = bool(jax.config.read('jax_enable_x64'))
+  work_dtype = jnp.float64 if use_x64 else input_dt.dtype
+  dt = jnp.asarray(dt, dtype=work_dtype)
+  kT = jnp.asarray(kT, dtype=work_dtype)
+  diameter = jnp.asarray(diameter, dtype=work_dtype)
+  diameter_np = np.asarray(diameter)
+  t0 = jnp.asarray(t0, dtype=work_dtype)
+
+  if diameter_np.ndim not in (0, 1, 2):
+    raise ValueError(
+      'Expected diameter to be a scalar or an array with shape [N] or [N, 1]. '
+      f'Found ndim={diameter_np.ndim}.'
+    )
+  if diameter_np.ndim == 2 and diameter_np.shape[1] != 1:
+    raise ValueError(
+      'Expected diameter to be a scalar or an array with shape [N] or [N, 1]. '
+      f'Found shape={diameter_np.shape}.'
+    )
+  if not np.all(np.isfinite(diameter_np)):
+    raise ValueError('Expected diameter to contain only finite values.')
+  if np.any(diameter_np <= 0):
+    raise ValueError('Expected diameter to be strictly positive.')
  
   if box is not None and box_fn is not None:
     raise ValueError(
@@ -2575,6 +2639,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
   sf_xy, sf_xz, sf_yz = _normalize_shear_schedule(shear_schedule)
   shear_at = _make_shear_at(sf_xy, sf_xz, sf_yz)
+
+  def _c(x):
+    return jnp.asarray(x, dtype=work_dtype)
 
   def _affine_velocity(R, g_dot_xy, g_dot_xz, g_dot_yz):
     """Affine velocity u(R) for simple shear in 2D/3D."""
@@ -2593,11 +2660,59 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     """Relative affine velocity u_i - u_j expressed via separation dr = r_i - r_j."""
     return _affine_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
 
+  def _canonicalize_particle_diameter(n_particles, dtype):
+    """Return per-particle hard-sphere diameters as a vector of shape [N]."""
+    if diameter_np.ndim == 0:
+      sigma = jnp.full((n_particles,), jnp.asarray(diameter, dtype=dtype))
+    elif diameter_np.ndim == 1:
+      if diameter_np.shape[0] != n_particles:
+        raise ValueError(
+          'Expected diameter array length to match the particle count. '
+          f'Found diameter.shape={diameter_np.shape} and N={n_particles}.'
+        )
+      sigma = jnp.asarray(diameter, dtype=dtype)
+    else:
+      if diameter_np.shape[0] != n_particles:
+        raise ValueError(
+          'Expected diameter array length to match the particle count. '
+          f'Found diameter.shape={diameter_np.shape} and N={n_particles}.'
+        )
+      sigma = jnp.asarray(diameter[:, 0], dtype=dtype)
+    return jnp.reshape(sigma, (n_particles,))
+
+  def _mobility_pair_scalars(mobility_value, n_particles, dtype):
+    """Return per-particle mobility scalars as a vector of shape [N]."""
+    mobility_arr = jnp.asarray(mobility_value, dtype=dtype)
+    if mobility_arr.ndim == 0:
+      mobility_vec = jnp.full((n_particles,), mobility_arr)
+    elif mobility_arr.ndim == 1:
+      if mobility_arr.shape[0] != n_particles:
+        raise ValueError(
+          'Expected mobility array length to match the particle count. '
+          f'Found mobility.shape={mobility_arr.shape} and N={n_particles}.'
+        )
+      mobility_vec = mobility_arr
+    elif mobility_arr.ndim == 2 and mobility_arr.shape[1] == 1:
+      if mobility_arr.shape[0] != n_particles:
+        raise ValueError(
+          'Expected mobility array length to match the particle count. '
+          f'Found mobility.shape={mobility_arr.shape} and N={n_particles}.'
+        )
+      mobility_vec = jnp.reshape(mobility_arr, (n_particles,))
+    else:
+      raise ValueError(
+        'Expected mobility to be a scalar or an array with shape [N] or [N, 1]. '
+        f'Found shape={mobility_arr.shape}.'
+      )
+    return mobility_vec
+
   @jit
   def init_fn(key, R, **kwargs):
-    mu = kwargs.get('mobility', mobility)
-    time0 = jnp.array(t0, dtype=R.dtype)
-    stress0 = jnp.zeros((R.shape[1], R.shape[1]), dtype=R.dtype)
+    R = jnp.asarray(R, dtype=work_dtype)
+    _ = _canonicalize_particle_diameter(R.shape[0], R.dtype)
+    mu = jnp.asarray(kwargs.get('mobility', mobility), dtype=work_dtype)
+    time0 = jnp.array(t0, dtype=work_dtype)
+    stress0 = jnp.zeros((R.shape[1], R.shape[1]), dtype=work_dtype)
     collided0 = jnp.zeros((R.shape[0],), dtype=bool)
     reached_max0 = jnp.array(False)
     step0 = jnp.array(0, dtype=jnp.int32)
@@ -2656,20 +2771,21 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     return _sort_pairs(i_idx, j_idx, mask)
 
   if event_time_tol is None:
-    time_tol = jnp.asarray(1e-9, dtype=dt.dtype)
+    time_tol = jnp.asarray(1e-9, dtype=work_dtype)
   else:
-    time_tol = jnp.asarray(event_time_tol, dtype=dt.dtype)
+    time_tol = jnp.asarray(event_time_tol, dtype=work_dtype)
   time_tol = jnp.minimum(time_tol, dt)
   # Used to prevent pathological near-zero event times from stalling the loop.
-  NO_EVENT_TIME = jnp.asarray(1e8, dtype=dt.dtype)
+  NO_EVENT_TIME = jnp.asarray(1e8, dtype=work_dtype)
 
   def _supports_batched_displacement(dim):
     # Many displacement fns (e.g. space.periodic) accept only vector inputs,
     # while `space.shearing` explicitly supports batched inputs. We detect this
     # once at construction time so collision prediction can use the fast path.
     try:
-      dummy = jax.ShapeDtypeStruct((2, dim), jnp.float32)
-      out = jax.eval_shape(lambda a, b: displacement_fn(a, b, t=f32(0.0)), dummy, dummy)
+      dummy = jax.ShapeDtypeStruct((2, dim), work_dtype)
+      out = jax.eval_shape(
+        lambda a, b: displacement_fn(a, b, t=_c(0.0)), dummy, dummy)
       return out.shape == (2, dim)
     except Exception:
       return False
@@ -2680,12 +2796,16 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
   @jit
   def apply_fn(state, **kwargs):
     step_kwargs = dict(kwargs)
-    _kT = step_kwargs.pop('kT', kT)
+    _kT = jnp.asarray(step_kwargs.pop('kT', kT), dtype=work_dtype)
 
     R_start, mu, key, time, _, _, _, prev_step, _ = dataclasses.astuple(state)
+    R_start = jnp.asarray(R_start, dtype=work_dtype)
+    mu = jnp.asarray(mu, dtype=work_dtype)
+    time = jnp.asarray(time, dtype=work_dtype)
     dim = R_start.shape[1]
     N = R_start.shape[0]
-    t_zero = jnp.asarray(0.0, dtype=dt.dtype)
+    t_zero = _c(0.0)
+    rel_eps = _c(64.0) * jnp.finfo(work_dtype).eps
 
     neighbor = step_kwargs.get('neighbor', None)
 
@@ -2736,10 +2856,12 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     # --- Construct Strating "velocity" from force + noise over dt ---
     F = force_fn(R_start, **force_kwargs)
     mobility_arr = jnp.asarray(mu, dtype=R_start.dtype)
+    mobility_pair = _mobility_pair_scalars(mu, N, R_start.dtype)
+    sigma = _canonicalize_particle_diameter(N, R_start.dtype)
 
     key, split = random.split(key)
     xi = random.normal(split, R_start.shape, R_start.dtype)
-    dR_noise = jnp.sqrt(f32(2) * mobility_arr * _kT * dt) * xi
+    dR_noise = jnp.sqrt(_c(2.0) * mobility_arr * _kT * dt) * xi
     # Strating's Algorithm: Interpret the Brownian displacement (drift + diffusion) 
     # as a constant "peculiar velocity" over the timestep dt. This allows treating 
     # the dynamics as ballistic between hard-sphere events.
@@ -2755,7 +2877,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       box_for_volume = jnp.asarray(box_for_volume, dtype=R_start.dtype)
       volume = quantity.volume(dim, box_for_volume)
     else:
-      volume = f32(1.0)
+      raise ValueError(
+          "brownian_hard_sphere: box or box_fn is required to compute collisional stress."
+      )
 
     stress_zero = jnp.zeros((dim, dim), dtype=R_start.dtype)
     collided_zero = jnp.zeros((N,), dtype=bool)
@@ -2770,16 +2894,16 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
         remap_eps = jnp.array(1e-9, dtype=dt_type)
       else:
         remap_eps = jnp.array(1e-5, dtype=dt_type)
-      remap_eps = jnp.minimum(remap_eps, 0.5 * dt)
+      remap_eps = jnp.minimum(remap_eps, _c(0.5) * dt)
 
       def _remap_cross_time(g0, gdot, m_prev, m_step):
         # Crossing occurs when floor(g + 0.5) changes, i.e. at half-integers.
         m_step_f = jnp.asarray(m_step, dtype=g0.dtype)
         sign = jnp.sign(m_step_f)
-        g_cross = jnp.asarray(m_prev, dtype=g0.dtype) + f32(0.5) * sign
-        safe_gdot = jnp.where(jnp.abs(gdot) > f32(0.0), gdot, f32(1.0))
+        g_cross = jnp.asarray(m_prev, dtype=g0.dtype) + _c(0.5) * sign
+        safe_gdot = jnp.where(jnp.abs(gdot) > _c(0.0), gdot, _c(1.0))
         t_cross = (g_cross - g0) / safe_gdot
-        t_cross = jnp.clip(t_cross, f32(0.0), dt)
+        t_cross = jnp.clip(t_cross, _c(0.0), dt)
         return jnp.where(m_step != 0, t_cross, NO_EVENT_TIME)
 
       t_cross_xy = _remap_cross_time(gamma_xy_0, g_dot_xy, m_prev_xy, m_xy)
@@ -2793,7 +2917,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       pending_xz = (dim >= 3) & (m_xz != 0)
       pending_yz = (dim >= 3) & (m_yz != 0)
     else:
-      remap_eps = f32(0.0)
+      remap_eps = _c(0.0)
       t_cross_xy = t_cross_xz = t_cross_yz = NO_EVENT_TIME
       pending_xy = jnp.array(False)
       pending_xz = jnp.array(False)
@@ -2888,7 +3012,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
         def _advance_linear(_):
           step_limit_remap = jnp.where(pend_any, t_next_remap - remap_eps, dt)
           step = jnp.minimum(dt - t_curr, step_limit_remap - t_curr)
-          step = jnp.maximum(step, f32(0.0))
+          step = jnp.maximum(step, _c(0.0))
 
           dR_step = V_curr * step
           if not fractional_coordinates:
@@ -2915,6 +3039,15 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
     # Global pair-time recomputation for all neighbor list formats.
     i_idx, j_idx, pair_mask = _pair_indices_and_mask(neighbor, N)
+    sigma_ij = 0.5 * (sigma[i_idx] + sigma[j_idx])
+    sigma_ij_sq = sigma_ij ** 2
+
+    def _pair_geom_tol(sigma_pair):
+      # Geometric contact tolerance in distance units.
+      return jnp.maximum(
+          rel_eps * jnp.maximum(sigma_pair, _c(1.0)),
+          _c(2.0) * time_tol)
+
     if i_idx.size == 0:
       loop_init = (
           t_zero,
@@ -2952,11 +3085,20 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       )
 
       def loop_cond(loop_state):
-        t_curr, _, _, _, _, count, *_ = loop_state
-        return (t_curr < dt - time_tol) & (count < max_collision_loops)
+        t_curr, _, _, _, _, count, pend_xy, pend_xz, pend_yz = loop_state
+        needs_work = (t_curr < dt - time_tol) | pend_xy | pend_xz | pend_yz
+        return needs_work & (count < max_collision_loops)
 
       def loop_body(loop_state):
-        t_curr, R_curr, V_curr, stress_accum, collided_accum, count, pend_xy, pend_xz, pend_yz = loop_state
+        (t_curr,
+         R_curr,
+         V_curr,
+         stress_accum,
+         collided_accum,
+         count,
+         pend_xy,
+         pend_xz,
+         pend_yz) = loop_state
 
         pend_any = pend_xy | pend_xz | pend_yz
         t_next_remap = jnp.minimum(
@@ -3012,31 +3154,44 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           # during the sub-step (O(t^2) shear advection of Brownian motion is ignored).
           dv = (Vi - Vj) + _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
 
+          dist_sq = jnp.sum(dr * dr, axis=-1)
           a = jnp.sum(dv * dv, axis=-1)
-          b = 2 * jnp.sum(dr * dv, axis=-1)
-          c = jnp.sum(dr * dr, axis=-1) - diameter_sq
-          delta = b**2 - 4 * a * c
+          b = _c(2.0) * jnp.sum(dr * dv, axis=-1)
+          c = dist_sq - sigma_ij_sq
+          dist = jnp.sqrt(jnp.maximum(dist_sq, _c(0.0)))
+          overlap_tol = _pair_geom_tol(sigma_ij)
+          overlap_tol_sq = jnp.maximum(
+              _c(2.0) * sigma_ij * overlap_tol, overlap_tol * overlap_tol)
+          delta_raw = b**2 - _c(2.0) * _c(2.0) * a * c
 
-          is_overlapping = c < 0
+          is_overlapping = c < -overlap_tol_sq
+          is_near_contact = dist <= (sigma_ij + overlap_tol)
           is_approaching = b < 0
-          valid_quad = (delta >= 0) & (a > f32(1e-12))
+          a_tol = jnp.maximum(_c(1e-12), rel_eps)
+          valid_quad = a > a_tol
 
-          safe_delta = jnp.where(valid_quad, delta, f32(1.0))
-          safe_a = jnp.where(valid_quad, a, f32(1.0))
-          t_hit = (-b - jnp.sqrt(safe_delta)) / (2 * safe_a)
+          delta = jnp.maximum(delta_raw, _c(0.0))
+          safe_a = jnp.where(valid_quad, a, _c(1.0))
+          t_hit = (-b - jnp.sqrt(delta)) / (_c(2.0) * safe_a)
           t_hit = jnp.where(valid_quad, t_hit, NO_EVENT_TIME)
-          t_hit = jnp.where(is_approaching & (t_hit >= 0), t_hit, NO_EVENT_TIME)
+          t_hit = jnp.where(
+            is_approaching & (t_hit >= _c(0.0)) & (delta_raw >= -overlap_tol_sq),
+            t_hit,
+            NO_EVENT_TIME,
+          )
 
-          resolve_now = is_overlapping | (is_approaching & (t_hit < time_tol))
-          t_event = jnp.where(resolve_now, time_tol, t_hit)
-          times = jnp.where(t_event >= time_tol, t_event, NO_EVENT_TIME)
+          resolve_now = is_overlapping | (is_approaching & (is_near_contact | (t_hit <= time_tol)))
+          t_event = jnp.where(resolve_now, _c(0.0), t_hit)
+          times = jnp.where(t_event >= _c(0.0), t_event, NO_EVENT_TIME)
           times = jnp.where(pair_mask, times, NO_EVENT_TIME)
 
           min_t_rel = jnp.min(times)
           coll_idx = jnp.argmin(times)
 
-          step_limit_remap = jnp.where(pend_any, (t_next_remap - remap_eps) - t_curr, dt_rem)
+          step_limit_remap = jnp.where(
+            pend_any, jnp.maximum((t_next_remap - remap_eps) - t_curr, _c(0.0)), dt_rem)
           step = jnp.minimum(min_t_rel, jnp.minimum(dt_rem, step_limit_remap))
+          step = jnp.maximum(step, _c(0.0))
 
           dR_step = V_curr * step
           if not fractional_coordinates:
@@ -3046,9 +3201,13 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
           R_next = shift_fn(R_curr, dR_step, **kw_shift)
           t_next = t_curr + step
 
-          is_coll = (min_t_rel <= dt_rem + time_tol) & (min_t_rel <= step + time_tol)
+          is_coll = (
+            (min_t_rel <= dt_rem + time_tol)
+            & (min_t_rel <= step + time_tol)
+            & (min_t_rel < NO_EVENT_TIME)
+          )
 
-          def _apply_elastic_collision(v_arr):
+          def _apply_collision_reflection(v_arr):
             idx_dtype = i_idx.dtype
             ii = i_idx[coll_idx].astype(idx_dtype)
             jj = j_idx[coll_idx].astype(idx_dtype)
@@ -3059,43 +3218,56 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
             dr = _disp_single_at(p_i, p_j, t_curr + step)
             dist = space.distance(dr)
-            n = dr / (dist + f32(1e-7))
+            n = dr / (dist + jnp.maximum(_c(1e-12), rel_eps))
+            sigma_pair = sigma_ij[coll_idx]
+            mu_i = mobility_pair[ii]
+            mu_j = mobility_pair[jj]
+            mu_sum = mu_i + mu_j
 
             dv_aff = _affine_relative_velocity(dr, g_dot_xy, g_dot_xz, g_dot_yz)
-            dv_dot_n = jnp.dot((v_i - v_j) + dv_aff, n)
-            impulse = jnp.where(dv_dot_n < 0, dv_dot_n, f32(0.0))
+            g_n = jnp.dot((v_i - v_j) + dv_aff, n)
+            alpha_i = jnp.where(
+                mu_sum > _c(0.0), _c(2.0) * mu_i / mu_sum, _c(1.0))
+            alpha_j = jnp.where(
+                mu_sum > _c(0.0), _c(2.0) * mu_j / mu_sum, _c(1.0))
+            normal_kick_i = jnp.where(g_n < _c(0.0), alpha_i * g_n, _c(0.0))
+            normal_kick_j = jnp.where(g_n < _c(0.0), alpha_j * g_n, _c(0.0))
 
-            v_i_new = v_i - impulse * n
-            v_j_new = v_j + impulse * n
+            v_i_new = v_i - normal_kick_i * n
+            v_j_new = v_j + normal_kick_j * n
             # Update the peculiar velocities with the collision impulse.
             # The affine part of the velocity is unchanged by the collision itself.
             v_next = v_arr.at[ii].set(v_i_new).at[jj].set(v_j_new)
 
-            overlap = diameter - dist
+            overlap = sigma_pair - dist
 
             def _correct_positions(Rin):
-              corr = f32(0.5) * overlap * n
-              Ri_new = shift_fn(Rin[ii], corr, **kw_shift)
-              Rj_new = shift_fn(Rin[jj], -corr, **kw_shift)
+              w_i = jnp.where(mu_sum > _c(0.0), mu_i / mu_sum, _c(0.5))
+              w_j = jnp.where(mu_sum > _c(0.0), mu_j / mu_sum, _c(0.5))
+              Ri_new = shift_fn(Rin[ii], w_i * overlap * n, **kw_shift)
+              Rj_new = shift_fn(Rin[jj], -w_j * overlap * n, **kw_shift)
               return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
 
             if compute_stress:
-              # Use the single-particle collision kick (not the relative change)
-              # and accumulate as (Δv ⊗ r) to match σ_xy ∝ Δv_x Δr_y.
+              # Use the single-particle collision kick and the pair contact
+              # vector. In the polydisperse overdamped case this remains an
+              # algorithmic collisional diagnostic rather than a literal
+              # inertial momentum-transfer quantity.
               dv_ij = v_i_new - v_i
-              r_contact = diameter * n
+              r_contact = sigma_pair * n
               impulse = dv_ij * dt
               stress_inc = jnp.einsum('i,j->ij', impulse, r_contact)
             else:
               stress_inc = stress_zero
 
-            R_corr = lax.cond(overlap > 0, _correct_positions, lambda Rin: Rin, R_next)
+            R_corr = lax.cond(
+                overlap > _c(0.0), _correct_positions, lambda Rin: Rin, R_next)
             return v_next, R_corr, stress_inc, ii, jj
 
           zero_idx = jnp.array(0, dtype=i_idx.dtype)
           V_next, R_step_next, stress_inc, ii, jj = lax.cond(
               is_coll,
-              _apply_elastic_collision,
+              _apply_collision_reflection,
               lambda v_arr: (v_arr, R_next, stress_zero, zero_idx, zero_idx),
               V_curr,
           )
@@ -3139,7 +3311,9 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
             "Hard sphere BD: exceeded max_collision_loops="
             f"{max_collision_loops} within one dt.")
 
-    is_unfinished = (t_final < dt - time_tol) & (loop_count >= max_collision_loops)
+    needs_work_final = (
+      (t_final < dt - time_tol) | pend_xy_f | pend_xz_f | pend_yz_f)
+    is_unfinished = needs_work_final & (loop_count >= max_collision_loops)
     # Safety check: raise a Python error if the collision loop exceeds the
     # max per-step limit. This uses a host callback (requires a CPU backend)
     # and can slow GPU runs. Uncomment to enable strict checking.
