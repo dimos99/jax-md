@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax_md import space, partition, smap
+from jax_md import partition, simulate, smap, space
 import os
 import matplotlib.pyplot as plt
 from typing import cast
@@ -245,6 +245,58 @@ def test_box_time_remap_and_overrides(dim):
     Ho = box_ow(gamma=gamma_dot, t=0.0)
     np.testing.assert_allclose(sheared_xy(Hk), 0.25 + gamma_dot * Ly, atol=1e-7)
     np.testing.assert_allclose(sheared_xy(Ho), gamma_dot * Ly, atol=1e-7)
+
+
+def test_remap_gamma_override_half_integer_precision_boundary():
+    # Boundary-sensitive remap path: gamma just below 0.5 must remain pre-wrap.
+    Ly = 2.0
+    base = jnp.diag(jnp.array([3.0, Ly], dtype=jnp.float64))
+    _, _, box_of = space.shearing(
+        base,
+        shear_schedule=lambda t: 123.0 * t,
+        fractional_coordinates=True,
+        remap=True,
+    )
+
+    eps = jnp.array(5e-10, dtype=jnp.float64)
+    gamma_before = jnp.array(0.5, dtype=jnp.float64) - eps
+    gamma_at = jnp.array(0.5, dtype=jnp.float64)
+    H_before = box_of(gamma=gamma_before, t=0.0)
+    H_at = box_of(gamma=gamma_at, t=0.0)
+
+    delta_before = sheared_xy(H_before) - sheared_xy(base)
+    delta_at = sheared_xy(H_at) - sheared_xy(base)
+
+    np.testing.assert_allclose(delta_before, gamma_before * Ly, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(delta_at, -0.5 * Ly, rtol=0.0, atol=1e-12)
+
+
+def test_simulate_remap_helpers_preserve_half_integer_precision_boundary():
+    eps = jnp.array(5e-10, dtype=jnp.float64)
+    sf_xy, sf_xz, sf_yz = simulate._normalize_shear_schedule(
+        lambda t: jnp.asarray(0.5, dtype=t.dtype) - eps
+    )
+    shear_at = simulate._make_shear_at(sf_xy, sf_xz, sf_yz)
+
+    gamma_before, _, _ = shear_at(jnp.array(1.0, dtype=jnp.float64), 2)
+    reduced_before, _, _, m_before, _, _ = simulate._reduce_shear_strain(
+        gamma_before, jnp.array(0.0), jnp.array(0.0), 2
+    )
+
+    sf_xy_at, sf_xz_at, sf_yz_at = simulate._normalize_shear_schedule(
+        lambda t: jnp.asarray(0.5, dtype=t.dtype)
+    )
+    shear_at_boundary = simulate._make_shear_at(sf_xy_at, sf_xz_at, sf_yz_at)
+    gamma_at, _, _ = shear_at_boundary(jnp.array(1.0, dtype=jnp.float64), 2)
+    reduced_at, _, _, m_at, _, _ = simulate._reduce_shear_strain(
+        gamma_at, jnp.array(0.0), jnp.array(0.0), 2
+    )
+
+    np.testing.assert_allclose(gamma_before, 0.5 - eps, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(reduced_before, 0.5 - eps, rtol=0.0, atol=1e-12)
+    np.testing.assert_equal(int(m_before), 0)
+    np.testing.assert_allclose(reduced_at, -0.5, rtol=0.0, atol=1e-12)
+    np.testing.assert_equal(int(m_at), 1)
 
 @pytest.mark.parametrize("fractional", [True, False])
 def test_fractional_vs_real_paths_agree(fractional):

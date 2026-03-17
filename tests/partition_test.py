@@ -618,6 +618,39 @@ class NeighborListTest(test_util.JAXMDTestCase):
         # c301cb2, 28d7423 — none touched the cell_size_too_small comparison).
         self.assertTrue(jnp.any(nbrs.cell_size_too_small))
 
+  def test_build_box_separates_reference_and_cell_sizing(self):
+    B = np.diag(np.array([6.2, 6.0, 6.0], dtype=f32))
+    disp, _, box_of = space.shearing(
+      B,
+      shear_schedule=lambda t: t,
+      fractional_coordinates=True,
+      remap=True,
+    )
+    neighbor_fn = partition.neighbor_list(
+      disp,
+      box=box_of(t=0.0),
+      r_cutoff=1.9,
+      dr_threshold=0.0,
+      capacity_multiplier=2.5,
+      fractional_coordinates=True,
+      format=partition.Sparse,
+    )
+    key = random.PRNGKey(17)
+    R = random.uniform(key, (48, 3), dtype=f32)
+    current_box = box_of(t=0.0)
+    worst_box = box_of(gamma={'xy': -0.5, 'xz': 0.0, 'yz': 0.0})
+
+    nbr_default = neighbor_fn.allocate(R, box=current_box)
+    nbr_default = nbr_default.update(R, box=worst_box)
+    self.assertTrue(bool(onp.asarray(nbr_default.cell_size_too_small).item()))
+
+    nbr_with_build_box = neighbor_fn.allocate(
+      R, box=current_box, build_box=worst_box)
+    self.assertAllClose(nbr_with_build_box.box_at_build, current_box)
+    nbr_with_build_box = nbr_with_build_box.update(R, box=worst_box)
+    self.assertFalse(
+      bool(onp.asarray(nbr_with_build_box.cell_size_too_small).item()))
+
 
 if __name__ == '__main__':
   absltest.main()
