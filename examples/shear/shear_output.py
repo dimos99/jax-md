@@ -184,6 +184,7 @@ class RunDumper:
     time_offset: float = 0.0,
     shear_remap: bool = True,
     unwrap_trajectory: bool = True,
+    atom_types: np.ndarray = None,
   ):
     self.box_size = float(box_size)
     self.dim = int(dim)
@@ -195,6 +196,7 @@ class RunDumper:
     self.time_offset = float(time_offset)
     self.shear_remap = bool(shear_remap)
     self.unwrap_trajectory = bool(unwrap_trajectory)
+    self.atom_types = None
     self.prev_frac_unwrapped = None
     self.base_box = None
     if base_box is not None:
@@ -204,6 +206,11 @@ class RunDumper:
     else:
       # Default to t=0 box if not explicitly provided.
       self.base_box = self._box_matrix_at_time(0.0)
+    if atom_types is not None:
+      types = np.asarray(atom_types, dtype=np.int64).reshape(-1)
+      if np.any(types <= 0):
+        raise ValueError('atom_types must be strictly positive integers.')
+      self.atom_types = types
     self.stress_filename = os.path.join(out_dir, 'stress.dat')
     self.traj_filename = os.path.join(out_dir, 'traj.dump')
 
@@ -391,14 +398,35 @@ class RunDumper:
         traj_lines.append(f'0 {self.box_size:.6e}\n')
         traj_lines.append(f'0 {self.box_size:.6e}\n')
         traj_lines.append('0 1.000000e+00\n')
-      traj_lines.append('ITEM: ATOMS id x y z\n')
+      ids = np.arange(1, len(pos_frac) + 1, dtype=np.int64)
+      if self.atom_types is not None:
+        if self.atom_types.shape != (len(pos_frac),):
+          raise ValueError(
+            'atom_types length must match trajectory particle count '
+            f'({self.atom_types.shape[0]} vs {len(pos_frac)}).'
+          )
+        traj_lines.append('ITEM: ATOMS id type x y z\n')
+      else:
+        traj_lines.append('ITEM: ATOMS id x y z\n')
       unwrapped_box_t = self._unwrapped_box_matrix_at_time(float(t))
       for i, p in enumerate(pos_frac):
+        atom_id = ids[i]
         p_real = np.asarray(unwrapped_box_t @ np.asarray(p), dtype=float)
         if self.dim == 2:
-          traj_lines.append(f'{i} {p_real[0]:.6e} {p_real[1]:.6e} 0.0\n')
+          if self.atom_types is not None:
+            atom_type = int(self.atom_types[i])
+            traj_lines.append(
+              f'{atom_id} {atom_type} {p_real[0]:.6e} {p_real[1]:.6e} 0.0\n')
+          else:
+            traj_lines.append(f'{atom_id} {p_real[0]:.6e} {p_real[1]:.6e} 0.0\n')
         else:
-          traj_lines.append(f'{i} {p_real[0]:.6e} {p_real[1]:.6e} {p_real[2]:.6e}\n')
+          if self.atom_types is not None:
+            atom_type = int(self.atom_types[i])
+            traj_lines.append(
+              f'{atom_id} {atom_type} {p_real[0]:.6e} {p_real[1]:.6e} {p_real[2]:.6e}\n')
+          else:
+            traj_lines.append(
+              f'{atom_id} {p_real[0]:.6e} {p_real[1]:.6e} {p_real[2]:.6e}\n')
     if traj_lines:
       self.traj_file.writelines(traj_lines)
 
