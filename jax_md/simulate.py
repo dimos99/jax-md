@@ -626,7 +626,7 @@ def nvt_nose_hoover(energy_or_force_fn: Callable[..., Array],
     return state.set(chain=thermostat.initialize(dof, KE, _kT))
 
   @jit
-  def apply_fn(state, **kwargs):
+  def _apply_fn_impl(state, **kwargs):
     _kT = kT if 'kT' not in kwargs else kwargs['kT']
 
     chain = state.chain
@@ -1304,7 +1304,7 @@ def brownian(energy_or_force: Callable[..., Array],
     return state
 
   @jit
-  def apply_fn(state, **kwargs):
+  def _apply_fn_impl(state, **kwargs):
     # Allow temperature to be overridden at step time.
     _kT = kwargs.get('kT', kT)
 
@@ -1479,7 +1479,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     return state
   
   @jit
-  def apply_fn(state, **kwargs):
+  def _apply_fn_impl(state, **kwargs):
     # Allow temperature to be overridden at step time.
     _kT = kwargs.get('kT', kT)
 
@@ -2521,6 +2521,12 @@ class HardSphereBrownianState:
   integrator_position: Array
 
 
+def _hard_sphere_collisional_stress_dyad(r_contact: Array,
+                                         delta_j: Array) -> Array:
+  """Return the manuscript dyad r_c ⊗ ΔJ for a hard-sphere contact event."""
+  return jnp.einsum('i,j->ij', r_contact, delta_j)
+
+
 def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
                          displacement_fn: space.DisplacementFn,
                          shift_fn: ShiftFn,
@@ -2591,14 +2597,15 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
       unimodular coordinate remap must be applied at the crossing time to keep
       real-space trajectories continuous and avoid missed collisions.
     - The returned state includes `stress`, the collisional hard-sphere stress
-      over the last step computed from collision-induced velocity kicks as
-        σ = -(1 / (V dt)) Σ ((Δv_i dt) ⊗ r_c),
-      where ``r_c = sigma_ij * n`` is the pair contact vector and ``Δv_i`` is
-      the mobility-weighted collision-induced jump in the peculiar velocity of
-      one particle. In the polydisperse case this remains an overdamped
-      collisional diagnostic rather than a literal inertial momentum-transfer
-      quantity. If no `box`/`box_fn` is provided, `stress` is returned as
-      zeros.
+      over the last step computed from the manuscript event-weighted estimator
+        σ = -(1 / (V dt)) Σ (r_c ⊗ ΔJ_event),
+      with ``ΔJ_event = ΔX_event / μ`` and
+      ``ΔX_event = Δv_i * (dt - t_event)`` for scalar positive mobility ``μ``.
+      Here ``r_c = sigma_ij * n`` is the pair contact vector and ``Δv_i`` is
+      the collision-induced jump in the peculiar velocity of one particle.
+      This collisional observable is currently implemented only for scalar
+      positive mobility. If no `box`/`box_fn` is provided, collisional stress
+      is disabled and `stress` is returned as zeros.
   """
   force_fn = quantity.canonicalize_force(energy_or_force_fn)
   input_dt = jnp.asarray(dt)
@@ -2794,7 +2801,7 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
   _batched_disp_3d = _supports_batched_displacement(3)
 
   @jit
-  def apply_fn(state, **kwargs):
+  def _apply_fn_impl(state, **kwargs):
     step_kwargs = dict(kwargs)
     _kT = jnp.asarray(step_kwargs.pop('kT', kT), dtype=work_dtype)
 
@@ -2874,12 +2881,20 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
 
     compute_stress = box_for_volume is not None
     if compute_stress:
+      def _stress_mobility_error(flag):
+        if flag:
+          raise ValueError(
+              "brownian_hard_sphere: manuscript collisional stress requires "
+              "a finite scalar mobility > 0. Omit box/box_fn to disable "
+              "collisional stress for non-positive mobility."
+          )
+
+      debug.callback(
+          _stress_mobility_error,
+          (~jnp.isfinite(mu)) | (mu <= _c(0.0)),
+      )
       box_for_volume = jnp.asarray(box_for_volume, dtype=R_start.dtype)
       volume = quantity.volume(dim, box_for_volume)
-    else:
-      raise ValueError(
-          "brownian_hard_sphere: box or box_fn is required to compute collisional stress."
-      )
 
     stress_zero = jnp.zeros((dim, dim), dtype=R_start.dtype)
     collided_zero = jnp.zeros((N,), dtype=bool)
@@ -3249,14 +3264,17 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
               return Rin.at[ii].set(Ri_new).at[jj].set(Rj_new)
 
             if compute_stress:
-              # Use the single-particle collision kick and the pair contact
-              # vector. In the polydisperse overdamped case this remains an
-              # algorithmic collisional diagnostic rather than a literal
-              # inertial momentum-transfer quantity.
-              dv_ij = v_i_new - v_i
+              # TODO: Generalize the manuscript stress estimator to
+              # per-particle mobility arrays. For now collisional stress is
+              # restricted to scalar positive mobility and uses the event-local
+              # displacement correction ΔX_event = Δv_i * (dt - t_event).
+              dv_i = v_i_new - v_i
               r_contact = sigma_pair * n
-              impulse = dv_ij * dt
-              stress_inc = jnp.einsum('i,j->ij', impulse, r_contact)
+              remaining_time = jnp.maximum(dt - (t_curr + step), _c(0.0))
+              delta_x_event = dv_i * remaining_time
+              delta_j_event = delta_x_event / mu
+              stress_inc = _hard_sphere_collisional_stress_dyad(
+                  r_contact, delta_j_event)
             else:
               stress_inc = stress_zero
 
@@ -3337,5 +3355,31 @@ def brownian_hard_sphere(energy_or_force_fn: Callable[..., Array],
     
     next_step = prev_step + jnp.int32(1)
     return HardSphereBrownianState(R_final, mu, key, time + dt, stress, collided_accum, is_unfinished, next_step, R_final)
+
+  def apply_fn(state, **kwargs):
+    box_for_volume = kwargs.get('box', None)
+    if box_for_volume is None and _box_at_time is not None:
+      box_for_volume = _box_at_time(t=state.time)
+
+    if box_for_volume is not None:
+      mobility_value = state.mobility
+      mobility_ndim = getattr(mobility_value, 'ndim', np.ndim(mobility_value))
+      if mobility_ndim != 0:
+        raise ValueError(
+          'brownian_hard_sphere: manuscript collisional stress requires '
+          'a scalar positive mobility. Omit box/box_fn to disable '
+          'collisional stress for array-valued mobility.'
+        )
+      if not isinstance(mobility_value, jax.core.Tracer):
+        mu_np = np.asarray(mobility_value)
+        mu_scalar = float(mu_np)
+        if (not np.isfinite(mu_scalar)) or mu_scalar <= 0.0:
+          raise ValueError(
+            'brownian_hard_sphere: manuscript collisional stress requires '
+            'a finite scalar mobility > 0. Omit box/box_fn to disable '
+            'collisional stress for non-positive mobility.'
+          )
+
+    return _apply_fn_impl(state, **kwargs)
 
   return init_fn, apply_fn
