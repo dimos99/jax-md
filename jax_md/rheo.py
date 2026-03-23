@@ -53,7 +53,7 @@ f64 = jnp.float64
 
 def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
     """
-    Return an Irving-Kirkwood stress function derived from a pair-energy callable.
+    Return a Cauchy stress function derived from a pair-energy callable.
 
     The returned function expects positions (fractional or real), a box matrix,
     and optional neighbor list, and produces an instantaneous stress tensor.
@@ -114,7 +114,7 @@ def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
             Fij = f_mag[..., None] * f_hat
 
             virial = 0.5 * jnp.einsum('ijk,ijl->kl', dR, Fij)
-            return -virial / vol
+            return virial / vol
 
         if partition.is_sparse(neighbor.format):
             send, recv = neighbor.idx
@@ -140,7 +140,7 @@ def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
 
             norm = f32(1.0) if neighbor.format is partition.OrderedSparse else f32(2.0)
             virial = jnp.einsum('bi,bj->ij', dR, Fij) / norm
-            return -virial / vol
+            return virial / vol
 
         if neighbor.format is partition.Dense:
             idx = neighbor.idx
@@ -167,7 +167,7 @@ def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
             Fij = f_mag[..., None] * f_hat
 
             virial = jnp.einsum('nkd,nkl->dl', dR, Fij) / f32(2.0)
-            return -virial / vol
+            return virial / vol
 
         raise ValueError(f"Unsupported neighbor list format {neighbor.format}.")
 

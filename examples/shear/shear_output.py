@@ -185,6 +185,7 @@ class RunDumper:
     shear_remap: bool = True,
     unwrap_trajectory: bool = True,
     atom_types: np.ndarray = None,
+    stress_filenames: dict | None = None,
   ):
     self.box_size = float(box_size)
     self.dim = int(dim)
@@ -211,11 +212,21 @@ class RunDumper:
       if np.any(types <= 0):
         raise ValueError('atom_types must be strictly positive integers.')
       self.atom_types = types
-    self.stress_filename = os.path.join(out_dir, 'stress.dat')
+    default_stress_filename = os.path.join(out_dir, 'stress.dat')
+    self.stress_filename = default_stress_filename
+    self.stress_filenames = {}
     self.traj_filename = os.path.join(out_dir, 'traj.dump')
 
     if self.stress_every > 0:
-      self.stress_file = open(self.stress_filename, 'w')
+      if stress_filenames is None:
+        resolved_stress_filenames = {'stress': default_stress_filename}
+      else:
+        resolved_stress_filenames = {}
+        for key, filename in stress_filenames.items():
+          resolved_stress_filenames[str(key)] = os.path.join(out_dir, filename)
+        if 'stress' not in resolved_stress_filenames:
+          resolved_stress_filenames['stress'] = default_stress_filename
+      self.stress_filenames = resolved_stress_filenames
       if self.dim == 3:
         stress_labels = ['sigma_xx', 'sigma_yy', 'sigma_zz', 'sigma_xy', 'sigma_xz', 'sigma_yz']
       elif self.dim == 2:
@@ -223,8 +234,16 @@ class RunDumper:
       else:
         axes = ('x', 'y', 'z')[:self.dim]
         stress_labels = [f'sigma_{a}{b}' for a in axes for b in axes]
-      self.stress_file.write('# time strain ' + ' '.join(stress_labels) + '\n')
+      self.stress_files = {}
+      header = '# time strain ' + ' '.join(stress_labels) + '\n'
+      for key, filename in self.stress_filenames.items():
+        handle = open(filename, 'w')
+        handle.write(header)
+        self.stress_files[key] = handle
+      self.stress_filename = self.stress_filenames['stress']
+      self.stress_file = self.stress_files['stress']
     else:
+      self.stress_files = {}
       self.stress_file = None
 
     if self.traj_every > 0:
@@ -304,6 +323,7 @@ class RunDumper:
     traj_times=None,
     traj_positions=None,
     traj_steps=None,
+    stress_components=None,
   ):
     def _ordered_stress_components(s):
       s = np.asarray(s)
@@ -314,18 +334,27 @@ class RunDumper:
       return s.reshape(-1)
 
     if (
-      self.stress_file is not None
+      self.stress_files
       and stress_times is not None
       and stress_strains is not None
-      and stress is not None
     ):
-      lines = []
-      for t, g, s in zip(stress_times, stress_strains, stress):
-        comps = _ordered_stress_components(s)
-        values = ' '.join(f'{val:.6e}' for val in comps)
-        lines.append(f'{t:.6e} {g:.6e} {values}\n')
-      if lines:
-        self.stress_file.writelines(lines)
+      if stress_components is None:
+        stress_payloads = {'stress': stress}
+      else:
+        stress_payloads = dict(stress_components)
+        if 'stress' not in stress_payloads:
+          stress_payloads['stress'] = stress
+      for key, handle in self.stress_files.items():
+        stress_values = stress_payloads.get(key)
+        if stress_values is None:
+          continue
+        lines = []
+        for t, g, s in zip(stress_times, stress_strains, stress_values):
+          comps = _ordered_stress_components(s)
+          values = ' '.join(f'{val:.6e}' for val in comps)
+          lines.append(f'{t:.6e} {g:.6e} {values}\n')
+        if lines:
+          handle.writelines(lines)
 
     if self.traj_file is None or traj_positions is None:
       return
@@ -431,7 +460,7 @@ class RunDumper:
       self.traj_file.writelines(traj_lines)
 
   def close(self):
-    if self.stress_file is not None:
-      self.stress_file.close()
+    for handle in self.stress_files.values():
+      handle.close()
     if self.traj_file is not None:
       self.traj_file.close()
