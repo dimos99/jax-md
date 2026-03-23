@@ -456,6 +456,7 @@ def _run_single(args, wall_start: float):
   # Hard-sphere integrator controls kept explicit in the script.
   hs_core_radius = common_cfg['hs_core_radius']
   diameter = 2.0 * hs_core_radius
+  relax_diameter = 2.0 * max(hs_core_radius, hydro_radius)
   max_collision_loops = common_cfg['max_collision_loops']
   event_time_tol = common_cfg['event_time_tol']
   format_map = common_cfg['format_map']
@@ -520,6 +521,7 @@ def _run_single(args, wall_start: float):
   _CONSOLE.info(f'Hydrodynamic radius a = {hydro_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere core radius = {hs_core_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere diameter = {diameter:.6f}')
+  _CONSOLE.info(f'Relaxation diameter = {relax_diameter:.6f}')
   _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
   _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
   _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
@@ -586,7 +588,7 @@ def _run_single(args, wall_start: float):
     n_particles=n_particles,
     dim=dim,
     seed=args.seed,
-    diameter=diameter,
+    diameter=relax_diameter,
     displacement_0=displacement_0,
     shift_0=shift_0,
     relax_steps=relax_steps,
@@ -1006,6 +1008,7 @@ def _run_batch(args, wall_start: float):
   ]
   hs_core_radius = common_cfg['hs_core_radius']
   diameter = 2.0 * hs_core_radius
+  relax_diameter = 2.0 * max(hs_core_radius, hydro_radius)
   max_collision_loops = common_cfg['max_collision_loops']
   event_time_tol = common_cfg['event_time_tol']
   format_map = common_cfg['format_map']
@@ -1074,6 +1077,7 @@ def _run_batch(args, wall_start: float):
   _CONSOLE.info(f'Hydrodynamic radius a = {hydro_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere core radius = {hs_core_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere diameter = {diameter:.6f}')
+  _CONSOLE.info(f'Relaxation diameter = {relax_diameter:.6f}')
   _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
   _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
   _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
@@ -1140,7 +1144,7 @@ def _run_batch(args, wall_start: float):
     base_box=base_box,
     n_particles=n_particles,
     dim=dim,
-    diameter=diameter,
+    diameter=relax_diameter,
     displacement_0=displacement_0,
     shift_0=shift_0,
     relax_steps=relax_steps,
