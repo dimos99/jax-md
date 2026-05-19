@@ -19,3 +19,6 @@ examples/output/*
 etc/
 output/
 *tmp*
+.mplconfig # matplotlib config dir
+.mplstyle # matplotlib style file
+.idea # JetBrains IDEs
