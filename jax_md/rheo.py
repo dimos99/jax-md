@@ -51,6 +51,128 @@ f32 = jnp.float32
 f64 = jnp.float64
 
 
+def _coerce_uniform_time_grid(time: Array,
+                              *,
+                              rtol: float = 1e-6,
+                              atol: float = 1e-12) -> Array:
+    """Snap near-uniform time samples onto an exact affine grid.
+
+    The FFT-based autocorrelation used for Green-Kubo analysis assumes a
+    constant sample spacing. Small floating-point jitter is harmless and is
+    normalized away here, but genuinely irregular sampling is rejected.
+    """
+    time_np = np.asarray(time, dtype=float)
+    if time_np.ndim != 1:
+        raise ValueError("time must be a 1D array")
+
+    if time_np.size < 2:
+        return time
+
+    dt = np.diff(time_np)
+    if np.any(dt <= 0.0):
+        raise ValueError("time must be strictly increasing")
+
+    dt_ref = float(np.median(dt))
+    dt_tol = max(atol, rtol * max(abs(dt_ref), float(np.max(np.abs(dt)))))
+    max_dt_error = float(np.max(np.abs(dt - dt_ref)))
+    if max_dt_error > dt_tol:
+        raise ValueError(
+            "Green-Kubo analysis requires a uniformly spaced time grid; "
+            f"max |dt - dt_ref| = {max_dt_error:.3e} for dt_ref = {dt_ref:.3e}."
+        )
+
+    regular_time = time_np[0] + dt_ref * np.arange(time_np.size, dtype=time_np.dtype)
+
+    if isinstance(time, np.ndarray):
+        return regular_time.astype(time.dtype, copy=False)
+
+    time_dtype = getattr(time, 'dtype', None)
+    if time_dtype is not None:
+        return jnp.asarray(regular_time, dtype=time_dtype)
+
+    return regular_time
+
+
+def _prepare_acf_for_fitting(time: Array,
+                             acf: Array,
+                             *,
+                             max_fit_points: int = 10000,
+                             fit_percent: float = 100.0,
+                             min_consecutive_negative: int = 3) -> Tuple[Array, Array, Dict[str, Any]]:
+    """Select the ACF segment used to fit the Maxwell model."""
+    if not (0.0 < fit_percent <= 100.0):
+        raise ValueError("fit_percent must be in (0, 100].")
+    if max_fit_points < 2:
+        raise ValueError("max_fit_points must be at least 2.")
+    if min_consecutive_negative < 1:
+        raise ValueError("min_consecutive_negative must be at least 1.")
+
+    n_points = len(time)
+    fit_stop_index = max(1, int(np.ceil(n_points * (fit_percent / 100.0))))
+
+    time_window = time[:fit_stop_index]
+    acf_window = acf[:fit_stop_index]
+
+    downsampled = False
+    if fit_stop_index > max_fit_points:
+        print(
+            f"Downsampling fit window from {fit_stop_index} to {max_fit_points} "
+            "points for fitting..."
+        )
+        tail_count = max_fit_points - 1
+        tail_indices = np.geomspace(1, fit_stop_index, tail_count).astype(int) - 1
+        raw_indices = np.concatenate(([0], tail_indices, [fit_stop_index - 1]))
+        indices = np.unique(raw_indices)
+        if isinstance(time_window, np.ndarray):
+            time_window = time_window[indices]
+            acf_window = acf_window[indices]
+        else:
+            fit_indices = jnp.asarray(indices)
+            time_window = time_window[fit_indices]
+            acf_window = acf_window[fit_indices]
+        downsampled = True
+
+    positive_mask = acf_window > 0
+    if not bool(jnp.any(positive_mask)):
+        raise ValueError("No positive autocorrelation values found")
+
+    acf_window_np = np.asarray(acf_window, dtype=float)
+    negative_mask = acf_window_np <= 0.0
+    if negative_mask[0]:
+        first_negative = len(acf_window)
+    elif min_consecutive_negative == 1:
+        negative_indices = np.flatnonzero(negative_mask)
+        first_negative = int(negative_indices[0]) if negative_indices.size else len(acf_window)
+    else:
+        negative_streak = np.convolve(
+            negative_mask.astype(np.int32),
+            np.ones(min_consecutive_negative, dtype=np.int32),
+            mode='valid',
+        )
+        negative_streak_indices = np.flatnonzero(negative_streak == min_consecutive_negative)
+        first_negative = (
+            int(negative_streak_indices[0])
+            if negative_streak_indices.size else len(acf_window)
+        )
+
+    t_fit = time_window[:first_negative]
+    acf_fit = acf_window[:first_negative]
+
+    if len(t_fit) < 10:
+        raise ValueError(f"Insufficient positive ACF points for fitting: {len(t_fit)}")
+
+    fit_metadata = {
+        'fit_percent': fit_percent,
+        'fit_stop_index': fit_stop_index,
+        'fit_window_end_time': float(np.asarray(time[fit_stop_index - 1], dtype=float)),
+        'fit_points_used': len(t_fit),
+        'downsampled_fit_window': downsampled,
+        'min_consecutive_negative': min_consecutive_negative,
+        'negative_streak_start_index': first_negative if first_negative < len(acf_window) else None,
+    }
+    return t_fit, acf_fit, fit_metadata
+
+
 def make_pairwise_stress_fn(pair_energy_for_stress, **kwargs):
     """
     Return a Cauchy stress function derived from a pair-energy callable.
@@ -189,9 +311,13 @@ def autocorrelation_fft(data: Array, normalize: bool = False) -> Array:
     Returns:
         Autocorrelation function of shape (N,)
     """
-    data = jnp.asarray(data, dtype=f32)
+    data = jnp.asarray(data)
+    dtype = data.dtype
+    if not jnp.issubdtype(dtype, jnp.floating):
+        dtype = f64 if jax.config.jax_enable_x64 else f32
+        data = data.astype(dtype)
     n = data.shape[0]
-    
+
     # Normalize data if requested
     if normalize:
         data_centered = data - jnp.mean(data)
@@ -199,27 +325,27 @@ def autocorrelation_fft(data: Array, normalize: bool = False) -> Array:
     else:
         data_centered = data
         data_var = 1.0
-    
+
     # Zero-pad to avoid circular correlation
     size = 2 * n
     data_padded = jnp.pad(data_centered, (0, n), mode='constant')
-    
+
     # Compute FFT
     fft_data = jnp.fft.fft(data_padded)
-    
+
     # Get power spectrum
     power_spectrum = jnp.abs(fft_data) ** 2
-    
+
     # Compute autocorrelation via inverse FFT
     acf = jnp.fft.ifft(power_spectrum).real[:n]
-    
+
     # Normalize by number of pairs at each lag
-    normalization = jnp.arange(n, 0, -1, dtype=f32)
+    normalization = jnp.arange(n, 0, -1, dtype=dtype)
     acf = acf / normalization
-    
+
     if normalize:
         acf = acf / data_var
-        
+
     return acf
 
 
@@ -261,10 +387,161 @@ def autocorrelation_direct(data: Array, normalize: bool = False) -> Array:
     return acf
 
 
+def _validate_multiple_tau_parameters(p: int, m: int) -> None:
+    """Validate the smoothing multiple-tau correlator parameters."""
+    if p < 2:
+        raise ValueError("multiple_tau_p must be at least 2.")
+    if m < 2:
+        raise ValueError("multiple_tau_m must be at least 2.")
+    if p <= m:
+        raise ValueError("multiple_tau_p must be larger than multiple_tau_m.")
+    if p % m != 0:
+        raise ValueError("multiple_tau_p must be an integer multiple of multiple_tau_m.")
+
+
+def autocorrelation_multiple_tau(data: Array,
+                                 normalize: bool = False,
+                                 *,
+                                 p: int = 32,
+                                 m: int = 2) -> Tuple[Array, Array]:
+    """
+    Compute a smoothing multiple-tau autocorrelation estimate.
+
+    This follows the Ramírez et al. hierarchical correlator structure used by
+    the external `mtau` implementation: level 0 stores every sample, higher
+    levels receive averages over `m` samples, and only lags `p / m ... p - 1`
+    are accumulated on levels above 0.
+
+    Args:
+        data: Input time series data of shape (N,)
+        normalize: If True, subtract the mean and divide by the variance.
+        p: Number of correlation slots per level.
+        m: Coarsening factor between successive levels.
+
+    Returns:
+        Tuple `(lags, acf)` where `lags` are integer sample offsets and `acf`
+        contains the corresponding autocorrelation values.
+    """
+    _validate_multiple_tau_parameters(p, m)
+
+    data_np = np.asarray(data)
+    if data_np.ndim != 1:
+        raise ValueError("data must be a 1D array")
+    if data_np.size == 0:
+        empty_lags = jnp.zeros((0,), dtype=jnp.int32)
+        empty_acf = jnp.zeros((0,), dtype=f32)
+        return empty_lags, empty_acf
+
+    dtype = np.result_type(data_np.dtype, np.float64)
+    signal = data_np.astype(dtype, copy=False)
+
+    if normalize:
+        mean = signal.mean()
+        centered = signal - mean
+        variance = centered.var()
+    else:
+        centered = signal
+        variance = 1.0
+
+    dmin = p // m
+    nan = np.nan
+    levels = []
+    kmax = 0
+
+    def _new_level():
+        return {
+            'shift': np.full(p, nan, dtype=dtype),
+            'correlation': np.zeros(p, dtype=dtype),
+            'count': np.zeros(p, dtype=np.int64),
+            'accumulator': dtype.type(0.0),
+            'naccumulator': 0,
+            'insertindex': 0,
+        }
+
+    def _ensure_level(k: int) -> None:
+        while len(levels) <= k:
+            levels.append(_new_level())
+
+    def _add_sample(value: float, k: int = 0) -> None:
+        nonlocal kmax
+        _ensure_level(k)
+        if k > kmax:
+            kmax = k
+
+        level = levels[k]
+        ind1 = level['insertindex']
+        level['shift'][ind1] = value
+
+        level['accumulator'] += value
+        level['naccumulator'] += 1
+        if level['naccumulator'] == m:
+            averaged_value = level['accumulator'] / m
+            level['accumulator'] = dtype.type(0.0)
+            level['naccumulator'] = 0
+            _add_sample(float(averaged_value), k + 1)
+
+        if k == 0:
+            ind2 = ind1
+            for j in range(p):
+                shifted_value = level['shift'][ind2]
+                if np.isfinite(shifted_value):
+                    level['correlation'][j] += level['shift'][ind1] * shifted_value
+                    level['count'][j] += 1
+                ind2 = (ind2 - 1) % p
+        else:
+            ind2 = ind1 - dmin
+            for j in range(dmin, p):
+                if ind2 < 0:
+                    ind2 += p
+                shifted_value = level['shift'][ind2]
+                if np.isfinite(shifted_value):
+                    level['correlation'][j] += level['shift'][ind1] * shifted_value
+                    level['count'][j] += 1
+                ind2 -= 1
+
+        level['insertindex'] = (ind1 + 1) % p
+
+    for sample in centered:
+        _add_sample(float(sample))
+
+    lag_steps = []
+    acf_values = []
+
+    level0 = levels[0]
+    for j in range(p):
+        if level0['count'][j] > 0:
+            lag_steps.append(j)
+            acf_values.append(level0['correlation'][j] / level0['count'][j])
+
+    for k in range(1, kmax):
+        level = levels[k]
+        scale = m ** k
+        for j in range(dmin, p):
+            if level['count'][j] > 0:
+                lag_steps.append(j * scale)
+                acf_values.append(level['correlation'][j] / level['count'][j])
+
+    lag_steps_np = np.asarray(lag_steps, dtype=np.int64)
+    acf_np = np.asarray(acf_values, dtype=dtype)
+
+    if normalize:
+        if variance <= 0.0:
+            acf_np = np.zeros_like(acf_np)
+        else:
+            acf_np = acf_np / variance
+
+    return jnp.asarray(lag_steps_np), jnp.asarray(acf_np)
+
+
 def stress_autocorrelation(stress_tensor: Array, 
                           volume: float,
                           temperature: float,
-                          components: Optional[Tuple[int, ...]] = None) -> Array:
+                          components: Optional[Tuple[int, ...]] = None,
+                          *,
+                          method: str = 'fft',
+                          multiple_tau_p: int = 32,
+                          multiple_tau_m: int = 2,
+                          return_lags: bool = False) -> Union[Array, Tuple[Array, Array]]:
     """
     Compute stress autocorrelation function for Green-Kubo viscosity.
     
@@ -278,11 +555,22 @@ def stress_autocorrelation(stress_tensor: Array,
         temperature: Temperature in consistent units
         components: Which stress components to use for shear viscosity.
                    If None, uses off-diagonal components (xy, xz, yz)
+        method: Autocorrelation estimator. `'fft'` uses the full FFT-based
+                unbiased estimator; `'multiple_tau'` uses the Ramírez-style
+                smoothing multiple-tau correlator.
+        multiple_tau_p: Number of slots per level for the multiple-tau method.
+        multiple_tau_m: Coarsening factor between successive levels for the
+                        multiple-tau method.
+        return_lags: If True, also return the lag indices used by the chosen
+                     estimator.
                    
     Returns:
         Stress autocorrelation function averaged over components (and replicas
-        if present)
+        if present). If `return_lags=True`, returns `(lag_steps, acf)`.
     """
+    if method not in ('fft', 'multiple_tau'):
+        raise ValueError(f"Unknown stress autocorrelation method: {method!r}")
+
     stress_tensor = jnp.asarray(stress_tensor)
 
     # Bring stress tensor into a common shape: (n_rep, n_time, n_components)
@@ -337,20 +625,47 @@ def stress_autocorrelation(stress_tensor: Array,
 
     n_rep = stress_components.shape[0]
 
-    # Move component axis forward for efficient vmaps: (n_rep, n_comp, n_time)
-    components_perm = jnp.swapaxes(stress_components, 1, 2)
+    if method == 'fft':
+        # Move component axis forward for efficient vmaps: (n_rep, n_comp, n_time)
+        components_perm = jnp.swapaxes(stress_components, 1, 2)
 
-    def _acf_per_replica(component_traces: Array) -> Array:
-        # component_traces shape: (n_comp, n_time)
-        acfs = jax.vmap(autocorrelation_fft)(component_traces)
-        return acfs
+        def _acf_per_replica(component_traces: Array) -> Array:
+            # component_traces shape: (n_comp, n_time)
+            acfs = jax.vmap(autocorrelation_fft)(component_traces)
+            return acfs
 
-    acfs = jax.vmap(_acf_per_replica)(components_perm)  # (n_rep, n_comp, n_time)
-    acfs = jnp.swapaxes(acfs, 1, 2)  # (n_rep, n_time, n_comp)
+        acfs = jax.vmap(_acf_per_replica)(components_perm)  # (n_rep, n_comp, n_time)
+        acfs = jnp.swapaxes(acfs, 1, 2)  # (n_rep, n_time, n_comp)
 
-    # Average over components then replicas
-    acf_avg_components = jnp.mean(acfs, axis=-1)
-    acf_avg = jnp.mean(acf_avg_components, axis=0) if n_rep > 1 else acf_avg_components[0]
+        # Average over components then replicas
+        acf_avg_components = jnp.mean(acfs, axis=-1)
+        acf_avg = jnp.mean(acf_avg_components, axis=0) if n_rep > 1 else acf_avg_components[0]
+        lag_steps = jnp.arange(acf_avg.shape[0], dtype=f32)
+    else:
+        _validate_multiple_tau_parameters(multiple_tau_p, multiple_tau_m)
+        stress_components_np = np.asarray(stress_components, dtype=float)
+
+        lag_steps_np = None
+        acf_sum = None
+        n_components_total = stress_components_np.shape[0] * stress_components_np.shape[-1]
+        for rep in range(stress_components_np.shape[0]):
+            for component in range(stress_components_np.shape[-1]):
+                trace_lags, trace_acf = autocorrelation_multiple_tau(
+                    stress_components_np[rep, :, component],
+                    p=multiple_tau_p,
+                    m=multiple_tau_m,
+                )
+                trace_lags_np = np.asarray(trace_lags)
+                trace_acf_np = np.asarray(trace_acf, dtype=float)
+                if lag_steps_np is None:
+                    lag_steps_np = trace_lags_np
+                    acf_sum = np.zeros_like(trace_acf_np, dtype=float)
+                elif not np.array_equal(trace_lags_np, lag_steps_np):
+                    raise RuntimeError("multiple-tau lag grids do not match across traces")
+                acf_sum += trace_acf_np
+
+        acf_avg = jnp.asarray(acf_sum / n_components_total)
+        lag_steps = jnp.asarray(lag_steps_np)
 
     # Apply Green-Kubo prefactor with numerical stability
     if temperature <= 0 or volume <= 0:
@@ -361,6 +676,9 @@ def stress_autocorrelation(stress_tensor: Array,
 
     # Ensure finite values
     result = jnp.where(jnp.isfinite(result), result, 0.0)
+
+    if return_lags:
+        return lag_steps, result
 
     return result
 
@@ -903,7 +1221,12 @@ def green_kubo_viscosity(stress_tensor: Array,
                         temperature: float,
                         max_modes: int = 10,
                         components: Optional[Tuple[int, ...]] = None,
-                        max_fit_points: int = 10000) -> Dict[str, Any]:
+                        max_fit_points: int = 10000,
+                        fit_percent: float = 100.0,
+                        min_consecutive_negative: int = 3,
+                        acf_method: str = 'fft',
+                        multiple_tau_p: int = 32,
+                        multiple_tau_m: int = 2) -> Dict[str, Any]:
     """
     Compute viscosity using Green-Kubo formalism.
     
@@ -914,63 +1237,71 @@ def green_kubo_viscosity(stress_tensor: Array,
     stress_tensor: Stress tensor time series. Supports shapes (N, 3, 3),
                (N, 6) and replica batched variants (M, N, 3, 3) or
                (M, N, 6).
-        time: Time array
+        time: Uniformly spaced time array. Small floating-point jitter is
+              regularized internally, but irregular sampling is not supported.
         volume: System volume
         temperature: Temperature
         max_modes: Maximum number of Maxwell modes to try
         components: Stress tensor components to use
         max_fit_points: Maximum number of points to use for fitting (default: 10000).
                        Large datasets will be downsampled to avoid numerical issues.
+        fit_percent: Percentage of the ACF samples to use for Maxwell fitting.
+                    The raw ACF is still computed on the full time grid.
+        min_consecutive_negative: Number of back-to-back non-positive ACF samples
+                    required before truncating the fit window. Values larger
+                    than 1 make the fit more robust to noisy tail sign flips.
+        acf_method: Autocorrelation estimator. `'fft'` preserves the original
+                    full-resolution grid. `'multiple_tau'` uses a Ramírez-style
+                    smoothing multiple-tau grid.
+        multiple_tau_p: Number of slots per multiple-tau level.
+        multiple_tau_m: Coarsening factor between multiple-tau levels.
         
     Returns:
         Dictionary containing viscosity and fitting results
     """
-    # Compute stress autocorrelation function
-    acf = stress_autocorrelation(stress_tensor, volume, temperature, components)
-    
-    # Downsample if dataset is too large for fitting
-    n_points = len(time)
-    if n_points > max_fit_points:
-        print(f"Downsampling from {n_points} to {max_fit_points} points for fitting...")
-        # Use logarithmic spacing to keep more detail at early times
-        indices = np.unique(np.logspace(0, np.log10(n_points - 1), max_fit_points).astype(int))
-        time_fit = time[indices]
-        acf_fit_full = acf[indices]
+    time = _coerce_uniform_time_grid(time)
+    time = jnp.asarray(time)
+
+    if len(time) > 1:
+        dt = time[1] - time[0]
     else:
-        time_fit = time
-        acf_fit_full = acf
-    
-    # Only use positive part of ACF
-    positive_mask = acf_fit_full > 0
-    if not jnp.any(positive_mask):
-        raise ValueError("No positive autocorrelation values found")
-    
-    # Truncate to positive values
-    first_negative = jnp.argmax(~positive_mask) if jnp.any(~positive_mask) else len(acf_fit_full)
-    if first_negative == 0:
-        first_negative = len(acf_fit_full)
-    
-    t_fit = time_fit[:first_negative]
-    acf_fit = acf_fit_full[:first_negative]
-    
-    # Further check: ensure we have enough valid points
-    if len(t_fit) < 10:
-        raise ValueError(f"Insufficient positive ACF points for fitting: {len(t_fit)}")
+        dt = jnp.asarray(0.0, dtype=time.dtype)
+
+    # Compute stress autocorrelation function
+    lag_steps, acf = stress_autocorrelation(
+        stress_tensor,
+        volume,
+        temperature,
+        components,
+        method=acf_method,
+        multiple_tau_p=multiple_tau_p,
+        multiple_tau_m=multiple_tau_m,
+        return_lags=True,
+    )
+    analysis_time = time[0] + lag_steps * dt
+
+    t_fit, acf_fit, fit_metadata = _prepare_acf_for_fitting(
+        analysis_time,
+        acf,
+        max_fit_points=max_fit_points,
+        fit_percent=fit_percent,
+        min_consecutive_negative=min_consecutive_negative,
+    )
     
     # Select best Maxwell model
     best_model, model_results = select_best_model(t_fit, acf_fit, max_modes)
     
     # Produce fitted G(t) for times
-    acf_fitted = best_model.evaluate(model_results['fit_result']['fitted_params'], time)
+    acf_fitted = best_model.evaluate(model_results['fit_result']['fitted_params'], analysis_time)
     
     # Compute viscosity (final value)
     viscosity = best_model.viscosity_integral()
     
     # Compute cumulative viscosity integral from fitted model
-    cumulative_viscosity_fitted = best_model.viscosity_integral_cumulative(time)
+    cumulative_viscosity_fitted = best_model.viscosity_integral_cumulative(analysis_time)
     
     # Compute cumulative viscosity integral directly from raw ACF
-    cumulative_viscosity_raw = viscosity_integral_direct(acf, time)
+    cumulative_viscosity_raw = viscosity_integral_direct(acf, analysis_time)
     
     # Compute frequency response for a standard frequency range
     log_freq_range = jnp.logspace(-3, 3, 100)  # 10^-3 to 10^3 rad/s
@@ -981,9 +1312,13 @@ def green_kubo_viscosity(stress_tensor: Array,
         'cumulative_viscosity_fitted': cumulative_viscosity_fitted,
         'cumulative_viscosity_raw': cumulative_viscosity_raw,
         'autocorrelation_function': acf,
-        'time': time,
-        # 'fitted_time': t_fit,
+        'time': analysis_time,
+        'input_time': time,
+        'acf_lag_steps': lag_steps,
+        'acf_method': acf_method,
+        'fitted_time': t_fit,
         'fitted_acf': acf_fitted,
+        'fit_metadata': fit_metadata,
         'model': best_model,
         'model_results': model_results,
         'frequencies': log_freq_range,
