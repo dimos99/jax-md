@@ -49,7 +49,7 @@ def parse_args():
     '--phi',
     type=float,
     default=None,
-    help='Packing fraction for random initialization mode (required without --init-traj/--init-data).',
+    help='Hydrodynamic packing fraction for random initialization mode (required without --init-traj/--init-data).',
   )
   parser.add_argument('--peclet', type=float, default=0.0)
   parser.add_argument(
@@ -113,6 +113,15 @@ def parse_args():
     type=float,
     default=2.5,
     help='Capacity multiplier for hard-sphere collision neighbor list (must be > 0).',
+  )
+  parser.add_argument(
+    '--collision-neighbor-extra-capacity',
+    type=_parse_int_like,
+    default=0,
+    help=(
+      'Absolute extra sparse-neighbor reserve added at allocation time for the '
+      'hard-sphere collision neighbor list (must be >= 0).'
+    ),
   )
   parser.add_argument(
     '--out_dir',
@@ -218,6 +227,8 @@ def parse_args():
     raise ValueError('collision_neighbor_skin must be >= 0 when provided.')
   if float(args.collision_neighbor_capacity_multiplier) <= 0.0:
     raise ValueError('collision_neighbor_capacity_multiplier must be > 0.')
+  if int(args.collision_neighbor_extra_capacity) < 0:
+    raise ValueError('collision_neighbor_extra_capacity must be >= 0.')
   if args.batch_outdir_run_start <= 0:
     raise ValueError('batch_outdir_run_start must be > 0.')
   if args.init_traj_values and args.init_data_values:

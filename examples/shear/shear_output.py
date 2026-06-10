@@ -423,10 +423,29 @@ class RunDumper:
         traj_lines.append(f'{ylo_bound:.6e} {yhi_bound:.6e} {xz:.6e}\n')
         traj_lines.append(f'{zlo_bound:.6e} {zhi_bound:.6e} {yz:.6e}\n')
       else:
-        traj_lines.append('ITEM: BOX BOUNDS pp pp pp\n')
-        traj_lines.append(f'0 {self.box_size:.6e}\n')
-        traj_lines.append(f'0 {self.box_size:.6e}\n')
-        traj_lines.append('0 1.000000e+00\n')
+        is_sheared_2d = (
+          self.dim == 2
+          and box_t.ndim == 2
+          and (
+            abs(float(self.shear_rate)) > 0.0
+            or abs(float(box_t[0, 1])) > 0.0
+          )
+        )
+        if is_sheared_2d:
+          lx = float(box_t[0, 0])
+          ly = float(box_t[1, 1])
+          xy = float(box_t[0, 1])
+          xlo_bound = min(0.0, xy)
+          xhi_bound = lx + max(0.0, xy)
+          traj_lines.append('ITEM: BOX BOUNDS xy xz yz pp pp pp\n')
+          traj_lines.append(f'{xlo_bound:.6e} {xhi_bound:.6e} {xy:.6e}\n')
+          traj_lines.append(f'0.000000e+00 {ly:.6e} 0.000000e+00\n')
+          traj_lines.append('0.000000e+00 1.000000e+00 0.000000e+00\n')
+        else:
+          traj_lines.append('ITEM: BOX BOUNDS pp pp pp\n')
+          traj_lines.append(f'0 {self.box_size:.6e}\n')
+          traj_lines.append(f'0 {self.box_size:.6e}\n')
+          traj_lines.append('0 1.000000e+00\n')
       ids = np.arange(1, len(pos_frac) + 1, dtype=np.int64)
       if self.atom_types is not None:
         if self.atom_types.shape != (len(pos_frac),):

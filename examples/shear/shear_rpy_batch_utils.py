@@ -1,17 +1,15 @@
-"""Internal helpers for batched hard-sphere shear runs."""
+"""Internal helpers for batched RPY shear runs."""
 
 import os
 import re
 from dataclasses import dataclass
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
 from shear_console import get_console
-from shear_hard_sphere_cli import build_internal_config
-from shear_hard_sphere_cli import resolve_runtime_settings
 from shear_prepare_utils import _build_initial_positions
-from shear_prepare_utils import _build_format_map
 from shear_prepare_utils import _resolve_initial_system
 
 _CONSOLE = get_console()
@@ -173,42 +171,6 @@ def _clone_args_for_run(args, run_spec: _RunSpec):
   return run_args
 
 
-def _resolve_hs_common_config(args) -> dict:
-  """Resolves shared hard-sphere runtime settings from CLI/defaults."""
-  internal = build_internal_config()
-  runtime = resolve_runtime_settings(args, internal)
-  hydro_radius = (
-    float(args.hydro_radius)
-    if args.hydro_radius is not None
-    else float(runtime['a'])
-  )
-  return {
-    'runtime': runtime,
-    'hydro_radius': hydro_radius,
-    'kT': runtime['kT'],
-    'viscosity': runtime['viscosity'],
-    'dt': runtime['dt'],
-    'relax_steps': runtime['relax_steps'],
-    'relax_neighbor_format': runtime['relax_neighbor_format'],
-    'relax_neighbor_dr_threshold': runtime['relax_neighbor_dr_threshold'],
-    'relax_neighbor_capacity_multiplier': (
-      runtime['relax_neighbor_capacity_multiplier']
-    ),
-    'hs_core_radius': (
-      float(args.hs_core_radius)
-      if args.hs_core_radius is not None
-      else float(hydro_radius)
-    ),
-    'max_collision_loops': (
-      int(args.max_collision_loops)
-      if args.max_collision_loops is not None
-      else int(1e7)
-    ),
-    'event_time_tol': None,
-    'format_map': _build_format_map(),
-  }
-
-
 def _resolve_batch_initial_systems(
   args,
   *,
@@ -312,26 +274,6 @@ def _stack_optional_arrays(values):
   return jnp.stack(values, axis=0)
 
 
-def _stack_hs_states(states):
-  """Stacks hard-sphere Brownian states along a leading batch axis."""
-  template = states[0]
-  return template.set(
-    position=jnp.stack([state.position for state in states], axis=0),
-    mobility=jnp.stack([state.mobility for state in states], axis=0),
-    rng=jnp.stack([state.rng for state in states], axis=0),
-    time=jnp.stack([state.time for state in states], axis=0),
-    stress=jnp.stack([state.stress for state in states], axis=0),
-    collided=jnp.stack([state.collided for state in states], axis=0),
-    reached_max_collision_loops=jnp.stack(
-      [state.reached_max_collision_loops for state in states], axis=0
-    ),
-    step=jnp.stack([state.step for state in states], axis=0),
-    integrator_position=jnp.stack(
-      [state.integrator_position for state in states], axis=0
-    ),
-  )
-
-
 def _pad_neighbor_idx(neighbor, *, target_width: int):
   """Pads neighbor-list indices to a shared width using the invalid-id sentinel."""
   current_width = int(neighbor.idx.shape[-1])
@@ -349,6 +291,13 @@ def _pad_neighbor_idx(neighbor, *, target_width: int):
 
 def _stack_neighbor_lists(neighbors):
   """Stacks neighbor-list dynamic fields with shared static capacities."""
+  if all(neighbor is None for neighbor in neighbors):
+    return None
+  if any(neighbor is None for neighbor in neighbors):
+    raise ValueError(
+      'Expected neighbor lists to either all be present or all be absent.'
+    )
+
   template = neighbors[0]
   max_occupancy = max(int(neighbor.max_occupancy) for neighbor in neighbors)
   cell_list_capacity = [neighbor.cell_list_capacity for neighbor in neighbors]
@@ -386,6 +335,76 @@ def _stack_neighbor_lists(neighbors):
   )
 
 
+def _stack_wave_modes(wave_states):
+  """Stacks wave-space mode arrays while preserving a shared key set."""
+  template_modes = wave_states[0].modes
+  mode_keys = tuple(template_modes.keys())
+  for wave_state in wave_states[1:]:
+    if tuple(wave_state.modes.keys()) != mode_keys:
+      raise ValueError(
+        'Expected identical wave-space mode keys across all batched runs.'
+      )
+  return {
+    key: jnp.stack([wave_state.modes[key] for wave_state in wave_states], axis=0)
+    for key in mode_keys
+  }
+
+
+def _stack_wave_state(wave_states):
+  """Stacks dynamic wave-space fields while reusing template callables."""
+  template = wave_states[0]
+  try:
+    stacked_params = jax.tree_util.tree_map(
+      lambda *xs: jnp.stack(xs, axis=0),
+      *[wave_state.params for wave_state in wave_states],
+    )
+  except ValueError as err:
+    raise ValueError(
+      'Expected identical static wave-space parameters across all batched runs.'
+    ) from err
+  return template.set(
+    params=stacked_params,
+    modes=_stack_wave_modes(wave_states),
+  )
+
+
+def _stack_rpy_states(states):
+  """Stacks sheared RPY states along a leading batch axis."""
+  template = states[0]
+  real_template = template.rpy_state.real
+  rpy_template = template.rpy_state
+
+  real_neighbors = [state.rpy_state.real.neighbors for state in states]
+  stacked_real = real_template.set(
+    neighbors=_stack_neighbor_lists(real_neighbors),
+    lattice_indices=jnp.stack(
+      [state.rpy_state.real.lattice_indices for state in states], axis=0
+    ),
+    zero_image_index=jnp.stack(
+      [state.rpy_state.real.zero_image_index for state in states], axis=0
+    ),
+    box_matrix=jnp.stack(
+      [state.rpy_state.real.box_matrix for state in states], axis=0
+    ),
+  )
+  stacked_wave = _stack_wave_state([state.rpy_state.wave for state in states])
+  stacked_rpy_state = rpy_template.set(
+    real=stacked_real,
+    wave=stacked_wave,
+    preconditioner=rpy_template.preconditioner,
+  )
+  return template.set(
+    real_position=jnp.stack([state.real_position for state in states], axis=0),
+    integrator_position=jnp.stack(
+      [state.integrator_position for state in states], axis=0),
+    rpy_state=stacked_rpy_state,
+    rng=jnp.stack([state.rng for state in states], axis=0),
+    step=jnp.stack([state.step for state in states], axis=0),
+    time=jnp.stack([state.time for state in states], axis=0),
+    force=jnp.stack([state.force for state in states], axis=0),
+  )
+
+
 def _failed_run_labels(flags, run_specs: tuple[_RunSpec, ...]) -> list[str]:
   """Returns run labels for truthy entries in a boolean array."""
   return [
@@ -401,32 +420,17 @@ def _check_batch_nan_positions(
   stage: str,
   console=None,
 ) -> bool:
-  """Returns False when any batched run contains NaN positions."""
+  """Returns False when any batched run contains NaN integrator positions."""
   log = _CONSOLE if console is None else console
-  axes = tuple(range(1, state.position.ndim))
-  failed = _failed_run_labels(jnp.any(jnp.isnan(state.position), axis=axes), run_specs)
+  axes = tuple(range(1, state.integrator_position.ndim))
+  failed = _failed_run_labels(
+    jnp.any(jnp.isnan(state.integrator_position), axis=axes),
+    run_specs,
+  )
   if failed:
     log.error(
-      f'NaN detected in positions during {stage} for runs: '
+      f'NaN detected in integrator positions during {stage} for runs: '
       f'{", ".join(failed)}.'
-    )
-    return False
-  return True
-
-
-def _check_batch_collision_loop_status(
-  state,
-  run_specs: tuple[_RunSpec, ...],
-  stage: str,
-  console=None,
-) -> bool:
-  """Returns False when any batched run hits max collision loops."""
-  log = _CONSOLE if console is None else console
-  failed = _failed_run_labels(state.reached_max_collision_loops, run_specs)
-  if failed:
-    log.error(
-      'Hard-sphere collision loop reached max_collision_loops '
-      f'during {stage} for runs: {", ".join(failed)}.'
     )
     return False
   return True
@@ -441,24 +445,27 @@ def _check_batch_neighbor_status(
 ) -> bool:
   """Returns False when any batched neighbor list reports an error flag."""
   log = _CONSOLE if console is None else console
+  if neighbor is None:
+    log.error(f'Missing {label} in stage={stage}.')
+    return False
   overflow = _failed_run_labels(neighbor.did_buffer_overflow, run_specs)
   if overflow:
     log.error(
-      f'{label} neighbor list overflow in stage={stage} for runs: '
+      f'{label} overflow in stage={stage} for runs: '
       f'{", ".join(overflow)}.'
     )
     return False
   cell_small = _failed_run_labels(neighbor.cell_size_too_small, run_specs)
   if cell_small:
     log.error(
-      f'{label} neighbor list cell size too small in stage={stage} for runs: '
+      f'{label} cell size too small in stage={stage} for runs: '
       f'{", ".join(cell_small)}.'
     )
     return False
   malformed = _failed_run_labels(neighbor.malformed_box, run_specs)
   if malformed:
     log.error(
-      f'{label} neighbor list malformed box in stage={stage} for runs: '
+      f'{label} malformed box in stage={stage} for runs: '
       f'{", ".join(malformed)}.'
     )
     return False

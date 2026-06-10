@@ -84,7 +84,13 @@ def parse_args():
       'If omitted, the internal default is used.'
     ),
   )
-  parser.add_argument('--seed', type=_parse_int_like, default=42)
+  parser.add_argument(
+    '--seed',
+    dest='seed_values',
+    action='append',
+    type=_parse_int_like,
+    default=None,
+  )
   parser.add_argument(
     '--out_dir',
     '--out',
@@ -95,12 +101,16 @@ def parse_args():
   )
   parser.add_argument(
     '--init-traj',
+    dest='init_traj_values',
+    action='append',
     type=str,
     default=None,
     help='Optional LAMMPS dump file; initialize from its last complete frame.',
   )
   parser.add_argument(
     '--init-data',
+    dest='init_data_values',
+    action='append',
     type=str,
     default=None,
     help='Optional LAMMPS data file; initialize from its Atoms section.',
@@ -114,8 +124,45 @@ def parse_args():
       'and defaults. If omitted, the run uses zero potential energy.'
     ),
   )
+  parser.add_argument(
+    '--batch-outdir-naming',
+    choices=('auto', 'seed', 'input', 'run'),
+    default='auto',
+    help=(
+      'Batch-only output subdirectory naming. "auto" keeps the current '
+      'seed/input-based labels, "seed" uses seed_<seed>, "input" uses the '
+      'input filename, and "run" uses run_####.'
+    ),
+  )
+  parser.add_argument(
+    '--batch-outdir-run-start',
+    type=_parse_int_like,
+    default=1,
+    help=(
+      'Starting run number for --batch-outdir-naming=run. For example, 5 '
+      'produces run_0005, run_0006, ...'
+    ),
+  )
 
   args = parser.parse_args()
+  seed_values = tuple([42] if args.seed_values is None else args.seed_values)
+  init_traj_values = tuple(
+    [] if args.init_traj_values is None else args.init_traj_values
+  )
+  init_data_values = tuple(
+    [] if args.init_data_values is None else args.init_data_values
+  )
+  args.seed_values = seed_values
+  args.init_traj_values = init_traj_values
+  args.init_data_values = init_data_values
+  args.seed = int(seed_values[0])
+  args.init_traj = init_traj_values[0] if init_traj_values else None
+  args.init_data = init_data_values[0] if init_data_values else None
+  args.batch_mode = bool(
+    len(seed_values) > 1
+    or len(init_traj_values) > 1
+    or len(init_data_values) > 1
+  )
   if args.dt is None:
     raise ValueError('--dt is required.')
   if args.out_dir is None:
@@ -138,7 +185,9 @@ def parse_args():
     raise ValueError('mr_skin must be >= 0.')
   if args.mr_capacity_multiplier is not None and args.mr_capacity_multiplier <= 0.0:
     raise ValueError('mr_capacity_multiplier must be > 0 when provided.')
-  if args.init_traj is not None and args.init_data is not None:
+  if args.batch_outdir_run_start <= 0:
+    raise ValueError('batch_outdir_run_start must be > 0.')
+  if args.init_traj_values and args.init_data_values:
     raise ValueError('--init-traj and --init-data cannot be used together.')
   if args.init_traj is not None or args.init_data is not None:
     if args.n_particles is not None or args.phi is not None:

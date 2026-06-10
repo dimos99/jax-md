@@ -37,11 +37,12 @@ def _parse_int_like(value: str) -> int:
 
 def parse_args():
   parser = argparse.ArgumentParser(
-    description='2D bidisperse hard-sphere Brownian runner without shear.'
+    description='2D bidisperse hard-sphere Brownian runner with optional shear.'
   )
   parser.add_argument('--n_particles', type=_parse_int_like, default=None)
   parser.add_argument('--phi', type=float, default=None)
   parser.add_argument('--dt', type=float, default=None)
+  parser.add_argument('--peclet', type=float, default=0.0)
   parser.add_argument('--n_steps', type=_parse_int_like, default=30000)
   parser.add_argument('--stress_every', type=_parse_int_like, default=0,
                       help='Set to 0 to disable stress calculation/output.')
@@ -156,6 +157,8 @@ def parse_args():
     raise ValueError('dt must be > 0.')
   if args.n_steps <= 0:
     raise ValueError('n_steps must be > 0.')
+  if float(args.peclet) < 0.0:
+    raise ValueError('peclet must be >= 0.')
   if args.stress_every < 0:
     raise ValueError('stress_every must be >= 0.')
   if args.traj_every < 0:

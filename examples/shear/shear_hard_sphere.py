@@ -36,6 +36,7 @@ from shear_prepare_utils import _derive_system_dynamics
 from shear_prepare_utils import _resolve_initial_system
 from shear_prepare_utils import _resolve_potential_setup
 from shear_prepare_utils import _write_params_json
+from shear_runtime_utils import _allocate_probe_sized_neighbor
 from shear_runtime_utils import _check_interaction_neighbor_status
 from shear_time_utils import _predict_xy_remapped_positions_for_next_force
 from shear_time_utils import _state_next_time_from_step
@@ -58,6 +59,37 @@ def _as_box_matrix(box, *, dim: int) -> np.ndarray:
   if arr.ndim == 1:
     return np.diag(arr)
   return arr
+
+
+def _packing_fraction(*, n_particles: int, radius: float, box_measure: float, dim: int) -> float:
+  """Computes packing fraction from particle count, radius, and box measure."""
+  if dim == 2:
+    return float(n_particles * np.pi * radius ** 2 / box_measure)
+  if dim == 3:
+    return float(n_particles * (4.0 / 3.0) * np.pi * radius ** 3 / box_measure)
+  raise ValueError(f'Unsupported dim={dim} for packing-fraction calculation.')
+
+
+def _neighbor_api_extra_capacity(
+  *,
+  absolute_extra_capacity: int,
+  n_particles: int,
+  neighbor_format,
+) -> int:
+  """Converts an absolute pair-slot reserve to neighbor-list API units.
+
+  Sparse neighbor lists interpret `extra_capacity` per particle, so round up
+  the absolute reserve to the smallest API value that preserves the request.
+  """
+  absolute_extra_capacity = int(absolute_extra_capacity)
+  if absolute_extra_capacity <= 0:
+    return 0
+  n_particles = int(n_particles)
+  if n_particles <= 0:
+    raise ValueError('n_particles must be > 0.')
+  if partition.is_sparse(neighbor_format):
+    return (absolute_extra_capacity + n_particles - 1) // n_particles
+  return absolute_extra_capacity
 
 
 def _fractional_cell_size_for_cutoff(box, cutoff: float) -> float:
@@ -164,7 +196,7 @@ def _check_collision_neighbor_status(collision_neighbor, stage: str, console=Non
     log.error(
       f'Collision neighbor list overflow in stage={stage}. '
       'Try increasing --collision-neighbor-capacity-multiplier or '
-      '--collision-neighbor-skin.'
+      '--collision-neighbor-extra-capacity or --collision-neighbor-skin.'
     )
     return False
   if np.any(cell_small):
@@ -191,6 +223,7 @@ def _resolve_collision_neighbor_settings(
   collision_neighbor_capacity_multiplier = float(
     args.collision_neighbor_capacity_multiplier
   )
+  collision_neighbor_extra_capacity = int(args.collision_neighbor_extra_capacity)
   sigma_rel = float(np.sqrt(4.0 * D0 * dt))
   skin_from_cli = args.collision_neighbor_skin is not None
   if skin_from_cli:
@@ -210,6 +243,7 @@ def _resolve_collision_neighbor_settings(
     'r_cutoff': collision_neighbor_r_cutoff,
     'threshold': collision_neighbor_threshold,
     'capacity_multiplier': collision_neighbor_capacity_multiplier,
+    'extra_capacity': collision_neighbor_extra_capacity,
     'skin_from_cli': skin_from_cli,
   }
 
@@ -218,7 +252,8 @@ def _build_hs_params_payload(
   *,
   args,
   n_particles: int,
-  phi: float,
+  hydrodynamic_phi: float,
+  hs_core_phi: float,
   dt: float,
   hydro_radius: float,
   hs_core_radius: float,
@@ -250,7 +285,7 @@ def _build_hs_params_payload(
   return {
     'user_args': {
       'n_particles': n_particles,
-      'phi': phi,
+      'phi': hydrodynamic_phi,
       'dt': dt,
       'n_steps': args.n_steps,
       'peclet': args.peclet,
@@ -270,6 +305,7 @@ def _build_hs_params_payload(
       'collision_neighbor_capacity_multiplier': (
         args.collision_neighbor_capacity_multiplier
       ),
+      'collision_neighbor_extra_capacity': args.collision_neighbor_extra_capacity,
     },
     'internal': {
       'hydrodynamic_radius': hydro_radius,
@@ -285,6 +321,8 @@ def _build_hs_params_payload(
       'integrator': 'simulate.brownian_hard_sphere',
       'initialization_mode': init_mode,
       'dim': dim,
+      'hydrodynamic_phi': hydrodynamic_phi,
+      'hs_core_phi': hs_core_phi,
       'box_size': box_size,
       'box_matrix': _to_jsonable(base_box_np),
       'box_volume': box_volume,
@@ -329,6 +367,7 @@ def _build_hs_params_payload(
       'capacity_multiplier': float(
         collision_neighbor_settings['capacity_multiplier']
       ),
+      'extra_capacity': int(collision_neighbor_settings['extra_capacity']),
       'build_policy': str(collision_neighbor_settings['build_policy']),
       'build_gamma_xy': float(collision_neighbor_settings['build_gamma_xy']),
       'build_box': _to_jsonable(collision_neighbor_settings['build_box']),
@@ -470,12 +509,12 @@ def _run_single(args, wall_start: float):
 
   dim = 3
   initial_system = _resolve_initial_system(
-    args, a=hs_core_radius, dim=dim, console=_CONSOLE)
+    args, a=hydro_radius, dim=dim, console=_CONSOLE)
   init_mode = initial_system['init_mode']
   data_info = initial_system['data_info']
   dump_info = initial_system['dump_info']
   n_particles = initial_system['n_particles']
-  phi = initial_system['phi']
+  hydrodynamic_phi = float(initial_system['phi'])
   base_box = initial_system['base_box']
 
   dynamics = _derive_system_dynamics(
@@ -492,6 +531,12 @@ def _run_single(args, wall_start: float):
   shear_rate = dynamics['shear_rate']
   shear_t0 = dynamics['shear_t0']
   shear_schedule = dynamics['shear_schedule']
+  hs_core_phi = _packing_fraction(
+    n_particles=n_particles,
+    radius=hs_core_radius,
+    box_measure=box_volume,
+    dim=dim,
+  )
 
   # kT * mobility = D0 for isolated spheres.
   mobility = D0 / kT
@@ -513,6 +558,7 @@ def _run_single(args, wall_start: float):
   collision_neighbor_capacity_multiplier = collision_neighbor_settings[
     'capacity_multiplier'
   ]
+  collision_neighbor_extra_capacity = collision_neighbor_settings['extra_capacity']
 
   _CONSOLE.section('System')
   _CONSOLE.info(f'Equivalent box size L = {box_size:.6f}')
@@ -520,6 +566,9 @@ def _run_single(args, wall_start: float):
   _CONSOLE.info(f'Mobility = {mobility:.6e}')
   _CONSOLE.info(f'Hydrodynamic radius a = {hydro_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere core radius = {hs_core_radius:.6f}')
+  _CONSOLE.info(f'Hydrodynamic packing fraction phi = {hydrodynamic_phi:.6f}')
+  if not np.isclose(hydrodynamic_phi, hs_core_phi, rtol=1e-12, atol=1e-12):
+    _CONSOLE.info(f'Hard-sphere core packing fraction phi = {hs_core_phi:.6f}')
   _CONSOLE.info(f'Hard-sphere diameter = {diameter:.6f}')
   _CONSOLE.info(f'Relaxation diameter = {relax_diameter:.6f}')
   _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
@@ -534,7 +583,8 @@ def _run_single(args, wall_start: float):
     f'skin={collision_neighbor_skin:.6f}'
     f'({"cli" if collision_neighbor_skin_from_cli else "auto"}), '
     f'threshold={collision_neighbor_threshold:.6f}, '
-    f'capacity_multiplier={collision_neighbor_capacity_multiplier:.3g}'
+    f'capacity_multiplier={collision_neighbor_capacity_multiplier:.3g}, '
+    f'extra_capacity={collision_neighbor_extra_capacity}'
   )
 
   potential_setup = _resolve_potential_setup(
@@ -757,7 +807,8 @@ def _run_single(args, wall_start: float):
   params = _build_hs_params_payload(
     args=args,
     n_particles=n_particles,
-    phi=phi,
+    hydrodynamic_phi=hydrodynamic_phi,
+    hs_core_phi=hs_core_phi,
     dt=dt,
     hydro_radius=hydro_radius,
     hs_core_radius=hs_core_radius,
@@ -830,21 +881,35 @@ def _run_single(args, wall_start: float):
   # ============================================================================
   try:
     state = init_fn(run_key, R0)
+    collision_neighbor_api_extra_capacity = _neighbor_api_extra_capacity(
+      absolute_extra_capacity=collision_neighbor_extra_capacity,
+      n_particles=state.position.shape[0],
+      neighbor_format=collision_neighbor_format,
+    )
     # `box` is the physical/reference box at t0; `build_box` is the
     # worst-remap envelope used only for conservative cell-list sizing.
     box_t0 = box_of(t=shear_t0)
     collision_build_box = jnp.asarray(
       collision_build_box_info['box'], dtype=base_box.dtype)
-    collision_neighbor = collision_neighbor_fn.allocate(
-      state.position, box=box_t0, build_box=collision_build_box)
+    collision_neighbor = _allocate_probe_sized_neighbor(
+      collision_neighbor_fn,
+      state.position,
+      box=box_t0,
+      build_box=collision_build_box,
+      extra_capacity=collision_neighbor_api_extra_capacity,
+    )
     if not _check_collision_neighbor_status(collision_neighbor, 'shear_init'):
       return
     interaction_neighbor = None
     if use_pair_potential:
       interaction_build_box = jnp.asarray(
         interaction_build_box_info['box'], dtype=base_box.dtype)
-      interaction_neighbor = interaction_neighbor_fn.allocate(
-        state.position, box=box_t0, build_box=interaction_build_box)
+      interaction_neighbor = _allocate_probe_sized_neighbor(
+        interaction_neighbor_fn,
+        state.position,
+        box=box_t0,
+        build_box=interaction_build_box,
+      )
       if not _check_interaction_neighbor_status(interaction_neighbor, 'shear_init'):
         return
 
@@ -1023,7 +1088,7 @@ def _run_batch(args, wall_start: float):
   dim = 3
   run_specs, resolved_runs = _resolve_batch_initial_systems(
     args,
-    hs_core_radius=hs_core_radius,
+    packing_radius=hydro_radius,
     dim=dim,
     console=_CONSOLE,
   )
@@ -1034,7 +1099,7 @@ def _run_batch(args, wall_start: float):
 
   base_box = resolved_runs[0][2]['base_box']
   n_particles = int(resolved_runs[0][2]['n_particles'])
-  phi = float(resolved_runs[0][2]['phi'])
+  hydrodynamic_phi = float(resolved_runs[0][2]['phi'])
   dynamics = _derive_system_dynamics(
     base_box=base_box,
     a=hydro_radius,
@@ -1049,6 +1114,12 @@ def _run_batch(args, wall_start: float):
   shear_rate = dynamics['shear_rate']
   shear_t0 = dynamics['shear_t0']
   shear_schedule = dynamics['shear_schedule']
+  hs_core_phi = _packing_fraction(
+    n_particles=n_particles,
+    radius=hs_core_radius,
+    box_measure=box_volume,
+    dim=dim,
+  )
 
   mobility = D0 / kT
   collision_neighbor_settings = _resolve_collision_neighbor_settings(
@@ -1069,6 +1140,7 @@ def _run_batch(args, wall_start: float):
   collision_neighbor_capacity_multiplier = collision_neighbor_settings[
     'capacity_multiplier'
   ]
+  collision_neighbor_extra_capacity = collision_neighbor_settings['extra_capacity']
 
   _CONSOLE.section('System')
   _CONSOLE.info(f'Equivalent box size L = {box_size:.6f}')
@@ -1076,6 +1148,9 @@ def _run_batch(args, wall_start: float):
   _CONSOLE.info(f'Mobility = {mobility:.6e}')
   _CONSOLE.info(f'Hydrodynamic radius a = {hydro_radius:.6f}')
   _CONSOLE.info(f'Hard-sphere core radius = {hs_core_radius:.6f}')
+  _CONSOLE.info(f'Hydrodynamic packing fraction phi = {hydrodynamic_phi:.6f}')
+  if not np.isclose(hydrodynamic_phi, hs_core_phi, rtol=1e-12, atol=1e-12):
+    _CONSOLE.info(f'Hard-sphere core packing fraction phi = {hs_core_phi:.6f}')
   _CONSOLE.info(f'Hard-sphere diameter = {diameter:.6f}')
   _CONSOLE.info(f'Relaxation diameter = {relax_diameter:.6f}')
   _CONSOLE.info(f'Max collision loops/step = {max_collision_loops}')
@@ -1090,7 +1165,8 @@ def _run_batch(args, wall_start: float):
     f'skin={collision_neighbor_skin:.6f}'
     f'({"cli" if collision_neighbor_skin_from_cli else "auto"}), '
     f'threshold={collision_neighbor_threshold:.6f}, '
-    f'capacity_multiplier={collision_neighbor_capacity_multiplier:.3g}'
+    f'capacity_multiplier={collision_neighbor_capacity_multiplier:.3g}, '
+    f'extra_capacity={collision_neighbor_extra_capacity}'
   )
 
   potential_setup = _resolve_potential_setup(
@@ -1365,7 +1441,8 @@ def _run_batch(args, wall_start: float):
       params = _build_hs_params_payload(
         args=prepared_run.args,
         n_particles=prepared_run.n_particles,
-        phi=prepared_run.phi,
+        hydrodynamic_phi=prepared_run.phi,
+        hs_core_phi=hs_core_phi,
         dt=dt,
         hydro_radius=hydro_radius,
         hs_core_radius=hs_core_radius,
@@ -1417,15 +1494,29 @@ def _run_batch(args, wall_start: float):
       )
 
       state = init_fn(prepared_run.run_key, prepared_run.R0)
-      collision_neighbor = collision_neighbor_fn.allocate(
-        state.position, box=box_t0, build_box=collision_build_box)
+      collision_neighbor_api_extra_capacity = _neighbor_api_extra_capacity(
+        absolute_extra_capacity=collision_neighbor_extra_capacity,
+        n_particles=state.position.shape[0],
+        neighbor_format=collision_neighbor_format,
+      )
+      collision_neighbor = _allocate_probe_sized_neighbor(
+        collision_neighbor_fn,
+        state.position,
+        box=box_t0,
+        build_box=collision_build_box,
+        extra_capacity=collision_neighbor_api_extra_capacity,
+      )
       if not _check_collision_neighbor_status(
         collision_neighbor, f'shear_init ({prepared_run.spec.label})'):
         return
       interaction_neighbor = None
       if use_pair_potential:
-        interaction_neighbor = interaction_neighbor_fn.allocate(
-          state.position, box=box_t0, build_box=interaction_build_box)
+        interaction_neighbor = _allocate_probe_sized_neighbor(
+          interaction_neighbor_fn,
+          state.position,
+          box=box_t0,
+          build_box=interaction_build_box,
+        )
         if not _check_interaction_neighbor_status(
           interaction_neighbor, f'shear_init ({prepared_run.spec.label})'):
           return

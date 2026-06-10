@@ -18,8 +18,15 @@ from jax_md import space
 from jax_md.hydro import rpy
 
 from shear_rpy_cli import build_internal_config
+from shear_rpy_batch_utils import _check_batch_nan_positions
+from shear_rpy_batch_utils import _check_batch_neighbor_status
+from shear_rpy_batch_utils import _prepare_batch_runs
+from shear_rpy_batch_utils import _resolve_batch_initial_systems
+from shear_rpy_batch_utils import _stack_neighbor_lists
+from shear_rpy_batch_utils import _stack_rpy_states
 from shear_rpy_cli import parse_args
 from shear_rpy_cli import resolve_runtime_settings
+from shear_rpy_batch_utils import resolve_batch_run_specs
 from shear_console import get_console
 from shear_init import _build_reduced_xy_box_fn
 from shear_output import RunDumper
@@ -31,6 +38,7 @@ from shear_prepare_utils import _derive_system_dynamics
 from shear_prepare_utils import _resolve_initial_system
 from shear_prepare_utils import _resolve_potential_setup
 from shear_prepare_utils import _write_params_json
+from shear_runtime_utils import _allocate_probe_sized_neighbor
 from shear_runtime_utils import _check_interaction_neighbor_status
 from shear_runtime_utils import _check_nan_positions
 from shear_runtime_utils import _check_neighbor_status
@@ -121,39 +129,124 @@ def _resolve_worst_xy_remap_build_box(*, box_of, base_box, cutoff: float) -> dic
   return max(candidates, key=lambda c: c['fractional_cell_size'])
 
 
-def main():
-  """Runs one configurable RPY shear trajectory and writes run artifacts."""
-  # ============================================================================
-  # PREPARATION
-  # ============================================================================
-  # Parse CLI arguments and capture wall-clock start for end-of-run timing.
-  args = parse_args()
-  wall_start = time.perf_counter()
-
-  # Resolve runtime settings.
-  # Resolve typed runtime settings from internal defaults and CLI values.
+def _resolve_rpy_common_config(args) -> dict:
+  """Resolves shared runtime settings for single-run and batched RPY runs."""
   internal = build_internal_config()
   runtime = resolve_runtime_settings(args, internal)
-  a = runtime['a']
-  kT = runtime['kT']
-  viscosity = runtime['viscosity']
   dt = runtime['dt']
-  # Keep downstream serialization/logging on a single normalized timestep value.
   args.dt = dt
-  mr_iters = runtime['mr_iters']
-  tol = runtime['tol']
-  xi_override = runtime['xi_override']
-  mr_neighbor_format = runtime['mr_neighbor_format']
-  mr_dr_threshold = runtime['mr_dr_threshold']
-  mr_capacity_multiplier = runtime['mr_capacity_multiplier']
-  real_space_mode = runtime['real_space_mode']
-  relax_steps = runtime['relax_steps']
-  relax_neighbor_format = runtime['relax_neighbor_format']
-  relax_neighbor_dr_threshold = runtime['relax_neighbor_dr_threshold']
-  relax_neighbor_capacity_multiplier = runtime['relax_neighbor_capacity_multiplier']
+  return {
+    'runtime': runtime,
+    'a': runtime['a'],
+    'kT': runtime['kT'],
+    'viscosity': runtime['viscosity'],
+    'dt': dt,
+    'mr_iters': runtime['mr_iters'],
+    'tol': runtime['tol'],
+    'xi_override': runtime['xi_override'],
+    'mr_neighbor_format': runtime['mr_neighbor_format'],
+    'mr_dr_threshold': runtime['mr_dr_threshold'],
+    'mr_capacity_multiplier': runtime['mr_capacity_multiplier'],
+    'real_space_mode': runtime['real_space_mode'],
+    'relax_steps': runtime['relax_steps'],
+    'relax_neighbor_format': runtime['relax_neighbor_format'],
+    'relax_neighbor_dr_threshold': runtime['relax_neighbor_dr_threshold'],
+    'relax_neighbor_capacity_multiplier': (
+      runtime['relax_neighbor_capacity_multiplier']
+    ),
+    'format_map': _build_format_map(),
+  }
 
-  # Resolve enum-like settings once before building runtime operators.
-  format_map = _build_format_map()
+
+def _build_run_kernels(
+  *,
+  dim: int,
+  do_stress: bool,
+  use_pair_potential: bool,
+  apply_fn,
+  stress_fn,
+  box_of,
+  dt: float,
+  shear_rate: float,
+  shear_t0: float,
+):
+  """Builds the single-run step and stress kernels shared by batch mode."""
+  if use_pair_potential:
+    @jax.jit
+    def run_one_step(state_in, interaction_neighbor_in):
+      next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
+      next_box = box_of(t=next_time)
+      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
+        state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
+      interaction_neighbor_out = interaction_neighbor_in.update(
+        pos_for_neighbor, box=next_box)
+      state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
+      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
+      curr_box = box_of(t=curr_time)
+      interaction_neighbor_out = interaction_neighbor_out.update(
+        state_out.integrator_position, box=curr_box)
+      return state_out, interaction_neighbor_out
+  else:
+    @jax.jit
+    def _run_one_step_without_pair_potential(state_in):
+      return apply_fn(state_in)
+
+    def run_one_step(state_in, interaction_neighbor_in):
+      del interaction_neighbor_in
+      state_out = _run_one_step_without_pair_potential(state_in)
+      return state_out, None
+
+  evaluate_stress = None
+  if do_stress:
+    if use_pair_potential:
+      @jax.jit
+      def evaluate_stress(state_in, interaction_neighbor_in):
+        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
+        curr_box = box_of(t=curr_time)
+        stress = stress_fn(
+          state_in.integrator_position,
+          box=curr_box,
+          neighbor=interaction_neighbor_in,
+          fractional_coordinates=True,
+        )
+        strain = shear_rate * curr_time
+        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
+    else:
+      @jax.jit
+      def _evaluate_stress_without_pair_potential(state_in):
+        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
+        strain = shear_rate * curr_time
+        stress = jnp.zeros((dim, dim), dtype=state_in.integrator_position.dtype)
+        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
+
+      def evaluate_stress(state_in, interaction_neighbor_in):
+        del interaction_neighbor_in
+        return _evaluate_stress_without_pair_potential(state_in)
+
+  return run_one_step, evaluate_stress
+
+
+def _run_single(args, wall_start: float):
+  """Runs one configurable RPY shear trajectory and writes run artifacts."""
+  common_cfg = _resolve_rpy_common_config(args)
+  a = common_cfg['a']
+  kT = common_cfg['kT']
+  viscosity = common_cfg['viscosity']
+  dt = common_cfg['dt']
+  mr_iters = common_cfg['mr_iters']
+  tol = common_cfg['tol']
+  xi_override = common_cfg['xi_override']
+  mr_neighbor_format = common_cfg['mr_neighbor_format']
+  mr_dr_threshold = common_cfg['mr_dr_threshold']
+  mr_capacity_multiplier = common_cfg['mr_capacity_multiplier']
+  real_space_mode = common_cfg['real_space_mode']
+  relax_steps = common_cfg['relax_steps']
+  relax_neighbor_format = common_cfg['relax_neighbor_format']
+  relax_neighbor_dr_threshold = common_cfg['relax_neighbor_dr_threshold']
+  relax_neighbor_capacity_multiplier = common_cfg[
+    'relax_neighbor_capacity_multiplier'
+  ]
+  format_map = common_cfg['format_map']
 
   # Log backend/device context once for reproducibility diagnostics.
   devices = jax.devices()
@@ -399,63 +492,17 @@ def main():
       'writing zero pair-interaction stress.'
     )
   planned_steps = int(args.n_steps)
-
-  # This is the main JIT-compiled step function used in the inner loop of the shearing run.
-  if use_pair_potential:
-    @jax.jit
-    def run_one_step(state_in, interaction_neighbor_in):
-      # Update interaction neighbors at the next box/time, then integrate one step.
-      next_time = _state_next_time_from_step(state_in, dt=dt, t0=shear_t0)
-      next_box = box_of(t=next_time)
-      pos_for_neighbor = _predict_xy_remapped_positions_for_next_force(
-        state_in, dt=dt, shear_rate=shear_rate, t0=shear_t0)
-      # Predictive update keeps pair-force neighbors aligned with the next force evaluation geometry.
-      interaction_neighbor_out = interaction_neighbor_in.update(
-        pos_for_neighbor, box=next_box)
-      state_out = apply_fn(state_in, interaction_neighbor=interaction_neighbor_out)
-      curr_time = _state_time_from_step(state_out, dt=dt, t0=shear_t0)
-      curr_box = box_of(t=curr_time)
-      # Refresh neighbors at the accepted state so stress/output use current-step neighborhoods.
-      interaction_neighbor_out = interaction_neighbor_out.update(
-        state_out.integrator_position, box=curr_box)
-      return state_out, interaction_neighbor_out
-  else:
-    @jax.jit
-    def _run_one_step_without_pair_potential(state_in):
-      return apply_fn(state_in)
-
-    def run_one_step(state_in, interaction_neighbor_in):
-      del interaction_neighbor_in
-      state_out = _run_one_step_without_pair_potential(state_in)
-      return state_out, None
-
-  evaluate_stress = None
-  if do_stress:
-    if use_pair_potential:
-      @jax.jit
-      def evaluate_stress(state_in, interaction_neighbor_in):
-        # Stress uses the current sheared box to stay consistent with periodic triclinic geometry.
-        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
-        curr_box = box_of(t=curr_time)
-        stress = stress_fn(
-          state_in.integrator_position,
-          box=curr_box,
-          neighbor=interaction_neighbor_in,
-          fractional_coordinates=True,
-        )
-        strain = shear_rate * curr_time
-        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
-    else:
-      @jax.jit
-      def _evaluate_stress_without_pair_potential(state_in):
-        curr_time = _state_time_from_step(state_in, dt=dt, t0=shear_t0)
-        strain = shear_rate * curr_time
-        stress = jnp.zeros((dim, dim), dtype=state_in.integrator_position.dtype)
-        return _state_step(state_in, dt=dt, t0=shear_t0), curr_time, strain, stress
-
-      def evaluate_stress(state_in, interaction_neighbor_in):
-        del interaction_neighbor_in
-        return _evaluate_stress_without_pair_potential(state_in)
+  run_one_step, evaluate_stress = _build_run_kernels(
+    dim=dim,
+    do_stress=do_stress,
+    use_pair_potential=use_pair_potential,
+    apply_fn=apply_fn,
+    stress_fn=stress_fn,
+    box_of=box_of,
+    dt=dt,
+    shear_rate=shear_rate,
+    shear_t0=shear_t0,
+  )
 
   # Prepare output artifacts.
   out_dir = args.out_dir
@@ -587,7 +634,8 @@ def main():
       box_t0 = box_of(t=shear_t0)
       interaction_build_box = jnp.asarray(
         interaction_build_box_info['box'], dtype=base_box.dtype)
-      interaction_neighbor = interaction_neighbor_fn.allocate(
+      interaction_neighbor = _allocate_probe_sized_neighbor(
+        interaction_neighbor_fn,
         state.integrator_position,
         box=box_t0,
         build_box=interaction_build_box,
@@ -710,6 +758,586 @@ def main():
     _CONSOLE.warn('Skipping per-step timing/PTPS (no executed steps).')
 
   _CONSOLE.success('Done.')
+
+
+def _run_batch(args, wall_start: float):
+  """Runs multiple same-shape RPY shear trajectories in one JAX process."""
+  common_cfg = _resolve_rpy_common_config(args)
+  a = common_cfg['a']
+  kT = common_cfg['kT']
+  viscosity = common_cfg['viscosity']
+  dt = common_cfg['dt']
+  mr_iters = common_cfg['mr_iters']
+  tol = common_cfg['tol']
+  xi_override = common_cfg['xi_override']
+  mr_neighbor_format = common_cfg['mr_neighbor_format']
+  mr_dr_threshold = common_cfg['mr_dr_threshold']
+  mr_capacity_multiplier = common_cfg['mr_capacity_multiplier']
+  real_space_mode = common_cfg['real_space_mode']
+  relax_steps = common_cfg['relax_steps']
+  relax_neighbor_format = common_cfg['relax_neighbor_format']
+  relax_neighbor_dr_threshold = common_cfg['relax_neighbor_dr_threshold']
+  relax_neighbor_capacity_multiplier = common_cfg[
+    'relax_neighbor_capacity_multiplier'
+  ]
+  format_map = common_cfg['format_map']
+
+  devices = jax.devices()
+  device_labels = ', '.join(
+    f'{d.platform}:{getattr(d, "device_kind", "device")}' for d in devices)
+  _CONSOLE.section('Environment')
+  _CONSOLE.info(f'JAX backend: {jax.default_backend()}')
+  _CONSOLE.info(f'JAX devices: {device_labels}')
+
+  dim = 3
+  diameter = 2.0 * a
+  run_specs, resolved_runs = _resolve_batch_initial_systems(
+    args,
+    packing_radius=a,
+    dim=dim,
+    console=_CONSOLE,
+  )
+  n_runs = len(run_specs)
+  _CONSOLE.section('Batch')
+  _CONSOLE.info(f'Running {n_runs} same-shape simulations in one process.')
+  _CONSOLE.info('Run labels: ' + ', '.join(run_spec.label for run_spec in run_specs))
+
+  base_box = resolved_runs[0][2]['base_box']
+  n_particles = int(resolved_runs[0][2]['n_particles'])
+  phi = float(resolved_runs[0][2]['phi'])
+  dynamics = _derive_system_dynamics(
+    base_box=base_box,
+    a=a,
+    kT=kT,
+    viscosity=viscosity,
+    peclet=args.peclet,
+  )
+  base_box_np = dynamics['base_box_np']
+  box_volume = dynamics['box_volume']
+  box_size = dynamics['box_size']
+  D0 = dynamics['D0']
+  shear_rate = dynamics['shear_rate']
+  shear_t0 = dynamics['shear_t0']
+  shear_schedule = dynamics['shear_schedule']
+  shear_vector_schedule = dynamics['shear_vector_schedule']
+
+  _CONSOLE.section('System')
+  _CONSOLE.info(f'Equivalent box size L = {box_size:.6f}')
+  _CONSOLE.info(f'D0 = {D0:.6e}')
+  _CONSOLE.info(f'Shear rate = {shear_rate:.6e}')
+  _CONSOLE.info(f'Strain per step = {shear_rate * dt:.6e}')
+
+  potential_setup = _resolve_potential_setup(
+    potential_arg=args.potential,
+    dt=dt,
+    format_map=format_map,
+  )
+  use_pair_potential = bool(potential_setup['use_pair_potential'])
+  interaction_neighbor_defaults = potential_setup['interaction_neighbor_defaults']
+  interaction_neighbor_format_name = potential_setup['interaction_neighbor_format_name']
+  interaction_neighbor_format = potential_setup['interaction_neighbor_format']
+  interaction_neighbor_dr_threshold = potential_setup['interaction_neighbor_dr_threshold']
+  interaction_neighbor_capacity_multiplier = potential_setup[
+    'interaction_neighbor_capacity_multiplier'
+  ]
+  pair_potential_fn = potential_setup['pair_potential_fn']
+  potential_params = potential_setup['potential_params']
+  potential_r_cut = potential_setup['potential_r_cut']
+  potential_name = potential_setup['potential_name']
+  potential_source = potential_setup['potential_source']
+
+  _CONSOLE.section('Potential')
+  if use_pair_potential:
+    _CONSOLE.info(
+      f'Potential module: {args.potential} -> {potential_name} '
+      f'(source={potential_source}, r_cut={potential_r_cut:.6f})'
+    )
+    _CONSOLE.info(
+      'Interaction neighbor defaults: '
+      f'format={interaction_neighbor_format_name}, '
+      f'dr_threshold={interaction_neighbor_dr_threshold:.3g}, '
+      f'capacity_multiplier={interaction_neighbor_capacity_multiplier:.3g}'
+    )
+  else:
+    _CONSOLE.info(
+      'No potential selected; integrating with zero potential energy.'
+    )
+    _CONSOLE.info('Pair-interaction neighbor list disabled.')
+
+  displacement, shift, box_of = space.shearing(
+    base_box,
+    shear_schedule=shear_schedule,
+    fractional_coordinates=True,
+    remap=True,
+  )
+  displacement_0, shift_0 = space.periodic_general(
+    base_box, fractional_coordinates=True)
+
+  prepared_runs = _prepare_batch_runs(
+    resolved_runs,
+    base_box=base_box,
+    n_particles=n_particles,
+    dim=dim,
+    diameter=diameter,
+    displacement_0=displacement_0,
+    shift_0=shift_0,
+    relax_steps=relax_steps,
+    relax_neighbor_format=relax_neighbor_format,
+    relax_neighbor_capacity_multiplier=relax_neighbor_capacity_multiplier,
+    relax_neighbor_dr_threshold=relax_neighbor_dr_threshold,
+    format_map=format_map,
+  )
+  for prepared_run in prepared_runs:
+    if prepared_run.init_mode == 'random_relax':
+      _CONSOLE.info(
+        f'[{prepared_run.spec.label}] Post-relax minimum pair distance: '
+        f'{prepared_run.min_dist:.6f}'
+      )
+    else:
+      _CONSOLE.info(
+        f'[{prepared_run.spec.label}] Loaded minimum pair distance: '
+        f'{prepared_run.min_dist:.6f}'
+      )
+
+  metric_shear = space.canonicalize_displacement_or_metric(displacement)
+  if use_pair_potential:
+    energy_fn_all_pairs = smap.pair(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
+    energy_fn_neighbor = smap.pair_neighbor_list(
+      pair_potential_fn,
+      metric_shear,
+      ignore_unused_parameters=True,
+      **potential_params,
+    )
+    energy_fn = _wrap_neighbor_energy(
+      energy_fn_neighbor,
+      energy_all_pairs_fn=energy_fn_all_pairs,
+    )
+    interaction_neighbor_fn = partition.neighbor_list(
+      metric_shear,
+      base_box,
+      r_cutoff=potential_r_cut,
+      dr_threshold=interaction_neighbor_dr_threshold,
+      capacity_multiplier=interaction_neighbor_capacity_multiplier,
+      fractional_coordinates=True,
+      format=interaction_neighbor_format,
+    )
+    interaction_neighbor_threshold = float(
+      potential_r_cut + interaction_neighbor_dr_threshold
+    )
+    interaction_build_box_info = _resolve_worst_xy_remap_build_box(
+      box_of=box_of,
+      base_box=base_box,
+      cutoff=interaction_neighbor_threshold,
+    )
+    _CONSOLE.info(
+      'Interaction build box: '
+      'policy=worst_xy_remap_corner, '
+      f'gamma_xy={interaction_build_box_info["gamma_xy"]:+.3f}, '
+      f'r_cutoff={potential_r_cut:.6f}, '
+      f'threshold={interaction_neighbor_threshold:.6f}, '
+      f'fractional_cell_size={interaction_build_box_info["fractional_cell_size"]:.6f}'
+    )
+  else:
+    def energy_fn(R, **unused_kwargs):
+      return jnp.zeros((), dtype=R.dtype)
+
+    interaction_neighbor_fn = None
+    interaction_build_box_info = None
+
+  shear_t_bounds = (
+    0.0,
+    float(dt * float(args.n_steps)),
+  )
+  rpy_params = rpy.estimate_rpy_params(
+    tol=tol,
+    A=base_box,
+    a=a,
+    N=n_particles,
+    phi=phi,
+    xi_override=xi_override,
+    shear_vector_schedule=shear_vector_schedule,
+    shear_t_bounds=shear_t_bounds,
+    shear_remap=True,
+    notes=True,
+  )
+  xi = float(rpy_params.xi)
+  rpy_rcut = float(rpy_params.rcut)
+  rpy_P = int(rpy_params.P)
+  rpy_M = int(rpy_params.M)
+  rpy_theta = float(rpy_params.theta)
+  rpy_lattice_extent = int(rpy_params.lattice_extent)
+  _CONSOLE.section('RPY Parameters')
+  _CONSOLE.info(
+    'RPY parameters: '
+    f'xi={xi:.6f}, rcut={rpy_rcut:.6f}, P={rpy_P}, M={rpy_M}, theta={rpy_theta:.6f}'
+  )
+  diagnostics = rpy_params.diagnostics
+  if diagnostics is not None:
+    _CONSOLE.info(
+      'Quadrature deformation bound: '
+      f'lambda_max={diagnostics.quadrature_lambda_max:.6f} '
+      f'(remap={diagnostics.shear_remap})'
+    )
+
+  init_fn, apply_fn = simulate.rpy_with_shear(
+    (displacement, shift, box_of),
+    energy_fn,
+    dt=dt,
+    kT=kT,
+    a=a,
+    xi=xi,
+    eta=viscosity,
+    shear_vector_schedule=shear_vector_schedule,
+    t0=shear_t0,
+    neighbor_format=format_map[mr_neighbor_format],
+    dr_threshold=mr_dr_threshold,
+    capacity_multiplier=mr_capacity_multiplier,
+    real_space_mode=real_space_mode,
+    rcut=rpy_rcut,
+    P=rpy_P,
+    Mgrid=rpy_M,
+    theta=rpy_theta,
+    lattice_extent=rpy_lattice_extent,
+    mr_iters=mr_iters,
+  )
+
+  do_stress = args.stress_every > 0
+  do_traj = args.traj_every > 0
+  stress_fn = None
+  if do_stress and use_pair_potential:
+    stress_fn = rheo.make_pairwise_stress_fn(
+      pair_potential_fn,
+      **potential_params,
+    )
+  elif do_stress:
+    _CONSOLE.warn(
+      '--stress_every > 0 with no potential selected; '
+      'writing zero pair-interaction stress.'
+    )
+  planned_steps = int(args.n_steps)
+  run_one_step, evaluate_stress = _build_run_kernels(
+    dim=dim,
+    do_stress=do_stress,
+    use_pair_potential=use_pair_potential,
+    apply_fn=apply_fn,
+    stress_fn=stress_fn,
+    box_of=box_of,
+    dt=dt,
+    shear_rate=shear_rate,
+    shear_t0=shear_t0,
+  )
+  if use_pair_potential:
+    batched_run_one_step = jax.jit(jax.vmap(run_one_step))
+  else:
+    batched_run_one_step = jax.jit(jax.vmap(run_one_step, in_axes=(0, None)))
+  batched_evaluate_stress = None
+  if do_stress:
+    if use_pair_potential:
+      batched_evaluate_stress = jax.jit(jax.vmap(evaluate_stress))
+    else:
+      batched_evaluate_stress = jax.jit(
+        jax.vmap(evaluate_stress, in_axes=(0, None))
+      )
+
+  dump_box_fn = _build_reduced_xy_box_fn(np.asarray(base_box, dtype=float), shear_rate)
+  box_t0 = box_of(t=shear_t0)
+  interaction_build_box = None
+  if use_pair_potential:
+    interaction_build_box = jnp.asarray(
+      interaction_build_box_info['box'], dtype=base_box.dtype)
+
+  _CONSOLE.section('Run Plan')
+  _CONSOLE.info(
+    f'Running {n_runs} batched sheared RPY trajectories for '
+    f'{planned_steps} steps (requested {args.n_steps}).'
+  )
+  if do_stress and do_traj:
+    _CONSOLE.info(
+      f'Outputs: per-run stress.dat + traj.dump under {args.out_dir}'
+    )
+  elif do_stress:
+    _CONSOLE.info(f'Outputs: per-run stress.dat under {args.out_dir}')
+  elif do_traj:
+    _CONSOLE.info(f'Outputs: per-run traj.dump under {args.out_dir}')
+  else:
+    _CONSOLE.info('Outputs: none (both --stress_every and --traj_every are 0).')
+
+  dumpers = []
+  try:
+    os.makedirs(args.out_dir, exist_ok=True)
+    states = []
+    interaction_neighbors = []
+    for prepared_run in prepared_runs:
+      out_dir = prepared_run.spec.out_dir
+      os.makedirs(out_dir, exist_ok=True)
+      confin_path = os.path.join(out_dir, 'confin.data')
+      if prepared_run.init_mode == 'data':
+        shutil.copyfile(prepared_run.args.init_data, confin_path)
+        _CONSOLE.info(
+          f'[{prepared_run.spec.label}] Copied init data file to {confin_path}'
+        )
+      else:
+        init_frac = np.mod(np.asarray(prepared_run.R0, dtype=float), 1.0)
+        init_pos_real = np.asarray(init_frac @ base_box_np.T, dtype=float)
+        write_lammps_data(
+          confin_path,
+          base_box_np,
+          init_pos_real,
+          comment=(
+            'Generated by examples/shear/shear_rpy.py '
+            f'(init_mode={prepared_run.init_mode})'
+          ),
+        )
+        _CONSOLE.info(
+          f'[{prepared_run.spec.label}] Wrote initial configuration to {confin_path}'
+        )
+
+      params = _build_params_payload(
+        args=prepared_run.args,
+        n_particles=prepared_run.n_particles,
+        phi=prepared_run.phi,
+        dt=dt,
+        a=a,
+        kT=kT,
+        viscosity=viscosity,
+        mr_iters=mr_iters,
+        tol=tol,
+        xi_override=xi_override,
+        mr_neighbor_format=mr_neighbor_format,
+        mr_dr_threshold=mr_dr_threshold,
+        mr_capacity_multiplier=mr_capacity_multiplier,
+        relax_steps=relax_steps,
+        relax_neighbor_format=relax_neighbor_format,
+        relax_neighbor_dr_threshold=relax_neighbor_dr_threshold,
+        relax_neighbor_capacity_multiplier=relax_neighbor_capacity_multiplier,
+        init_mode=prepared_run.init_mode,
+        dim=dim,
+        box_size=box_size,
+        base_box_np=base_box_np,
+        box_volume=box_volume,
+        diameter=diameter,
+        potential_r_cut=potential_r_cut,
+        D0=D0,
+        shear_rate=shear_rate,
+        dump_info=prepared_run.dump_info,
+        data_info=prepared_run.data_info,
+        confin_path=confin_path,
+        planned_steps=planned_steps,
+        xi=xi,
+        rpy_rcut=rpy_rcut,
+        rpy_P=rpy_P,
+        rpy_M=rpy_M,
+        rpy_theta=rpy_theta,
+        rpy_lattice_extent=rpy_lattice_extent,
+        rpy_params=rpy_params,
+        real_space_mode=real_space_mode,
+        potential_name=potential_name,
+        potential_source=potential_source,
+        potential_params=potential_params,
+        interaction_neighbor_defaults=interaction_neighbor_defaults,
+      )
+      params_path = _write_params_json(out_dir, params)
+      _CONSOLE.info(
+        f'[{prepared_run.spec.label}] Wrote parameters to {params_path}'
+      )
+
+      dumpers.append(
+        RunDumper(
+          out_dir,
+          box_size,
+          dim,
+          dt,
+          args.traj_every,
+          args.stress_every,
+          box_fn=dump_box_fn,
+          base_box=base_box_np,
+          shear_rate=shear_rate,
+          time_offset=shear_t0,
+          shear_remap=True,
+          unwrap_trajectory=True,
+        )
+      )
+
+      state = init_fn(prepared_run.run_key, prepared_run.R0)
+      if not _check_neighbor_status(
+        state, f'shear_init ({prepared_run.spec.label})'):
+        return
+      interaction_neighbor = None
+      if use_pair_potential:
+        interaction_neighbor = _allocate_probe_sized_neighbor(
+          interaction_neighbor_fn,
+          state.integrator_position,
+          box=box_t0,
+          build_box=interaction_build_box,
+        )
+        if not _check_interaction_neighbor_status(
+          interaction_neighbor, f'shear_init ({prepared_run.spec.label})'):
+          return
+      states.append(state)
+      if use_pair_potential:
+        interaction_neighbors.append(interaction_neighbor)
+
+    state = _stack_rpy_states(states)
+    interaction_neighbor = (
+      _stack_neighbor_lists(interaction_neighbors)
+      if use_pair_potential
+      else None
+    )
+
+    if do_traj:
+      if do_stress:
+        stress_steps, _, stress_strains, stresses = batched_evaluate_stress(
+          state, interaction_neighbor)
+      for run_index, dumper in enumerate(dumpers):
+        if do_stress:
+          out_stress_times = np.array(
+            [int(np.asarray(stress_steps[run_index])) * dt + float(shear_t0)],
+            dtype=float,
+          )
+          out_stress_strains = np.array(
+            [float(np.asarray(stress_strains[run_index]))], dtype=float)
+          out_stresses = np.asarray(stresses[run_index], dtype=float)[np.newaxis]
+        else:
+          out_stress_times = np.array([], dtype=float)
+          out_stress_strains = np.array([], dtype=float)
+          out_stresses = np.zeros((0, dim, dim), dtype=float)
+        dumper.dump(
+          out_stress_times,
+          out_stress_strains,
+          out_stresses,
+          None,
+          np.asarray(state.integrator_position[run_index], dtype=float)[np.newaxis],
+          traj_steps=np.array([0], dtype=np.int64),
+        )
+
+    steps_done = 0
+    while steps_done < planned_steps:
+      state, interaction_neighbor = batched_run_one_step(state, interaction_neighbor)
+      steps_done += 1
+
+      if not _check_batch_nan_positions(
+        state, run_specs, f'shear step {steps_done}'):
+        return
+      if not _check_batch_neighbor_status(
+        state.rpy_state.real.neighbors,
+        run_specs,
+        f'shear step {steps_done}',
+        'RPY real-space neighbor list',
+      ):
+        return
+      if use_pair_potential and not _check_batch_neighbor_status(
+        interaction_neighbor,
+        run_specs,
+        f'shear step {steps_done}',
+        'pair-interaction neighbor list',
+      ):
+        return
+
+      emit_stress = do_stress and (steps_done % args.stress_every == 0)
+      emit_traj = do_traj and (steps_done % args.traj_every == 0)
+      if emit_stress:
+        stress_steps, _, stress_strains, stresses = batched_evaluate_stress(
+          state, interaction_neighbor)
+      else:
+        stress_steps = None
+        stress_strains = None
+        stresses = None
+
+      if emit_stress or emit_traj:
+        step_values = np.asarray(
+          _state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
+        positions_np = np.asarray(state.integrator_position, dtype=float)
+        for run_index, dumper in enumerate(dumpers):
+          if emit_stress:
+            out_stress_times = np.array(
+              [int(np.asarray(stress_steps[run_index])) * dt + float(shear_t0)],
+              dtype=float,
+            )
+            out_stress_strains = np.array(
+              [float(np.asarray(stress_strains[run_index]))], dtype=float)
+            out_stresses = np.asarray(
+              stresses[run_index], dtype=float)[np.newaxis]
+          else:
+            out_stress_times = None
+            out_stress_strains = None
+            out_stresses = None
+
+          if emit_traj:
+            out_traj_steps = np.array(
+              [int(step_values[run_index])], dtype=np.int64)
+            out_traj_positions = positions_np[run_index][np.newaxis]
+          else:
+            out_traj_steps = None
+            out_traj_positions = None
+
+          dumper.dump(
+            out_stress_times,
+            out_stress_strains,
+            out_stresses,
+            None,
+            out_traj_positions,
+            traj_steps=out_traj_steps,
+          )
+
+      if args.progress_every > 0 and (steps_done % args.progress_every == 0):
+        _CONSOLE.progress(f'Step {min(steps_done, planned_steps)}/{planned_steps}')
+
+    final_steps = np.asarray(_state_step(state, dt=dt, t0=shear_t0), dtype=np.int64)
+    for run_index, prepared_run in enumerate(prepared_runs):
+      final_step = int(final_steps[run_index])
+      final_time = float(final_step * dt + shear_t0)
+      final_box = np.asarray(dump_box_fn(t=final_time), dtype=float)
+      pos_frac = np.mod(np.asarray(state.integrator_position[run_index], dtype=float), 1.0)
+      pos_real = np.asarray(pos_frac @ final_box.T, dtype=float)
+
+      confout_path = os.path.join(prepared_run.spec.out_dir, 'confout.data')
+      write_lammps_data(
+        confout_path,
+        final_box,
+        pos_real,
+        comment=(
+          'Generated by examples/shear/shear_rpy.py '
+          f'(step={final_step})'
+        ),
+      )
+      _CONSOLE.info(
+        f'[{prepared_run.spec.label}] Wrote final data snapshot {confout_path}'
+      )
+  finally:
+    for dumper in dumpers:
+      dumper.close()
+
+  elapsed_s = time.perf_counter() - wall_start
+  total_steps = int(planned_steps)
+  _CONSOLE.section('Timing')
+  _CONSOLE.info(f'Total wall time: {elapsed_s:.3f} s')
+  if total_steps > 0 and elapsed_s > 0.0:
+    seconds_per_step = elapsed_s / float(total_steps)
+    ptps = (float(n_particles) * float(total_steps) * float(n_runs)) / elapsed_s
+    _CONSOLE.info(
+      'Time per batch step: '
+      f'{seconds_per_step:.6e} s/step ({seconds_per_step * 1e3:.6f} ms/step)'
+    )
+    _CONSOLE.info(f'Aggregate PTPS: {ptps:.6e} particle-timesteps/s')
+  else:
+    _CONSOLE.warn('Skipping per-step timing/PTPS (no executed steps).')
+
+  _CONSOLE.success('Done.')
+
+
+def main():
+  """Dispatches to single-run or in-process batch RPY execution."""
+  args = parse_args()
+  wall_start = time.perf_counter()
+  if args.batch_mode:
+    _run_batch(args, wall_start)
+  else:
+    _run_single(args, wall_start)
 
 
 if __name__ == '__main__':

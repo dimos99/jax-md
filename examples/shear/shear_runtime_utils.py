@@ -3,6 +3,9 @@
 import jax.numpy as jnp
 import numpy as np
 
+from jax_md import dataclasses
+from jax_md import space
+
 from shear_console import get_console
 
 _CONSOLE = get_console()
@@ -17,6 +20,48 @@ def _wrap_neighbor_energy(energy_neighbor_fn, energy_all_pairs_fn=None):
       raise ValueError('Missing required interaction_neighbor kwarg for pair-interaction force evaluation.')
     return energy_neighbor_fn(R, neighbor=interaction_neighbor, **kwargs)
   return _wrapped
+
+
+def _allocate_probe_sized_neighbor(
+  neighbor_fn,
+  position,
+  *,
+  box,
+  build_box,
+  extra_capacity: int = 0,
+):
+  """Allocates actual neighbors while sizing cell capacity from a build-box probe.
+
+  The returned neighbor list keeps the real `position` / `box` reference state
+  and actual neighbor pairs at `t0`. When `build_box` is present, we also
+  estimate the worst-tilt cell-list capacity from positions remapped into that
+  box and transplant only the larger `cell_list_capacity`.
+  """
+  neighbor = neighbor_fn.allocate(
+    position,
+    extra_capacity=extra_capacity,
+    box=box,
+    build_box=build_box,
+  )
+  if build_box is None or neighbor.cell_list_capacity is None:
+    return neighbor
+
+  probe_position = space.remap_fractional_positions(position, box, build_box)
+  probe_neighbor = neighbor_fn.allocate(
+    probe_position,
+    extra_capacity=extra_capacity,
+    box=box,
+    build_box=build_box,
+  )
+  probe_capacity = probe_neighbor.cell_list_capacity
+  if probe_capacity is None:
+    return neighbor
+
+  base_capacity = int(neighbor.cell_list_capacity)
+  probe_capacity = int(probe_capacity)
+  if probe_capacity <= base_capacity:
+    return neighbor
+  return dataclasses.replace(neighbor, cell_list_capacity=probe_capacity)
 
 
 def _neighbor_list_health(neighbors, stage: str, label: str, console=None) -> bool:
