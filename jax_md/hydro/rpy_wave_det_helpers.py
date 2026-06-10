@@ -406,7 +406,7 @@ def build_B_modes(k, K, K2, xi, eta, V, deconv):
     Pkk = projector_from_k(k, K2)
     H = Hasimoto(K, xi)
     scal = jnp.where(K2 > 0.0, (H * deconv.real) / (eta * V * K2), 0.0)
-    sqrt_scal = jnp.sqrt(jnp.clip(scal, a_min=0.0))
+    sqrt_scal = jnp.sqrt(jnp.clip(scal, min=0.0))
 
     Bfluid = scal[..., None, None] * Pkk
     Bfluid = Bfluid.at[0, 0, 0].set(jnp.zeros((3, 3)))

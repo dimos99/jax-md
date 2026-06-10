@@ -147,7 +147,7 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
         if off.shape[0]:
             T = T + jnp.diag(off, 1) + jnp.diag(off, -1)
         eigvals, eigvecs = jnp.linalg.eigh(T)
-        eigvals = jnp.clip(eigvals, a_min=0.0)
+        eigvals = jnp.clip(eigvals, min=0.0)
         sqrt_eigs = jnp.sqrt(eigvals)
         return eigvecs @ (sqrt_eigs * (eigvecs.T @ e1))
 
@@ -294,7 +294,7 @@ def lanczos_sqrt_mv_test(key: jax.Array,
     noise = jax.random.normal(key_vec, (n,), dtype=REAL_DTYPE)
     approx = lanczos_sqrt_mv(mv, (M,), noise, iters=iters, tol=tol)
     evals, evecs = jnp.linalg.eigh(M)
-    evals = jnp.clip(evals, a_min=0.0)
+    evals = jnp.clip(evals, min=0.0)
     exact = evecs @ (jnp.sqrt(evals) * (evecs.T @ noise))
     rel_err = jnp.linalg.norm(approx - exact) / jnp.linalg.norm(exact)
     return float(rel_err)
