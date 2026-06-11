@@ -45,6 +45,36 @@ traceless subspace (the diagonal entries are linearly constrained).  Any test
 probing the grand mobility as a dense matrix must use
 ``traceless_orthonormal_basis()`` instead, or a symmetric operator will look
 asymmetric.
+
+Symmetric/antisymmetric (rigid) decomposition
+---------------------------------------------
+Phase 2 (the stresslet constraint) works in the rigid representation
+``(F, L, S) <-> (U, Omega, E)``.  The couplet splits as
+
+    C = S - (1/2) eps . L        i.e.  C_mn = S_mn - (1/2) eps_mnk L_k,
+
+where ``S`` is the (symmetric traceless) stresslet and ``L`` the torque.
+This embed sign is pinned externally by the rotlet test in
+``tests/rpy_stresslet_test.py`` (and matches Fiore's FSD ``Stokes.cc``).
+The extraction signs are then *forced* by requiring the round-trip
+``C -> (S, L) -> C`` to be the identity on traceless tensors:
+
+    L_k = -(1/2) eps_kmn (C_mn - C_nm) = -eps_kmn C_mn.
+
+The velocity-gradient output decomposes the same way,
+
+    E   = sym(D)  (rate of strain, 5 dof),
+    Omega_k = -(1/2) eps_kij D_ij,
+
+which, with our convention ``D_ij = du_i/dx_j``, is exactly the physical
+angular velocity ``omega = (1/2) curl(u)`` and is the Frobenius adjoint of
+the torque embed -- so the grand mobility stays symmetric in
+``(F, L, S)`` coordinates.
+
+The 5-dof stresslet/strain coordinates use the *orthonormal* symmetric
+members of ``traceless_orthonormal_basis()`` (indices 3..7), never the
+drop-zz packing: orthonormality is what makes ``M_ES`` genuinely symmetric
+in the working coordinates.
 """
 
 from typing import Tuple
@@ -103,6 +133,18 @@ pack8 = couplet_to_components
 unpack8 = components_to_couplet
 
 
+# Levi-Civita symbol eps_ijk.
+_LEVI_CIVITA_NP = np.zeros((3, 3, 3), dtype=np.float64)
+for _i, _j, _k in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+  _LEVI_CIVITA_NP[_i, _j, _k] = 1.0
+  _LEVI_CIVITA_NP[_i, _k, _j] = -1.0
+
+
+def levi_civita() -> jnp.ndarray:
+  """Levi-Civita symbol as a (3, 3, 3) array in the working real dtype."""
+  return jnp.asarray(_LEVI_CIVITA_NP, dtype=REAL_DTYPE)
+
+
 def traceless_orthonormal_basis() -> jnp.ndarray:
   """Frobenius-orthonormal basis of the traceless 3x3 subspace, shape (8, 3, 3).
 
@@ -125,3 +167,75 @@ def traceless_orthonormal_basis() -> jnp.ndarray:
   basis[6] = np.diag([1.0, -1.0, 0.0]) / np.sqrt(2.0)
   basis[7] = np.diag([1.0, 1.0, -2.0]) / np.sqrt(6.0)
   return jnp.asarray(basis, dtype=REAL_DTYPE)
+
+
+def stresslet_basis() -> jnp.ndarray:
+  """Orthonormal basis of the symmetric traceless subspace, shape (5, 3, 3).
+
+  These are members 3..7 of ``traceless_orthonormal_basis()`` -- the same
+  coordinates the dense-probing test helpers use, so a symmetric operator
+  stays symmetric in these coordinates.
+  """
+  return traceless_orthonormal_basis()[3:8]
+
+
+def stresslet_to_couplet(S5: jnp.ndarray) -> jnp.ndarray:
+  """Embed 5-dof orthonormal stresslet coordinates as a (..., 3, 3) couplet.
+
+  The result is symmetric and traceless (zero torque channel).
+  """
+  S5 = jnp.asarray(S5)
+  basis = jnp.asarray(stresslet_basis(), dtype=S5.dtype)
+  return jnp.einsum('...a,aij->...ij', S5, basis)
+
+
+def torque_to_couplet(L3: jnp.ndarray) -> jnp.ndarray:
+  """Embed a torque (axial) vector as an antisymmetric couplet.
+
+  ``C_mn = -(1/2) eps_mnk L_k`` -- the rotlet-pinned convention (module
+  docstring); do not change the sign or factor independently of
+  ``couplet_to_stresslet_torque``.
+  """
+  L3 = jnp.asarray(L3)
+  eps = jnp.asarray(_LEVI_CIVITA_NP, dtype=L3.dtype)
+  return jnp.einsum('mnk,...k->...mn', -0.5 * eps, L3)
+
+
+def couplet_to_stresslet_torque(
+    C: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Split a traceless couplet into (stresslet S5, torque L3).
+
+  Exact inverse of ``stresslet_to_couplet(S5) + torque_to_couplet(L3)``:
+  ``S5`` are orthonormal coordinates of ``sym(C)`` and
+  ``L_k = -(1/2) eps_kmn (C_mn - C_nm)``.
+  """
+  C = jnp.asarray(C)
+  basis = jnp.asarray(stresslet_basis(), dtype=C.dtype)
+  eps = jnp.asarray(_LEVI_CIVITA_NP, dtype=C.dtype)
+  sym = 0.5 * (C + jnp.swapaxes(C, -1, -2))
+  S5 = jnp.einsum('...ij,aij->...a', sym, basis)
+  L3 = -jnp.einsum('kmn,...mn->...k', eps, C)
+  return S5, L3
+
+
+def decompose_gradient(D: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Split a traceless velocity gradient into (strain E5, angular velocity).
+
+  ``E5`` are orthonormal coordinates of the rate of strain ``sym(D)`` and
+  ``Omega_k = -(1/2) eps_kij D_ij``, the physical angular velocity
+  ``omega = (1/2) curl(u)`` for ``D_ij = du_i/dx_j``.
+
+  Note the antisymmetric factor differs from ``couplet_to_stresslet_torque``
+  by 2: the gradient extraction is the Frobenius *adjoint* of the torque
+  embed (which keeps the grand mobility symmetric in (F, L, S)
+  coordinates and matches FSD's ``Mobility_D2WE_kernel``), whereas the
+  couplet extraction is the *inverse* of the embed (round-trip identity).
+  The two differ because the embed ``-(1/2) eps`` is not orthonormal.
+  """
+  D = jnp.asarray(D)
+  basis = jnp.asarray(stresslet_basis(), dtype=D.dtype)
+  eps = jnp.asarray(_LEVI_CIVITA_NP, dtype=D.dtype)
+  sym = 0.5 * (D + jnp.swapaxes(D, -1, -2))
+  E5 = jnp.einsum('...ij,aij->...a', sym, basis)
+  Omega = -0.5 * jnp.einsum('kij,...ij->...k', eps, D)
+  return E5, Omega

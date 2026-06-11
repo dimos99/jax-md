@@ -56,9 +56,13 @@ from jax_md.hydro.rpy_moments import (
   N_MOMENTS,
   couplet_to_components,
   components_to_couplet,
+  couplet_to_stresslet_torque,
+  stresslet_to_couplet,
+  torque_to_couplet,
   traceless,
 )
-from jax_md.hydro.rpy_real_det_dipole import build_Mr_grand_apply
+from jax_md.hydro.rpy_constrained import make_constrained_solver
+from jax_md.hydro.rpy_real_det_dipole import build_Mr_grand_apply, mr_grand_matvec
 from jax_md.hydro.rpy_wave_det_dipole import build_Mw_grand_state
 from jax_md.hydro.rpy_wave_stoch import _hermitian_gaussian_modes
 
@@ -880,7 +884,11 @@ def build_rpy_mobility(space_fns,
                        lattice_extra: float = 0.0,
                        box_jump_threshold: Optional[float] = None,
                        real_space_mode: str = 'auto',
-                       use_stresslet: bool = False):
+                       use_stresslet: bool = False,
+                       constrained: bool = False,
+                       solve_tol: float = 1e-3,
+                       solve_maxiter: int = 50,
+                       with_torque: bool = False):
   """Construct init/apply functions for the split-Ewald RPY mobility.
 
   Args:
@@ -935,6 +943,21 @@ def build_rpy_mobility(space_fns,
     use_stresslet: If True, build the Phase-1 grand mobility from force and
       traceless couplet inputs and return velocity plus traceless velocity
       gradient. Brownian sampling is not implemented for this mode.
+    constrained: If True (requires ``use_stresslet=True``), apply the
+      stresslet-constrained mobility ``R_FU^{-1} = M_UF - M_US M_ES^{-1}
+      M_EF``: the rigid constraint E = 0 is enforced by solving for the
+      stresslet matrix-free (GMRES on M_ES), and ``apply_fn`` returns
+      ``((velocities, stresslets), next_state)``. The couplet input is gone
+      from this path -- the stresslet is solved for, not supplied.
+    solve_tol: Relative GMRES tolerance for the stresslet constraint solve
+      (constrained mode only). Default 1e-3 (Fiore & Swan 2018); tighten
+      to ~1e-6+ when separating solver error from physics error.
+    solve_maxiter: GMRES Krylov basis size (static int, constrained mode
+      only). M_ES is well conditioned (~8-10 iterations); approaching this
+      limit signals a bug, not a tight tolerance.
+    with_torque: If True (requires ``constrained=True``), ``apply_fn``
+      accepts applied ``torques`` and returns
+      ``((velocities, stresslets, angular_velocities), next_state)``.
 
   Returns:
     A tuple ``(init_fn, apply_fn)`` where:
@@ -1002,6 +1025,12 @@ def build_rpy_mobility(space_fns,
 
   # -- Validate inputs and unpack space functions ---------------------------
   xi = _check_xi(xi)
+
+  if constrained and not use_stresslet:
+    raise ValueError('constrained=True requires use_stresslet=True '
+                     '(no dipole machinery to constrain).')
+  if with_torque and not constrained:
+    raise ValueError('with_torque=True requires constrained=True.')
 
   if len(space_fns) < 2:
     raise ValueError('space_fns must contain displacement and shift functions.')
@@ -1238,6 +1267,8 @@ def build_rpy_mobility(space_fns,
                forces,
                *,
                couplets: Optional[jnp.ndarray] = None,
+               torques: Optional[jnp.ndarray] = None,
+               stresslet_guess: Optional[jnp.ndarray] = None,
                brownian_key: Optional[jax.Array] = None,
                kT: Optional[float] = None,
                dt: Optional[float] = None,
@@ -1249,6 +1280,103 @@ def build_rpy_mobility(space_fns,
     dim = int(positions_frac.shape[1])
     combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
     current_box = _resolve_current_box(dim, combined_kwargs)
+
+    if not constrained:
+      if torques is not None:
+        raise ValueError('torques are only accepted in constrained mode '
+                         '(build_rpy_mobility(..., constrained=True, '
+                         'with_torque=True)).')
+      if stresslet_guess is not None:
+        raise ValueError('stresslet_guess is only accepted in constrained mode.')
+
+    if constrained:
+      if brownian_key is not None:
+        raise NotImplementedError(
+            'Brownian sampling for the constrained mobility is not '
+            'implemented (Phase 3).')
+      if couplets is not None:
+        raise ValueError('couplets may not be passed in constrained mode; '
+                         'the stresslet is solved for, not supplied.')
+      if torques is not None and not with_torque:
+        raise ValueError('torques require build_rpy_mobility(..., '
+                         'with_torque=True).')
+
+      forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+      if with_torque and torques is not None:
+        torques_local = jnp.asarray(torques, dtype=REAL_DTYPE)
+        C_applied = torque_to_couplet(torques_local)
+      else:
+        torques_local = None
+        C_applied = jnp.zeros(
+            positions_frac.shape[:-1] + (3, 3), dtype=REAL_DTYPE)
+
+      # RHS grand call fused with the state refresh: one Mr_apply rebuilds
+      # the neighbor list, one wave call refreshes/rebuilds the wave state.
+      (Ur, Dr), real_state = Mr_apply(
+          state.real, positions_frac, forces, C_applied, **combined_kwargs)
+      Uw, Dw, wave_state = _apply_wave_components_grand(
+          wave_state=state.wave,
+          positions_frac=positions_frac,
+          forces=forces,
+          couplets=C_applied,
+          current_box=current_box,
+      )
+      if real_space_first:
+        U_applied, D_applied = Ur + Uw, traceless(Dr + Dw)
+      else:
+        U_applied, D_applied = Uw + Ur, traceless(Dw + Dr)
+
+      # Fixed-state grand matvec over the refreshed states; covers both the
+      # static-box and live-box/shear paths.
+      def grand_mv(F, C):
+        Ur_, Dr_ = mr_grand_matvec(real_state, positions_frac, F, C)
+        if current_box is not None:
+          Uw_, Dw_ = _apply_wave_exact_grand(
+              static=wave_static,
+              current_box=current_box,
+              positions_frac=positions_frac,
+              forces=F,
+              couplets=C,
+              a=a,
+              xi=xi,
+              eta=eta,
+          )
+        else:
+          Uw_, Dw_ = wave_state.apply_fn(positions_frac, F, C)
+        if real_space_first:
+          return Ur_ + Uw_, traceless(Dr_ + Dw_)
+        return Uw_ + Ur_, traceless(Dw_ + Dr_)
+
+      if stresslet_guess is None:
+        guess5 = jnp.zeros(positions_frac.shape[:-1] + (5,), dtype=REAL_DTYPE)
+      else:
+        stresslet_guess = jnp.asarray(stresslet_guess, dtype=REAL_DTYPE)
+        if stresslet_guess.shape[-1] == 5:
+          guess5 = stresslet_guess
+        else:
+          guess5 = couplet_to_stresslet_torque(stresslet_guess)[0]
+
+      solve_fn = make_constrained_solver(
+          grand_mv,
+          with_torque=with_torque,
+          solve_tol=solve_tol,
+          solve_maxiter=solve_maxiter,
+      )
+      U, S5, Omega, _ = solve_fn(
+          forces,
+          torques=torques_local,
+          stresslet_guess=guess5,
+          applied_output=(U_applied, D_applied),
+      )
+      stresslets = stresslet_to_couplet(S5)
+      next_state = _compose_next_state(
+          real_state=real_state,
+          wave_state=wave_state,
+          preconditioner=state.preconditioner,
+      )
+      if with_torque:
+        return (U, stresslets, Omega), next_state
+      return (U, stresslets), next_state
 
     if use_stresslet:
       if brownian_key is not None:

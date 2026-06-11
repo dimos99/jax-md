@@ -80,6 +80,20 @@ from jax_md.hydro.rpy import (
     brownian_increment,
 )
 
+from jax_md.hydro.rpy_constrained import (
+    make_constrained_solver,
+    m_es_operator,
+    solve_stresslet,
+)
+
+from jax_md.hydro.rpy_moments import (
+    couplet_to_stresslet_torque,
+    decompose_gradient,
+    stresslet_basis,
+    stresslet_to_couplet,
+    torque_to_couplet,
+)
+
 __all__ = [
     # Real-space
     'F1F2_closed_form',
@@ -126,4 +140,14 @@ __all__ = [
     'RpyParameterDiagnostics',
     'RpyState',
     'brownian_increment',
+    # Stresslet constraint (Phase 2)
+    'make_constrained_solver',
+    'm_es_operator',
+    'solve_stresslet',
+    # Moment decomposition
+    'couplet_to_stresslet_torque',
+    'decompose_gradient',
+    'stresslet_basis',
+    'stresslet_to_couplet',
+    'torque_to_couplet',
 ]
