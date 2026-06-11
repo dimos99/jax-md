@@ -1,24 +1,123 @@
-*.pyc
+###############################################################################
+# Python: bytecode, binaries, packaging
+###############################################################################
+
+*.py[cod]
+*$py.class
 *.so
-*.egg-info
-*.~undo-tree~
-.ipynb_checkpoints
-/bazel-*
-.bazelrc
-.pytype/*
-**/.pytype/*
-/tensorflow
-.DS_Store
+*.egg-info/
+.eggs/
+
 build/
 dist/
+
+
+###############################################################################
+# Python: type checkers, caches, notebooks
+###############################################################################
+
 .mypy_cache/
+.pytype/
+**/.pytype/
+
+.ipynb_checkpoints/
+
+
+###############################################################################
+# Build systems / external source trees
+###############################################################################
+
+/bazel-*
+.bazelrc
+
+/tensorflow
+
+
+###############################################################################
+# Editors / IDEs
+###############################################################################
+
+# VS Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# Emacs undo-tree
+*.~undo-tree~
+
+
+###############################################################################
+# OS files
+###############################################################################
+
+.DS_Store
+
+
+###############################################################################
+# Project outputs / generated data
+###############################################################################
+
 examples/output/*
-.vscode
-*literature*
-*traj*
-etc/
+examples/hydrogels/out/
+
 output/
+
 *tmp*
-.mplconfig # matplotlib config dir
-.mplstyle # matplotlib style file
-.idea # JetBrains IDEs
+*traj*
+*literature*
+debug/
+
+
+###############################################################################
+# Matplotlib local config
+###############################################################################
+
+.mplconfig/
+.mplstyle/
+
+
+###############################################################################
+# AI agent / assistant files
+###############################################################################
+
+# OpenAI Codex / general agent instructions
+AGENTS.md
+
+# Claude Code
+CLAUDE.md
+.claude/
+
+# Cursor
+.cursorrules
+.cursor/
+
+# Windsurf
+.windsurf/
+.windsurfrules
+
+# GitHub Copilot instructions
+.github/copilot-instructions.md
+
+# Gemini CLI / Google agent files
+GEMINI.md
+
+# Aider
+.aider*
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v4/
+
+# Continue
+.continue/
+
+# Local MCP / agent configs
+.mcp.json
+mcp.json
+
+
+###############################################################################
+# Sync / deployment tooling
+###############################################################################
+
+.rsyncignore
