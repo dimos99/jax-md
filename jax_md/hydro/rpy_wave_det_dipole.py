@@ -1,4 +1,24 @@
-"""Wave-space grand RPY mobility with force and traceless couplet moments."""
+"""Wave-space grand RPY mobility with force and traceless couplet moments.
+
+Extends the deterministic wave-space operator of ``rpy_wave_det`` to the grand
+mobility ``[U, D] = M^w [F, C]`` (Fiore & Swan 2018, Eqs. 4.20-4.23).  The
+moment-to-force-density map and its exact adjoint are
+
+  f_hat_m  = Pshape F_m - i Pdip k_n C_mn      (force + couplet sources)
+  U_hat    = Pshape u_hat
+  D_hat_ij = +i Pdip k_j u_hat_i               (velocity-gradient readout)
+
+with ``Pshape = sinc(ka)``, ``Pdip = 3 j1(ka)/(ka)``, and the
+Hasimoto-screened Stokeslet ``B`` unchanged and moment-agnostic.  Mutual
+adjointness of the C -> f map (-i) and the u -> D map (+i) makes the
+wave-space grand operator symmetric positive semi-definite by construction;
+the jnp.fft sign convention ``u(x) = sum_k u_hat e^{+i k.x}`` fixes
+``d/dx_n <-> +i k_n``.
+
+Couplet index and packing conventions live in ``rpy_moments``; all 11 moment
+channels (3 force + 8 drop-zz couplet components) share a single
+spread/FFT/gather pass.
+"""
 
 from typing import Callable, Optional, Tuple
 
@@ -20,7 +40,6 @@ from jax_md.hydro.rpy_wave_det_helpers import (
     make_reciprocal,
     positions_to_fractional,
     q_grid,
-    k_from_q,
     sinc,
     build_Pdip_modes,
     build_stencils_frac,
@@ -42,7 +61,13 @@ def build_grand_wave_modes(A,
                            theta=None,
                            *,
                            fractional_coordinates: bool = True) -> WaveSpaceState:
-  """Precompute wave-space modes for the grand mobility operator."""
+  """Precompute grand wave-space modes and attach the cached grand matvec.
+
+  Identical to ``build_wave_modes`` plus the dipole shape factor ``Pdip``;
+  the returned state's ``apply_fn`` is ``make_grand_wave_matvec`` over the
+  precomputed modes.  No stochastic samplers are attached (Phase 1 has no
+  Brownian dipole moments).
+  """
   state = build_wave_modes(
       A,
       a,
@@ -57,20 +82,17 @@ def build_grand_wave_modes(A,
   )
   modes = dict(state.modes)
   modes["Pdip"] = build_Pdip_modes(modes["K"], a)
-  template = WaveSpaceState(
-      params=state.params,
-      modes=modes,
-      apply_fn=None,
-      sqrt_fn=None,
-      fused_fn=None,
-  )
+  template = WaveSpaceState(params=state.params, modes=modes)
   return WaveSpaceState(
       params=template.params,
       modes=template.modes,
       apply_fn=make_grand_wave_matvec(template),
-      sqrt_fn=None,
-      fused_fn=None,
   )
+
+
+# Alias kept for naming parity with the legacy ``build_Mw_state``; used by
+# ``build_rpy_mobility`` when ``use_stresslet=True``.
+build_Mw_grand_state = build_grand_wave_modes
 
 
 def make_grand_wave_matvec(
@@ -132,30 +154,6 @@ def make_grand_wave_matvec(
   return Mw_core
 
 
-def build_Mw_grand_state(A, a, xi, eta, Mx, My, Mz, P_support, *,
-                         theta=None, fractional_coordinates=True):
-  """Construct a WaveSpaceState with cached grand deterministic matvec."""
-  state = build_grand_wave_modes(
-      A,
-      a,
-      xi,
-      eta,
-      Mx,
-      My,
-      Mz,
-      P_support,
-      theta,
-      fractional_coordinates=fractional_coordinates,
-  )
-  return WaveSpaceState(
-      params=state.params,
-      modes=state.modes,
-      apply_fn=make_grand_wave_matvec(state),
-      sqrt_fn=None,
-      fused_fn=None,
-  )
-
-
 def mw_grand_matvec(state: WaveSpaceState,
                     positions: jnp.ndarray,
                     forces: jnp.ndarray,
@@ -171,7 +169,12 @@ def mw_grand_matvec(state: WaveSpaceState,
 
 
 def _mw_bruteforce_grand(t, F, C, A, a, xi, eta, Mx, My, Mz, P, theta=None):
-  """Direct k-space grand mobility over the FFT mode set (slow; testing only)."""
+  """Direct O(N^2 Nk) k-space grand mobility over the FFT mode set.
+
+  Independent of the NUFFT machinery (no spreading, deconvolution, or FFTs);
+  pins the phases, signs, and shape factors of ``make_grand_wave_matvec`` in
+  tests.  Testing only.
+  """
   del P, theta
   Brecip = make_reciprocal(A)
   V = jnp.linalg.det(A)

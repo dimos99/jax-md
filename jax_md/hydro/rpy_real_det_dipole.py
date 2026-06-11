@@ -1,6 +1,27 @@
-"""Real-space grand RPY mobility with force and traceless couplet inputs."""
+"""Real-space grand RPY mobility with force and traceless couplet inputs.
 
-from functools import partial
+Extends the deterministic real-space operator of ``rpy_real_det`` to the grand
+mobility ``[U, D] = M^r [F, C]``, adding the UC (couplet -> velocity), DF
+(force -> velocity gradient), and DC (couplet -> velocity gradient) blocks on
+top of the existing UF pair kernel.  The radial scalars (G1, G2, K1, K2, K3)
+come from ``rpy_real_det_dipole_helpers``; the tensor contraction here was
+validated against the quadrature ground truth in
+``tests/rpy_quadrature_reference.py`` and, in convention-free physical
+variables (F, L, S) -> (U, W, E), against the FSD reference implementation
+(machine precision; see ``tests/rpy_stresslet_test.py``).
+
+Conventions (shared with ``rpy_moments`` / the wave-space side):
+
+  * ``rij = x_sender - x_receiver`` (+ lattice image), so ``rhat`` points
+    receiver -> sender.  The literature tensors use the opposite direction;
+    odd-in-rhat blocks (UC/DF) absorb the sign, even blocks (UF/DC) do not.
+  * ``D_ij = du_i/dx_j`` (Faxen-filtered), traceless; couplets are projected
+    traceless on entry.
+  * Neighbor-list bookkeeping (worst-case shear allocation, live-box lattice
+    refresh) is shared with the legacy operator via
+    ``rpy_real_det._resolve_apply_bookkeeping``.
+"""
+
 from typing import Callable, Optional, Tuple
 
 import jax
@@ -40,6 +61,12 @@ from jax_md.hydro.rpy_real_lattice_helpers import (
 
 
 I3 = jnp.eye(3, dtype=REAL_DTYPE)
+
+# M_DF,ijm(r) = -M_UC,mij(r): the DF block is the adjoint of UC with a sign
+# flip inherited from the -i/+i pair in the wave-space moment maps (Fiore
+# Eqs. 4.21/4.22).  Not a free choice -- pinned externally by the quadrature
+# pair-tensor test and the FSD physical-map comparison, and confirmed
+# internally by grand-mobility symmetry.
 DF_ADJOINT_SIGN = -1.0
 
 
