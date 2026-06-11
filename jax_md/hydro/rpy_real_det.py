@@ -402,6 +402,109 @@ def _build_mr_core_min_image(
     return core
 
 
+def _resolve_apply_bookkeeping(
+    *,
+    state: RealSpaceState,
+    positions: jnp.ndarray,
+    displacement_fn: Callable,
+    box_fn: Optional[Callable],
+    fractional_coordinates: bool,
+    rcut: float,
+    lattice_extent: Optional[int],
+    lattice_extra: float,
+    box_jump_threshold: float,
+    extra_capacity: int,
+    neighbor_fn: Callable,
+    core_lattice: Callable,
+    core_min_image: Callable,
+    neighbor: Optional[partition.NeighborList] = None,
+    lattice_indices: Optional[jnp.ndarray] = None,
+    zero_image_index: Optional[int] = None,
+    box_matrix: Optional[jnp.ndarray] = None,
+    **kwargs,
+):
+    """Resolve live-box, lattice, and neighbor-list state for an apply call."""
+    dim = int(positions.shape[1])
+    if box_matrix is None:
+        box_matrix_local = current_box_matrix(
+            displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
+    else:
+        box_matrix_local = canonicalize_box_matrix(box_matrix, dim)
+        if box_matrix_local is None:
+            raise ValueError("box_matrix must be a scalar, vector, or matrix.")
+
+    core_fn_selected = state.core_fn
+    if core_fn_selected is None:
+        raise ValueError("RealSpaceState is missing core_fn; reinitialize with build_Mr_apply().")
+    using_lattice_kernel = core_fn_selected is core_lattice
+    using_min_image_kernel = core_fn_selected is core_min_image
+
+    if using_min_image_kernel and not isinstance(box_matrix_local, jax.core.Tracer):
+        if not _is_min_image_safe(box_matrix_local, rcut=float(rcut)):
+            raise ValueError(
+                "Current box violates minimum-image safety (rcut > 0.5 * sigma_min(box)) "
+                "for the selected real-space kernel. Rebuild in lattice mode."
+            )
+
+    if (using_lattice_kernel and lattice_extent is None and
+            lattice_indices is None and isinstance(box_matrix_local, jax.core.Tracer)):
+        raise ValueError(
+            "Dynamic/traced box requires explicit lattice_extent (or lattice_indices) "
+            "so the lattice-image set has static shape under jit."
+        )
+    force_rebuild_py = False
+    if not (isinstance(box_matrix_local, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
+        delta_box = np.asarray(box_matrix_local - state.box_matrix, dtype=np.float64)
+        box_jump = float(np.linalg.norm(delta_box))
+        force_rebuild_py = box_jump > float(box_jump_threshold)
+
+    if lattice_indices is not None:
+        lattice_indices_local = jnp.asarray(lattice_indices, dtype=jnp.int32)
+        zero_idx = int(zero_image_index) if zero_image_index is not None else state.zero_image_index
+    else:
+        if force_rebuild_py and lattice_extent is None:
+            lattice_indices_local, zero_idx = _compute_lattice_indices(
+                box_matrix_local,
+                rcut=float(rcut),
+                lattice_extent=lattice_extent,
+                lattice_extra=lattice_extra,
+                warn_stacklevel=5,
+            )
+        else:
+            lattice_indices_local = state.lattice_indices
+            zero_idx = state.zero_image_index
+
+    neighbor_kwargs = dict(kwargs)
+    neighbor_box = _neighbor_box_from_matrix(box_matrix_local, fractional_coordinates)
+    if neighbor_box is not None:
+        neighbor_kwargs.setdefault("box", neighbor_box)
+    else:
+        neighbor_kwargs.pop("box", None)
+    if neighbor is None:
+        if state.neighbors is None:
+            raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
+        if force_rebuild_py:
+            neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
+        else:
+            updated = state.neighbors.update(positions, **neighbor_kwargs)
+            try:
+                overflow_py = bool(np.asarray(updated.did_buffer_overflow))
+                cell_small_py = bool(np.asarray(updated.cell_size_too_small))
+                malformed_py = bool(np.asarray(updated.malformed_box))
+            except (TypeError, jax_errors.TracerArrayConversionError, jax_errors.TracerBoolConversionError):
+                neighbors = updated
+            else:
+                if overflow_py or cell_small_py or malformed_py:
+                    neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
+                else:
+                    neighbors = updated
+    else:
+        neighbors = neighbor
+
+    mask = partition.neighbor_list_mask(neighbors)
+    return box_matrix_local, core_fn_selected, lattice_indices_local, zero_idx, neighbors, mask
+
+
 def build_Mr_apply(
     space_fns,
     a,
@@ -580,101 +683,27 @@ def build_Mr_apply(
         if positions.shape != forces.shape:
             raise ValueError("positions and forces must have the same shape.")
 
-        dim = int(positions.shape[1])
-        if box_matrix is None:
-            box_matrix_local = current_box_matrix(
-                displacement_fn, box_fn, dim, fractional_coordinates=fractional_coordinates, **kwargs)
-        else:
-            box_matrix_local = canonicalize_box_matrix(box_matrix, dim)
-            if box_matrix_local is None:
-                raise ValueError("box_matrix must be a scalar, vector, or matrix.")
-
-        core_fn_selected = state.core_fn
-        if core_fn_selected is None:
-            raise ValueError("RealSpaceState is missing core_fn; reinitialize with build_Mr_apply().")
-        using_lattice_kernel = core_fn_selected is core_lattice
-        using_min_image_kernel = core_fn_selected is core_min_image
-
-        if using_min_image_kernel and not isinstance(box_matrix_local, jax.core.Tracer):
-            if not _is_min_image_safe(box_matrix_local, rcut=float(rcut)):
-                raise ValueError(
-                    "Current box violates minimum-image safety (rcut > 0.5 * sigma_min(box)) "
-                    "for the selected real-space kernel. Rebuild in lattice mode."
-                )
-
-        # Outside `jit`, we optionally rebuild neighbor/lattice bookkeeping when the
-        # box changes abruptly (e.g. due to a host-side resize).
-        #
-        # Inside `jit`, we must *not* attempt any NumPy conversion or data-dependent
-        # Python branching. When the box is *dynamic* (i.e. `box_matrix` itself is a
-        # Tracer), we cannot safely recompute lattice indices with a data-dependent
-        # extent because that would change array shapes; require an explicit
-        # `lattice_extent` (or an explicit `lattice_indices` override) in that case.
-        if (using_lattice_kernel and lattice_extent is None and
-                lattice_indices is None and isinstance(box_matrix_local, jax.core.Tracer)):
-            raise ValueError(
-                "Dynamic/traced box requires explicit lattice_extent (or lattice_indices) "
-                "so the lattice-image set has static shape under jit."
-            )
-        force_rebuild_py = False
-        if not (isinstance(box_matrix_local, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
-            delta_box = np.asarray(box_matrix_local - state.box_matrix, dtype=np.float64)
-            box_jump = float(np.linalg.norm(delta_box))
-            force_rebuild_py = box_jump > float(box_jump_threshold)
-
-        if lattice_indices is not None:
-            lattice_indices_local = jnp.asarray(lattice_indices, dtype=jnp.int32)
-            zero_idx = int(zero_image_index) if zero_image_index is not None else state.zero_image_index
-        else:
-            if force_rebuild_py and lattice_extent is None:
-                lattice_indices_local, zero_idx = _compute_lattice_indices(
-                    box_matrix_local,
-                    rcut=float(rcut),
-                    lattice_extent=lattice_extent,
-                    lattice_extra=lattice_extra,
-                    warn_stacklevel=5,
-                )
-            else:
-                lattice_indices_local = state.lattice_indices
-                zero_idx = state.zero_image_index
-
-        neighbor_kwargs = dict(kwargs)
-        neighbor_box = _neighbor_box_from_matrix(box_matrix_local, fractional_coordinates)
-        if neighbor_box is not None:
-            neighbor_kwargs.setdefault("box", neighbor_box)
-        else:
-            neighbor_kwargs.pop("box", None)
-        if neighbor is None:
-            if state.neighbors is None:
-                raise ValueError("RealSpaceState.neighbors is None; provide a neighbor list via 'neighbor'.")
-            if force_rebuild_py:
-                neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
-            else:
-                # Use the built-in NeighborList.update() method
-                updated = state.neighbors.update(positions, **neighbor_kwargs)
-
-                # Check for errors using NeighborList properties
-                try:
-                    overflow_py = bool(np.asarray(updated.did_buffer_overflow))
-                    cell_small_py = bool(np.asarray(updated.cell_size_too_small))
-                    malformed_py = bool(np.asarray(updated.malformed_box))
-                except (TypeError, jax_errors.TracerArrayConversionError, jax_errors.TracerBoolConversionError):
-                    # In JIT context, can't reallocate; just use updated neighbor list
-                    # The error flags will be set in the returned state for inspection
-                    # DEBUG CALLBACK DISABLED FOR GPU COMPATIBILITY
-                    # The callback causes GPU-to-CPU transfer issues
-                    # Instead, we rely on silent overflow handling
-                    neighbors = updated
-                else:
-                    # Outside JIT: reallocate if any error occurred
-                    if overflow_py or cell_small_py or malformed_py:
-                        neighbors = neighbor_fn.allocate(positions, int(extra_capacity), **neighbor_kwargs) # type: ignore
-                    else:
-                        neighbors = updated
-        else:
-            neighbors = neighbor
-
-        mask = partition.neighbor_list_mask(neighbors)
+        (box_matrix_local, core_fn_selected, lattice_indices_local, zero_idx,
+         neighbors, mask) = _resolve_apply_bookkeeping(
+            state=state,
+            positions=positions,
+            displacement_fn=displacement_fn,
+            box_fn=box_fn,
+            fractional_coordinates=fractional_coordinates,
+            rcut=float(rcut),
+            lattice_extent=lattice_extent,
+            lattice_extra=lattice_extra,
+            box_jump_threshold=float(box_jump_threshold),
+            extra_capacity=extra_capacity,
+            neighbor_fn=neighbor_fn,
+            core_lattice=core_lattice,
+            core_min_image=core_min_image,
+            neighbor=neighbor,
+            lattice_indices=lattice_indices,
+            zero_image_index=zero_image_index,
+            box_matrix=box_matrix,
+            **kwargs,
+        )
 
         # Forces are provided in real coordinates.
         forces_real = jnp.asarray(forces, dtype=REAL_DTYPE)

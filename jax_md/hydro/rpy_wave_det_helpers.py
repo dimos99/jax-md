@@ -117,6 +117,17 @@ def build_P_modes(K: jnp.ndarray, a: float) -> jnp.ndarray:
     return Pshape
 
 
+@partial(jax.jit, static_argnames=["a"])
+def build_Pdip_modes(K: jnp.ndarray, a: float) -> jnp.ndarray:
+    """Build dipole shape factor 3 (sin(ka) - ka cos(ka)) / (ka)^3."""
+    x = K * a
+    x2 = x * x
+    series = 1.0 - x2 / 10.0 + (x2 * x2) / 280.0
+    safe_x = jnp.where(jnp.abs(x) < 1.0e-2, 1.0, x)
+    closed = 3.0 * (jnp.sin(safe_x) - safe_x * jnp.cos(safe_x)) / (safe_x ** 3)
+    return jnp.where(jnp.abs(x) < 1.0e-2, series, closed)
+
+
 # ----------------------------
 # Stencils (indices + separable Gaussian weights)
 # ----------------------------
@@ -180,12 +191,12 @@ def build_stencils_frac(t, Mx, My, Mz, P, alpha):
 # Spread (S) and Gather (S†)
 # ----------------------------
 def spread(F, st, Mx, My, Mz):
-    """Spread particle forces to the FFT grid using SE stencils.
+    """Spread particle values to the FFT grid using SE stencils.
 
     Parameters
     ----------
     F : array
-        Particle forces with shape (N, 3).
+        Particle values with shape (N, Q).
     st : tuple
         Stencil tuple returned by ``build_stencils_frac``.
     Mx, My, Mz : int
@@ -194,10 +205,11 @@ def spread(F, st, Mx, My, Mz):
     Returns
     -------
     jnp.ndarray
-        Force grid with shape (Mx, My, Mz, 3).
+        Grid with shape (Mx, My, Mz, Q).
     """
     ix, iy, iz, wx, wy, wz = st
     N, P = ix.shape
+    Q = F.shape[-1]
 
     w3 = (wx[:, :, None, None] *
           wy[:, None, :, None] *
@@ -216,12 +228,12 @@ def spread(F, st, Mx, My, Mz):
     XI_all = XI.ravel()
     YI_all = YI.ravel()
     ZI_all = ZI.ravel()
-    contrib_all = contrib.reshape(-1, 3)
+    contrib_all = contrib.reshape(-1, Q)
 
     flat_indices = XI_all * My * Mz + YI_all * Mz + ZI_all
-    grid = jnp.zeros((Mx * My * Mz, 3), dtype=F.dtype)
+    grid = jnp.zeros((Mx * My * Mz, Q), dtype=F.dtype)
     grid = jax.ops.segment_sum(contrib_all, flat_indices, Mx * My * Mz)
-    return grid.reshape(Mx, My, Mz, 3)
+    return grid.reshape(Mx, My, Mz, Q)
 
 
 def gather(u_grid, st, Mx, My, Mz):

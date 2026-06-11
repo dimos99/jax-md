@@ -42,6 +42,7 @@ from jax_md.hydro.rpy_wave_det_helpers import (
     choose_theta,
     sinc,
     build_P_modes,
+    build_Pdip_modes,
     _build_mode_grid,
     _build_se_deconv_window,
     build_B_modes,
