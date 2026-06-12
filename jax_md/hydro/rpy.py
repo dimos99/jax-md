@@ -1020,11 +1020,13 @@ def build_rpy_mobility(space_fns,
   Returns:
     A tuple ``(init_fn, apply_fn)`` where:
 
-    **init_fn(positions_frac, **kwargs) -> RpyState**
+    **init_fn(positions_frac, *, wave_state=None, **kwargs) -> RpyState**
       Build the initial mobility state (neighbor list + wave-space arrays)
       for a given configuration. Keyword arguments such as ``gamma_xy`` or
       ``shear=(γ_xy, γ_xz, γ_yz)`` are forwarded to set the current box
-      deformation.
+      deformation. ``wave_state`` may be reused across configurations with
+      identical box and wave-grid parameters to avoid rebuilding the same
+      wave-space modes.
 
     **apply_fn(state, positions_frac, forces, *, couplets=None,
     brownian_key=None,
@@ -1171,7 +1173,8 @@ def build_rpy_mobility(space_fns,
     )
 
   # -- init_fn: allocate neighbor list and wave-space arrays ---------------
-  def init_fn(positions_frac, **kwargs):
+  def init_fn(positions_frac, *, wave_state: Optional[WaveSpaceState] = None,
+              **kwargs):
     positions_frac = jnp.asarray(positions_frac)
     dim = int(positions_frac.shape[1])
     combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
@@ -1191,7 +1194,8 @@ def build_rpy_mobility(space_fns,
 
     real_state = Mr_init(positions_frac, **combined_kwargs)
 
-    wave_state = _build_wave_state_for_box(active_box)
+    if wave_state is None:
+      wave_state = _build_wave_state_for_box(active_box)
 
     return RpyState(
         real=real_state,
@@ -1566,7 +1570,9 @@ def build_rpy_mobility(space_fns,
     shift_fn = space_fns[1]
 
     def _mobility_init_for_step(positions_frac, *,
-                                extra_capacity_override=None, **kwargs):
+                                extra_capacity_override=None,
+                                wave_state: Optional[WaveSpaceState] = None,
+                                **kwargs):
       positions_frac = jnp.asarray(positions_frac)
       dim = int(positions_frac.shape[1])
       combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
@@ -1575,9 +1581,11 @@ def build_rpy_mobility(space_fns,
       real_state = Mr_init(
           positions_frac, extra_capacity_override=extra_capacity_override,
           **combined_kwargs)
+      if wave_state is None:
+        wave_state = _build_wave_state_for_box(active_box)
       return RpyState(
           real=real_state,
-          wave=_build_wave_state_for_box(active_box),
+          wave=wave_state,
           preconditioner=precond,
       )
 

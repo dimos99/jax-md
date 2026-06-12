@@ -230,7 +230,7 @@ def make_constrained_brownian_step(
 
   Returns ``(brownian_init_fn, step_fn)``:
     brownian_init_fn(positions_frac, key, *, stresslet_guess=None,
-                     extra_capacity_override=None, **kwargs)
+                     extra_capacity_override=None, wave_state=None, **kwargs)
         -> ConstrainedBrownianState
     step_fn(state, **step_kwargs) -> (next_state, info)
   ``info`` carries the Lanczos diagnostics and ``nbr_did_overflow``; on
@@ -245,12 +245,16 @@ def make_constrained_brownian_step(
   use_midpoint = integrator == 'midpoint'
 
   def brownian_init_fn(positions_frac, key, *, stresslet_guess=None,
-                       extra_capacity_override=None, **kwargs):
+                       extra_capacity_override=None, wave_state=None,
+                       **kwargs):
     positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
     n = positions_frac.shape[0]
+    init_kwargs = {}
+    if wave_state is not None:
+      init_kwargs['wave_state'] = wave_state
     rpy_state = mobility_init_fn(
         positions_frac, extra_capacity_override=extra_capacity_override,
-        **kwargs)
+        **init_kwargs, **kwargs)
     if stresslet_guess is None:
       stresslet_guess = jnp.zeros((n, 5), dtype=REAL_DTYPE)
     return ConstrainedBrownianState(
