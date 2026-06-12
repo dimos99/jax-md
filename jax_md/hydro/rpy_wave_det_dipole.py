@@ -60,13 +60,16 @@ def build_grand_wave_modes(A,
                            P_support,
                            theta=None,
                            *,
-                           fractional_coordinates: bool = True) -> WaveSpaceState:
+                           fractional_coordinates: bool = True,
+                           attach_sqrt: bool = False) -> WaveSpaceState:
   """Precompute grand wave-space modes and attach the cached grand matvec.
 
   Identical to ``build_wave_modes`` plus the dipole shape factor ``Pdip``;
   the returned state's ``apply_fn`` is ``make_grand_wave_matvec`` over the
-  precomputed modes.  No stochastic samplers are attached (Phase 1 has no
-  Brownian dipole moments).
+  precomputed modes.  With ``attach_sqrt=True`` (Phase 3, constrained
+  Brownian dynamics) the grand stochastic sampler from
+  ``rpy_wave_stoch.build_Mw_grand_sqrt_sampler`` is attached as ``sqrt_fn``;
+  the default leaves it off (Phase 1 has no Brownian dipole moments).
   """
   state = build_wave_modes(
       A,
@@ -83,10 +86,15 @@ def build_grand_wave_modes(A,
   modes = dict(state.modes)
   modes["Pdip"] = build_Pdip_modes(modes["K"], a)
   template = WaveSpaceState(params=state.params, modes=modes)
+  sqrt_fn = None
+  if attach_sqrt:
+    from jax_md.hydro.rpy_wave_stoch import build_Mw_grand_sqrt_sampler
+    sqrt_fn = build_Mw_grand_sqrt_sampler(template)
   return WaveSpaceState(
       params=template.params,
       modes=template.modes,
       apply_fn=make_grand_wave_matvec(template),
+      sqrt_fn=sqrt_fn,
   )
 
 

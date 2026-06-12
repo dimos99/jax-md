@@ -239,3 +239,40 @@ def decompose_gradient(D: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
   E5 = jnp.einsum('...ij,aij->...a', sym, basis)
   Omega = -0.5 * jnp.einsum('kij,...ij->...k', eps, D)
   return E5, Omega
+
+
+def couplet_to_orthonormal(C: jnp.ndarray) -> jnp.ndarray:
+  """Coordinates of a traceless (..., 3, 3) tensor in the orthonormal basis.
+
+  Returns (..., 8) coordinates in ``traceless_orthonormal_basis()`` order.
+  Unlike the drop-zz packing these are Frobenius-orthonormal, so the
+  Euclidean inner product on the coordinates equals the Frobenius pairing
+  on the tensors -- the property the Lanczos square root relies on.
+  """
+  C = jnp.asarray(C)
+  basis = jnp.asarray(traceless_orthonormal_basis(), dtype=C.dtype)
+  return jnp.einsum('...ij,aij->...a', C, basis)
+
+
+def orthonormal_to_couplet(c8: jnp.ndarray) -> jnp.ndarray:
+  """Inverse of ``couplet_to_orthonormal`` (exact on traceless tensors)."""
+  c8 = jnp.asarray(c8)
+  basis = jnp.asarray(traceless_orthonormal_basis(), dtype=c8.dtype)
+  return jnp.einsum('...a,aij->...ij', c8, basis)
+
+
+def grand_to_flat(U: jnp.ndarray, D: jnp.ndarray) -> jnp.ndarray:
+  """Flatten a grand pair (U (..., 3), D (..., 3, 3)) to (..., 11).
+
+  Channels 0:3 are Cartesian; channels 3:11 are orthonormal-basis
+  coordinates of the traceless tensor channel.  The grand mobility is a
+  symmetric matrix in these flat coordinates (it is not in drop-zz).
+  """
+  U = jnp.asarray(U)
+  return jnp.concatenate([U, couplet_to_orthonormal(D)], axis=-1)
+
+
+def flat_to_grand(x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Inverse of ``grand_to_flat``: (..., 11) -> (F (..., 3), C (..., 3, 3))."""
+  x = jnp.asarray(x)
+  return x[..., :3], orthonormal_to_couplet(x[..., 3:])

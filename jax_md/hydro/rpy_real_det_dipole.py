@@ -572,6 +572,41 @@ def build_Mr_grand_apply(
     )
     return (velocities_real, traceless(gradients_real)), next_state
 
+  def refresh_fn(state: RealSpaceState, positions, **kwargs) -> RealSpaceState:
+    """Rebind the state at new positions without evaluating the grand kernel.
+
+    Same neighbor-list / lattice / box bookkeeping as ``apply_fn``, minus the
+    core evaluation -- used by the Phase-3 stepper to bind the slip sampler
+    at the start-of-step configuration at zero kernel cost.
+    """
+    positions = jnp.asarray(positions)
+    (box_matrix_local, core_fn_selected, lattice_indices_local, zero_idx,
+     neighbors, _) = _resolve_apply_bookkeeping(
+        state=state,
+        positions=positions,
+        displacement_fn=displacement_fn,
+        box_fn=box_fn,
+        fractional_coordinates=fractional_coordinates,
+        rcut=float(rcut),
+        lattice_extent=lattice_extent,
+        lattice_extra=lattice_extra,
+        box_jump_threshold=float(box_jump_threshold),
+        extra_capacity=extra_capacity,
+        neighbor_fn=neighbor_fn,
+        core_lattice=core_lattice,
+        core_min_image=core_min_image,
+        **kwargs,
+    )
+    return RealSpaceState(
+        neighbors=neighbors, # type: ignore
+        lattice_indices=lattice_indices_local, # type: ignore
+        zero_image_index=zero_idx, # type: ignore
+        box_matrix=box_matrix_local, # type: ignore
+        fractional_coordinates=fractional_coordinates, # type: ignore
+        core_fn=core_fn_selected, # type: ignore
+    )
+
+  apply_fn.refresh = refresh_fn
   return init_fn, apply_fn
 
 

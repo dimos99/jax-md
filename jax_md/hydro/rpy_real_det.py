@@ -454,7 +454,12 @@ def _resolve_apply_bookkeeping(
         )
     force_rebuild_py = False
     if not (isinstance(box_matrix_local, jax.core.Tracer) or isinstance(state.box_matrix, jax.core.Tracer)):
-        delta_box = np.asarray(box_matrix_local - state.box_matrix, dtype=np.float64)
+        # Subtract in numpy: a jnp subtraction is staged out as a tracer when an
+        # ambient trace is active (even for concrete operands), which would make
+        # this host-side check fail inside jit for states whose box_matrix is a
+        # concrete constant (e.g. the Phase-3 stepper's mid-step re-apply).
+        delta_box = (np.asarray(box_matrix_local, dtype=np.float64) -
+                     np.asarray(state.box_matrix, dtype=np.float64))
         box_jump = float(np.linalg.norm(delta_box))
         force_rebuild_py = box_jump > float(box_jump_threshold)
 

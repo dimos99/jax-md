@@ -30,7 +30,12 @@ from jax_md.hydro.rpy_wave_det_dipole import (
     mw_grand_matvec,
     _mw_bruteforce_grand,
 )
-from jax_md.hydro.rpy_wave_stoch import build_Mw_sqrt_sampler, build_Mw_apply_and_sample
+from jax_md.hydro.rpy_wave_stoch import (
+    build_Mw_sqrt_sampler,
+    build_Mw_apply_and_sample,
+    build_Mw_grand_sqrt_sampler,
+    grand_readout_noise_modes,
+)
 
 __all__ = [
     'REAL_DTYPE',

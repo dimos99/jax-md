@@ -61,6 +61,7 @@ from jax_md.hydro.rpy_wave import (
     mw_grand_matvec,
     build_Mw_sqrt_sampler,
     build_Mw_apply_and_sample,
+    build_Mw_grand_sqrt_sampler,
     make_reciprocal,
     q_grid,
     k_from_q,
@@ -88,10 +89,23 @@ from jax_md.hydro.rpy_constrained import (
 
 from jax_md.hydro.rpy_moments import (
     couplet_to_stresslet_torque,
+    couplet_to_orthonormal,
     decompose_gradient,
+    flat_to_grand,
+    grand_to_flat,
+    orthonormal_to_couplet,
     stresslet_basis,
     stresslet_to_couplet,
     torque_to_couplet,
+)
+
+from jax_md.hydro.rpy_brownian_constrained import (
+    ConstrainedBrownianState,
+    grand_jacobi_preconditioner,
+    make_constrained_brownian_step,
+    make_grand_slip_sampler,
+    make_real_grand_slip_sampler,
+    run_brownian_chunked,
 )
 
 __all__ = [
@@ -150,4 +164,15 @@ __all__ = [
     'stresslet_basis',
     'stresslet_to_couplet',
     'torque_to_couplet',
+    'couplet_to_orthonormal',
+    'orthonormal_to_couplet',
+    'grand_to_flat',
+    'flat_to_grand',
+    # Phase 3: constrained Brownian dynamics
+    'ConstrainedBrownianState',
+    'grand_jacobi_preconditioner',
+    'make_constrained_brownian_step',
+    'make_grand_slip_sampler',
+    'make_real_grand_slip_sampler',
+    'run_brownian_chunked',
 ]
