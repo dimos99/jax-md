@@ -209,6 +209,7 @@ def make_constrained_brownian_step(
     lanczos_tol: float = 1e-3,
     solve_tol: float = 1e-3,
     solve_maxiter: int = 50,
+    return_residual: bool = False,
 ) -> Tuple[Callable, Callable]:
   """Build the constrained Brownian stepper (Fiore & Swan midpoint SDAE).
 
@@ -236,7 +237,11 @@ def make_constrained_brownian_step(
     step_fn(state, **step_kwargs) -> (next_state, info)
   ``info`` carries the Lanczos diagnostics and ``nbr_did_overflow``; on
   overflow the step's results are invalid and the chunk must be replayed
-  after re-allocation (see ``run_brownian_chunked``).
+  after re-allocation (see ``run_brownian_chunked``).  When
+  ``return_residual=True`` it also carries ``solve_rel_residual`` (the
+  post-GMRES constraint residual), at the cost of one extra grand matvec
+  per step -- use it to confirm ``solve_maxiter`` is large enough, not in
+  timing-critical runs.
   """
   if integrator not in ('midpoint', 'euler_maruyama'):
     raise ValueError(f"integrator must be 'midpoint' or 'euler_maruyama', "
@@ -335,8 +340,9 @@ def make_constrained_brownian_step(
         with_torque=with_torque,
         solve_tol=solve_tol,
         solve_maxiter=solve_maxiter,
+        return_residual=return_residual,
     )
-    U_mid, S5, Omega, _ = solve_fn(
+    U_mid, S5, Omega, solve_info = solve_fn(
         F_P,
         torques=torques,
         stresslet_guess=state.stresslet,
@@ -350,6 +356,7 @@ def make_constrained_brownian_step(
     overflow = (real_s.neighbors.did_buffer_overflow |
                 real_k.neighbors.did_buffer_overflow)
     info = dict(slip_info)
+    info.update(solve_info)
     info['nbr_did_overflow'] = overflow
     if with_torque:
       info['angular_velocities'] = Omega

@@ -1631,7 +1631,8 @@ def build_rpy_mobility(space_fns,
       return wave_state.sqrt_fn(key, positions_frac)
 
     def make_brownian_step(force_fn=None, *, kT, dt, integrator='midpoint',
-                           torque_fn=None, mr_iters=50, lanczos_tol=1e-3):
+                           torque_fn=None, mr_iters=50, lanczos_tol=1e-3,
+                           return_residual=False):
       """Build (brownian_init_fn, step_fn) for constrained Brownian dynamics.
 
       ``force_fn(positions_frac, **step_kwargs) -> (N, 3)`` supplies the
@@ -1664,6 +1665,7 @@ def build_rpy_mobility(space_fns,
           lanczos_tol=lanczos_tol,
           solve_tol=solve_tol,
           solve_maxiter=solve_maxiter,
+          return_residual=return_residual,
       )
 
     apply_fn.make_brownian_step = make_brownian_step
