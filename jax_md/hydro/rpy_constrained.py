@@ -11,7 +11,7 @@ after which the constrained velocity is assembled as
     U = M_UF F + M_UL L + M_US S  =  R_FU^{-1} [F, L].
 
 Everything here is matrix-free: each sub-block application is one call of
-the Phase-1 grand matvec ``grand_mv(F, C) -> (U, D)`` with the irrelevant
+the grand matvec ``grand_mv(F, C) -> (U, D)`` with the irrelevant
 input zeroed and the relevant output extracted via the orthonormal
 symmetric/antisymmetric decomposition in ``rpy_moments``.  M_ES is
 symmetric PSD in those coordinates and well conditioned (the strain-
@@ -91,19 +91,20 @@ def make_constrained_solver(
     with_torque: bool = False,
     solve_tol: float = 1e-3,
     solve_maxiter: int = 50,
-    debug_residual: bool = False,
+    return_residual: bool = False,
 ):
   """Build the matrix-free stresslet-constrained mobility apply.
 
   Args:
-    grand_mv: Fixed-state Phase-1 grand matvec ``(F, C) -> (U, D)``.
+    grand_mv: Fixed-state grand matvec ``(F, C) -> (U, D)``.
     with_torque: If True, accept applied torques and also return the
       angular velocity Omega.
     solve_tol: Relative GMRES tolerance on the constraint residual.
-    solve_maxiter: Krylov basis size (static int).  If this is ever
-      approached, suspect a sign/indefiniteness bug, not a tight tolerance.
-    debug_residual: If True, spend one extra grand matvec per call to
-      report the post-solve relative residual in ``info``.
+    solve_maxiter: Krylov basis size (static int).  If this limit is ever
+      approached, check for a sign/indefiniteness error, not a tight tolerance.
+    return_residual: If True, spend one extra grand matvec per call to
+      report the post-solve relative residual in ``info`` (a supported
+      diagnostic for monitoring solver convergence).
 
   Returns:
     ``solve_fn(forces, torques=None, stresslet_guess=None,
@@ -111,7 +112,7 @@ def make_constrained_solver(
     converged stresslet in orthonormal (N, 5) coordinates (thread it back
     as ``stresslet_guess`` to warm-start the next step), ``Omega`` is the
     angular velocity (None unless ``with_torque``), and ``info`` is a dict
-    (contains ``'solve_rel_residual'`` when ``debug_residual``).
+    (contains ``'solve_rel_residual'`` when ``return_residual``).
     ``applied_output`` optionally supplies a precomputed
     ``grand_mv(F, torque_to_couplet(L))`` result so the RHS grand call can
     be fused with a state refresh by the caller.
@@ -161,7 +162,7 @@ def make_constrained_solver(
                decompose_gradient(D_stress)[1])
 
     info = {}
-    if debug_residual:
+    if return_residual:
       residual = m_es_operator(grand_mv)(S5) - rhs
       info['solve_rel_residual'] = (
           jnp.linalg.norm(residual) /

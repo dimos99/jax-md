@@ -66,10 +66,11 @@ def build_grand_wave_modes(A,
 
   Identical to ``build_wave_modes`` plus the dipole shape factor ``Pdip``;
   the returned state's ``apply_fn`` is ``make_grand_wave_matvec`` over the
-  precomputed modes.  With ``attach_sqrt=True`` (Phase 3, constrained
-  Brownian dynamics) the grand stochastic sampler from
+  precomputed modes.  With ``attach_sqrt=True`` (constrained Brownian
+  dynamics) the grand stochastic sampler from
   ``rpy_wave_stoch.build_Mw_grand_sqrt_sampler`` is attached as ``sqrt_fn``;
-  the default leaves it off (Phase 1 has no Brownian dipole moments).
+  the default leaves it off (the deterministic grand mobility has no Brownian
+  dipole moments).
   """
   state = build_wave_modes(
       A,
@@ -98,7 +99,7 @@ def build_grand_wave_modes(A,
   )
 
 
-# Alias kept for naming parity with the legacy ``build_Mw_state``; used by
+# Alias kept for naming parity with the force-only ``build_Mw_state``; used by
 # ``build_rpy_mobility`` when ``use_stresslet=True``.
 build_Mw_grand_state = build_grand_wave_modes
 

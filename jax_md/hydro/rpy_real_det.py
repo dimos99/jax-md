@@ -457,7 +457,7 @@ def _resolve_apply_bookkeeping(
         # Subtract in numpy: a jnp subtraction is staged out as a tracer when an
         # ambient trace is active (even for concrete operands), which would make
         # this host-side check fail inside jit for states whose box_matrix is a
-        # concrete constant (e.g. the Phase-3 stepper's mid-step re-apply).
+        # concrete constant (e.g. the constrained Brownian stepper's mid-step re-apply).
         delta_box = (np.asarray(box_matrix_local, dtype=np.float64) -
                      np.asarray(state.box_matrix, dtype=np.float64))
         box_jump = float(np.linalg.norm(delta_box))
@@ -564,7 +564,7 @@ def build_Mr_apply(
         of the box-matrix change exceeds this threshold. If None, defaults to
         ``dr_threshold``.
         In traced/JIT dynamic-box contexts with implicit ``lattice_extent``, strict
-        Fiore mode raises an error instead of silently under-covering image sums.
+        Fiore mode raises an error rather than under-covering image sums.
     real_space_mode : {'auto', 'min_image', 'lattice'}
         Real-space evaluation kernel. ``lattice`` always uses the periodic-image
         lattice sum, ``min_image`` always uses a minimum-image-only kernel (valid

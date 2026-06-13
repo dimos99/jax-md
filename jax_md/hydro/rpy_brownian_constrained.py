@@ -1,10 +1,11 @@
-"""Phase 3: constrained Brownian dynamics via the midpoint SDAE integrator.
+"""Constrained Brownian dynamics via the midpoint SDAE integrator.
 
 Implements the Fiore & Swan (2018) midpoint scheme for the stresslet-
 constrained mobility: sample the *unconstrained* grand Brownian slip with the
 positively split sampler (real-space Lanczos square root + wave-space
 analytic square root), advance to a midpoint with the slip velocity, and
-impose the rigidity constraint with a single Phase-2 solve at the midpoint.
+impose the rigidity constraint with a single stresslet-constraint solve at the
+midpoint.
 The Taylor expansion of the step reproduces, to O(dt), both the constrained
 covariance ``2 kT dt R_FU^{-1}`` and the thermal drift
 ``kT div R_FU^{-1}`` -- no square root of the constrained operator and no
@@ -24,8 +25,8 @@ Unit conventions
 The slip produced by ``make_grand_slip_sampler`` is a *velocity*: its
 covariance is ``(2 kT / dt) M_grand`` so that ``x_{k+1} = x_k + dt * U``
 carries the displacement covariance ``2 kT dt M``.  This differs from the
-legacy RPY Brownian path, whose ``noise`` output is a *displacement* with
-covariance ``2 kT dt M`` (scale ``sqrt(2 kT dt)``).
+unconstrained RPY Brownian path, whose ``noise`` output is a *displacement*
+with covariance ``2 kT dt M`` (scale ``sqrt(2 kT dt)``).
 """
 
 from functools import partial
@@ -138,7 +139,7 @@ def make_grand_slip_sampler(
     kT: float,
     dt: float,
 ) -> Callable[[jax.Array], Tuple[jnp.ndarray, jnp.ndarray, dict]]:
-  """Assemble the positively-split unconstrained Brownian slip (Part A).
+  """Assemble the positively-split unconstrained Brownian slip.
 
   ``real_sampler(key) -> (U, D, info)`` and ``wave_sampler(key) -> (U, D)``
   must be bound at the same configuration; their outputs are statistically
@@ -148,7 +149,7 @@ def make_grand_slip_sampler(
   Returns ``sampler(key) -> (U_B (N, 3), D_B (N, 3, 3), info)`` with joint
   covariance ``(2 kT / dt) * M_grand`` -- slip *velocity* units, so that the
   corrector ``x + dt * U`` carries displacement covariance ``2 kT dt M``
-  (unlike the legacy noise output, which is a displacement scaled by
+  (unlike the unconstrained noise output, which is a displacement scaled by
   ``sqrt(2 kT dt)``).
   """
 
@@ -165,7 +166,7 @@ def make_grand_slip_sampler(
 
 
 # -----------------------------------------------------------------------------
-# Parts B/C: midpoint SDAE integrator
+# Midpoint SDAE integrator
 # -----------------------------------------------------------------------------
 @dataclasses.dataclass
 class ConstrainedBrownianState:
@@ -214,7 +215,7 @@ def make_constrained_brownian_step(
   Per step: (1) sample the unconstrained grand slip ``[U_B, D_B]`` at the
   current configuration ``x_k`` (covariance ``2 kT/dt M_grand``); (2) move
   to the midpoint ``x_mid = x_k + (dt/2) U_B``; (3) perform the *single*
-  Phase-2 constraint solve at ``x_mid`` with the slip folded into the
+  stresslet-constraint solve at ``x_mid`` with the slip folded into the
   applied output (RHS ``-(E_B + M_EF F)``, assembly
   ``U_B + M_UF F + M_US S``); (4) advance ``x_{k+1} = x_k + dt U_mid``.
   The midpoint correlation between slip and solve reproduces the thermal

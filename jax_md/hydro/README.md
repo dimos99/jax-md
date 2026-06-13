@@ -135,6 +135,66 @@ state = init_fn(positions, t=0.0)
 velocities, state = apply_fn(state, positions, forces, t=current_time)
 ```
 
+## Stresslet-Constrained Mobility (Fiore & Swan 2018)
+
+Rigid spheres cannot deform with the local fluid strain. Enforcing this
+*stresslet constraint* extends the RPY mobility to the **grand mobility**, which
+couples particle forces **F** and couplets **C** to velocities **U** and
+velocity gradients **D** (Fiore & Swan 2018, Eqs. 30–31):
+
+```
+[U; D] = M · [F; C],   M = M^(w) + M^(r)
+```
+
+Decomposing the couplet into its symmetric stresslet **S** and antisymmetric
+torque **L**, and the gradient into rate of strain **E** and angular velocity
+**Ω**, the rigid constraint **E = 0** is solved for the stresslet (Eq. 36),
+giving the stresslet-constrained mobility (Eqs. 37–38):
+
+```
+R_FU^{-1} = M_UF − M_US · M_ES^{-1} · M_EF
+```
+
+`M_ES` is symmetric positive-definite and well conditioned, so the stresslet is
+recovered matrix-free with GMRES (~8–10 iterations, independent of `N`).
+
+```python
+from jax_md import space
+from jax_md.hydro import rpy
+
+space_fns = space.periodic_general(box, fractional_coordinates=True)
+
+# Grand mobility: forces + couplets -> velocities + velocity gradients.
+init_fn, apply_fn = rpy.build_rpy_mobility(
+    space_fns, a=0.03, xi=0.7, eta=1.0, P=16, Mgrid=64, use_stresslet=True)
+state = init_fn(positions)
+(velocities, gradients), state = apply_fn(state, positions, forces, couplets=C)
+
+# Stresslet-constrained mobility (the stresslet is solved for, not supplied).
+init_fn, apply_fn = rpy.build_rpy_mobility(
+    space_fns, a=0.03, xi=0.7, eta=1.0, P=16, Mgrid=64,
+    use_stresslet=True, constrained=True)
+state = init_fn(positions)
+(velocities, stresslets), state = apply_fn(state, positions, forces)
+```
+
+### Constrained Brownian dynamics
+
+Adding the stresslet constraint turns the equations of motion into an index-1
+stochastic differential-algebraic equation (SDAE). It is integrated with the
+Fiore & Swan midpoint scheme, which produces Brownian displacements consistent
+with the fluctuation-dissipation theorem for the constrained system *without*
+forming the square root of the constrained operator: the unconstrained slip is
+drawn by positive split sampling (real-space Lanczos square root + wave-space
+analytic square root), and the midpoint correlation reproduces the thermal
+drift `kT ∇·R_FU^{-1}` to O(dt).
+
+```python
+brownian_init, step = apply_fn.make_brownian_step(kT=1.0, dt=1e-3)
+state = brownian_init(positions, jax.random.PRNGKey(0))
+state, info = step(state)   # advance one constrained Brownian step
+```
+
 ## Implementation Details
 
 ### Coordinate Systems
@@ -159,9 +219,11 @@ The method has three independent error sources:
 
 ## References
 
-1. Fiore, A. M., et al. "Fast Stokesian dynamics." *J. Fluid Mech.* 878 (2019): 544-597.
-2. Wang, M., & Brady, J. F. "Spectral Ewald acceleration of Stokesian dynamics." *J. Comput. Phys.* 306 (2016): 443-477.
-3. Lindbo, D., & Tornberg, A. K. "Spectral accuracy in fast Ewald-based methods." *J. Comput. Phys.* 230 (2011): 8744-8761.
+1. Fiore, A. M., et al. "Rapid sampling of stochastic displacements in Brownian dynamics simulations." *J. Chem. Phys.* 146, 124116 (2017). — PSE method.
+2. Fiore, A. M., & Swan, J. W. "Rapid sampling of stochastic displacements in Brownian dynamics simulations with stresslet constraints." *J. Chem. Phys.* 148, 044114 (2018). — Grand mobility, stresslet constraint, constrained Brownian dynamics.
+3. Fiore, A. M., & Swan, J. W. "Fast Stokesian dynamics." *J. Fluid Mech.* 878 (2019): 544-597.
+4. Wang, M., & Brady, J. F. "Spectral Ewald acceleration of Stokesian dynamics." *J. Comput. Phys.* 306 (2016): 443-477.
+5. Lindbo, D., & Tornberg, A. K. "Spectral accuracy in fast Ewald-based methods." *J. Comput. Phys.* 230 (2011): 8744-8761.
 
 ## Testing
 

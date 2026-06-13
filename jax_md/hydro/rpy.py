@@ -125,7 +125,7 @@ def _deformation_matrix_from_shear(dim: int, gamma: ShearVector) -> jnp.ndarray:
 
 
 def _normalize_runtime_shear_kwargs(kwargs, dim: int):
-  """Reject legacy dict shear inputs and expand typed shear vectors."""
+  """Reject deprecated dict shear inputs and expand typed shear vectors."""
   result = dict(kwargs)
   gamma = result.get('gamma', None)
   if isinstance(gamma, dict):
@@ -998,7 +998,7 @@ def build_rpy_mobility(space_fns,
       lattice-image accumulation, ``'min_image'`` enforces minimum-image-only
       evaluation (requires ``rcut <= 0.5 * sigma_min(box)``), and ``'auto'``
       picks the safe option per box (default).
-    use_stresslet: If True, build the Phase-1 grand mobility from force and
+    use_stresslet: If True, build the grand mobility from force and
       traceless couplet inputs and return velocity plus traceless velocity
       gradient. Brownian sampling is not implemented for this mode.
     constrained: If True (requires ``use_stresslet=True``), apply the
@@ -1358,7 +1358,7 @@ def build_rpy_mobility(space_fns,
             'A single constrained mobility application with Brownian slip '
             'has no meaning outside a time step. Use '
             'apply_fn.make_brownian_step(...) to build the constrained '
-            'Brownian midpoint stepper (Phase 3).')
+            'Brownian midpoint stepper.')
       if couplets is not None:
         raise ValueError('couplets may not be passed in constrained mode; '
                          'the stresslet is solved for, not supplied.')
@@ -1565,7 +1565,7 @@ def build_rpy_mobility(space_fns,
 
   apply_fn.with_brownian = apply_with_brownian
 
-  # -- Phase 3: constrained Brownian midpoint stepper -----------------------
+  # -- Constrained Brownian midpoint stepper --------------------------------
   if constrained and include_brownian:
     shift_fn = space_fns[1]
 

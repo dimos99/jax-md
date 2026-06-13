@@ -92,7 +92,7 @@ def grand_readout_noise_modes(key, *, Pshape, Pdip, k, Bhalf_complex,
     T = A, recovering the textbook sampler.  On Nyquist planes (even grid
     dims) fftfreq assigns the *same* sign to the Nyquist component of k at
     q and q', so ``W(q') != conj(W(q))`` and a single-draw sampler is
-    non-Hermitian there (its imaginary part is silently dropped by the
+    non-Hermitian there (its imaginary part is dropped by the
     .real, under-counting the covariance).  The factorization above fixes
     this exactly and cheaply: draw two independent complex Gaussian fields
     z1, z3 with E[z z^H] = I, push both through W, and set

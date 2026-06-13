@@ -36,8 +36,8 @@ FFTs, and (b) the gridded velocity-gradient modes ``D_hat_ij = i Pdip k_j
 u_hat_i`` are traceless mode-by-mode since ``B`` projects ``u_hat``
 perpendicular to ``k`` (``tr D_hat = i Pdip (k . u_hat) = 0``), exactly, at
 every grid mode, regardless of spreading/aliasing of the *input* grids.  This
-claim is asserted analytically here and gated empirically by the post-NUFFT
-trace test in ``tests/rpy_stresslet_test.py``; if that gate ever fails, the
+claim is asserted analytically here and verified empirically by the post-NUFFT
+trace test in ``tests/rpy_stresslet_test.py``; if that test ever fails, the
 drop-zz storage is lossy and must be revisited.
 
 Note the 8 raw components are *not* Frobenius-orthonormal coordinates of the
@@ -48,7 +48,7 @@ asymmetric.
 
 Symmetric/antisymmetric (rigid) decomposition
 ---------------------------------------------
-Phase 2 (the stresslet constraint) works in the rigid representation
+The stresslet constraint works in the rigid representation
 ``(F, L, S) <-> (U, Omega, E)``.  The couplet splits as
 
     C = S - (1/2) eps . L        i.e.  C_mn = S_mn - (1/2) eps_mnk L_k,

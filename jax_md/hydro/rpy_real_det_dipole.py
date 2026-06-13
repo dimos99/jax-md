@@ -18,7 +18,7 @@ Conventions (shared with ``rpy_moments`` / the wave-space side):
   * ``D_ij = du_i/dx_j`` (Faxen-filtered), traceless; couplets are projected
     traceless on entry.
   * Neighbor-list bookkeeping (worst-case shear allocation, live-box lattice
-    refresh) is shared with the legacy operator via
+    refresh) is shared with the force-only operator via
     ``rpy_real_det._resolve_apply_bookkeeping``.
 """
 
@@ -431,7 +431,18 @@ def build_Mr_grand_apply(
     box_jump_threshold: Optional[float] = None,
     real_space_mode: RealSpaceMode = 'auto',
 ):
-  """Construct the neighbor-list-backed real-space grand mobility operator."""
+  """Construct the neighbor-list-backed real-space grand mobility operator.
+
+  The grand mobility couples particle forces and traceless couplets to
+  velocities and traceless velocity gradients via the real-space coupling
+  tensors M_UF, M_UC, M_DF, M_DC (Fiore & Swan 2018, Eqs. 25-27; scalar
+  radial functions F1/F2, G1/G2, K1/K2/K3 from Appendix A).
+
+  Returns ``(init_fn, apply_fn)`` mirroring ``build_Mr_apply``: ``init_fn``
+  allocates the neighbor-list-backed ``RealSpaceState`` and ``apply_fn``
+  evaluates ``(F, C) -> (U, D)`` at a configuration, refreshing the state for
+  the live (possibly sheared) box.
+  """
   if rcut <= 0.0:
     raise ValueError("rcut must be positive.")
   if lattice_extra < 0.0:
@@ -576,8 +587,8 @@ def build_Mr_grand_apply(
     """Rebind the state at new positions without evaluating the grand kernel.
 
     Same neighbor-list / lattice / box bookkeeping as ``apply_fn``, minus the
-    core evaluation -- used by the Phase-3 stepper to bind the slip sampler
-    at the start-of-step configuration at zero kernel cost.
+    core evaluation -- used by the constrained Brownian stepper to bind the
+    slip sampler at the start-of-step configuration at zero kernel cost.
     """
     positions = jnp.asarray(positions)
     (box_matrix_local, core_fn_selected, lattice_indices_local, zero_idx,
