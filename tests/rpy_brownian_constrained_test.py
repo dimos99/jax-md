@@ -1,31 +1,29 @@
-"""Validation gates for Phase-3 constrained Brownian dynamics (midpoint SDAE).
+"""Validation tests for constrained Brownian dynamics (midpoint SDAE).
 
-Gates (spec Part E):
-
-  0. Flat 11-component orthonormal layout: round trip and -- decisively --
-     the dense flat grand operator is symmetric.  Lanczos assumes the
-     Euclidean inner product, which equals the Frobenius pairing only in
-     orthonormal coordinates; in drop-zz the flat operator is asymmetric
-     and the square root would be silently wrong.
-  1. Real-space slip covariance: samples of M^(r)^{1/2} dW converge to the
-     dense M^(r)_grand probed from the matrix-free operator.
-  2. Wave-space noise: (a) the gathered field is real (Hermitian conjugacy
-     of the random Fourier modes -- the single most common split-sampler
-     bug); (b) covariance converges to the dense M^(w)_grand.
-  3. Combined slip covariance converges to (2 kT / dt) * M_grand.
-  4. (slow) Two-particle Boltzmann distribution under a harmonic spring with
-     the midpoint integrator (noise/drift consistency at ~1% mean / ~4% var
-     precision; see the in-test power notes -- the isolated pair has no
-     power against the drift omission specifically).
-  5a. (slow) Non-interacting suspension: midpoint S(q) = 1 at low q while
-     Euler-Maruyama shows the documented low-q suppression (3.5 sigma
-     separation) -- the decisive falsifiable test of the many-body thermal
-     drift, including its wave-space part.
-  7. (slow) Large-dt weak consistency: no resolvable stationary bias at
-     dt = 0.1 (k mu dt ~ 0.2/step); the O(dt) coefficient is below
-     resolution, so a scaling exponent is not extractable (power note in
-     the test).
-  8. Regression: all earlier modes unchanged; API gating.
+  * Flat 11-component orthonormal layout: round trip, and the dense flat
+    grand operator is symmetric.  Lanczos assumes the Euclidean inner
+    product, which equals the Frobenius pairing only in orthonormal
+    coordinates; in drop-zz the flat operator is asymmetric and the square
+    root would be incorrect.
+  * Real-space slip covariance: samples of M^(r)^{1/2} dW converge to the
+    dense M^(r)_grand probed from the matrix-free operator.
+  * Wave-space noise: (a) the gathered field is real (Hermitian conjugacy
+    of the random Fourier modes -- the single most common split-sampler
+    bug); (b) covariance converges to the dense M^(w)_grand.
+  * Combined slip covariance converges to (2 kT / dt) * M_grand.
+  * (slow) Two-particle Boltzmann distribution under a harmonic spring with
+    the midpoint integrator (noise/drift consistency at ~1% mean / ~4% var
+    precision; see the in-test power notes -- the isolated pair has no
+    power against the drift omission specifically).
+  * (slow) Non-interacting suspension: midpoint S(q) = 1 at low q while
+    Euler-Maruyama shows the documented low-q suppression (3.5 sigma
+    separation) -- a falsifiable test of the many-body thermal drift,
+    including its wave-space part.
+  * (slow) Large-dt weak consistency: no resolvable stationary bias at
+    dt = 0.1 (k mu dt ~ 0.2/step); the O(dt) coefficient is below
+    resolution, so a scaling exponent is not extractable (power note in
+    the test).
+  * Regression: all earlier modes unchanged; API validation.
 """
 
 import sys
@@ -114,7 +112,7 @@ def _test_positions(n=4, length=8.0, a=0.4, seed=7):
 
 
 # -----------------------------------------------------------------------------
-# Gate 0: flat orthonormal layout
+# Flat orthonormal layout
 # -----------------------------------------------------------------------------
 def test_flat_layout_round_trip():
   rng = np.random.default_rng(3)
@@ -164,7 +162,7 @@ def test_flat_grand_operator_is_symmetric():
 
 
 # -----------------------------------------------------------------------------
-# Gate 1: real-space slip sampler
+# Real-space slip sampler
 # -----------------------------------------------------------------------------
 _A = 0.4
 _XI = 0.75
@@ -226,7 +224,7 @@ def _run_real_slip_covariance(n_samples, iters, tol, k_sigma=3.0):
   reference = rtu._grand_dense_from_matvec(
       lambda F, C: mr_grand_matvec(real_state, positions, F, C), 4)
   # PSD of the real-space split (Lanczos clips negative Ritz values, which
-  # would silently bias the covariance if the split were indefinite).
+  # would bias the covariance if the split were indefinite).
   eigs = np.linalg.eigvalsh(0.5 * (reference + reference.T))
   psd_tol = 1e-10 if jax.config.jax_enable_x64 else 1e-3
   assert eigs.min() > -psd_tol * max(eigs.max(), 1e-15)
@@ -262,7 +260,7 @@ def test_real_slip_covariance_rigorous():
 
 
 # -----------------------------------------------------------------------------
-# Gate 2: wave-space noise (conjugacy + covariance)
+# Wave-space noise (conjugacy + covariance)
 # -----------------------------------------------------------------------------
 _MGRID = 10
 _PSUP = 5
@@ -276,7 +274,7 @@ def _grand_wave_state(length):
 def test_wave_noise_hermitian_conjugacy():
   """The random Fourier field must be Hermitian so its IFFT is real.
 
-  ``ifft_vec`` silently discards the imaginary part, so a broken mirroring
+  ``ifft_vec`` discards the imaginary part, so a broken mirroring
   (wrong half-space, mistreated self-conjugate/Nyquist modes) corrupts the
   covariance without any visible failure -- this test probes the complex
   IFFT *before* the .real truncation.
@@ -345,7 +343,7 @@ def test_wave_slip_covariance_rigorous():
 
 
 # -----------------------------------------------------------------------------
-# Gate 3: combined unconstrained slip covariance
+# Combined unconstrained slip covariance
 # -----------------------------------------------------------------------------
 def _run_combined_slip_covariance(n_samples, kT, dt, k_sigma=3.0):
   length = 8.0
@@ -395,7 +393,7 @@ def test_combined_slip_covariance_rigorous():
 
 
 # -----------------------------------------------------------------------------
-# Gate 8: stepper wiring, API gating, regression
+# Stepper wiring, API validation, regression
 # -----------------------------------------------------------------------------
 def _constrained_builder(positions, length, **extra):
   box = _box(length)
@@ -450,8 +448,9 @@ def test_step_determinism_replay():
 
 def test_em_and_midpoint_differ_with_noise():
   """EM and midpoint must produce different trajectories at kT > 0 with the
-  same key (collapsing the midpoint to EM loses the thermal drift; gate 4
-  is the physical check, this is the cheap structural one)."""
+  same key (collapsing the midpoint to EM loses the thermal drift; the
+  two-particle Boltzmann test is the physical check, this is the cheap
+  structural one)."""
   length = 8.0
   positions = _test_positions(n=4, length=length)
   _, apply_fn = _constrained_builder(positions, length)
@@ -511,7 +510,7 @@ def test_api_gating():
 
 
 # -----------------------------------------------------------------------------
-# Gate 4: two-particle Boltzmann distribution (slow)
+# Two-particle Boltzmann distribution (slow)
 # -----------------------------------------------------------------------------
 def _spring_system(*, kT, dt, integrator, k_spring=10.0, r0=1.2, length=6.0,
                    a=0.5):
@@ -573,17 +572,17 @@ def _blocked_se(samples, n_blocks=30):
 
 @pytest.mark.slow
 def test_two_particle_boltzmann_midpoint():
-  """Boltzmann gate (paper Fig. 3 analogue): the midpoint integrator must
+  """Boltzmann test (paper Fig. 3 analogue): the midpoint integrator must
   sample the analytic equilibrium distribution of a harmonic pair.
 
-  Power note (calibrated 2026-06-12): at these parameters the gate resolves
+  Power note (calibrated 2026-06-12): at these parameters the test resolves
   the mean to ~1% and the variance to ~4% (5 sigma); a mis-scaled slip
   (e.g. a sqrt(2) covariance error) fails at >50 sigma.  It has *no* power
   against the drift omission specifically: an Euler-Maruyama control run at
   the same budget was statistically indistinguishable from Boltzmann (the
   isolated-pair constrained-mobility divergence is tiny at r ~ 2.5a, err
   0.003 +- 0.0034 in the variance), and so was EM at dt up to 0.1.  The
-  falsifiable drift detection lives in the many-body structure-factor gate
+  falsifiable drift detection lives in the many-body structure-factor test
   (test_ideal_suspension_structure_factor_midpoint_vs_em, EM separated at
   3.5 sigma) and in the structural test_em_and_midpoint_differ_with_noise.
   """
@@ -607,7 +606,7 @@ def test_two_particle_boltzmann_midpoint():
 
 
 # -----------------------------------------------------------------------------
-# Gate 7: large-dt weak consistency (slow)
+# Large-dt weak consistency (slow)
 # -----------------------------------------------------------------------------
 @pytest.mark.slow
 def test_large_dt_midpoint_consistency():
@@ -619,7 +618,7 @@ def test_large_dt_midpoint_consistency():
   for this observable is below resolution even at dt = 0.1 (mean err
   0.0036 +- 0.0049, var err 0.0017 +- 0.0010), so a first-order *scaling
   exponent* cannot be honestly extracted at any feasible budget -- this
-  gate instead pins the absence of resolvable bias at 50x the production
+  test instead pins the absence of resolvable bias at 50x the production
   step.  A drift or noise error of relative size O(k mu dt) = 0.2 would
   fail at >40 sigma.
   """
@@ -643,7 +642,7 @@ def test_large_dt_midpoint_consistency():
 
 
 # -----------------------------------------------------------------------------
-# Gate 5a: non-interacting suspension S(q) = 1, midpoint vs EM (slow)
+# Non-interacting suspension S(q) = 1, midpoint vs EM (slow)
 # -----------------------------------------------------------------------------
 def _structure_factor_low_q(positions_frac_batch):
   """S(q) averaged over the lowest three q shells (|n|^2 = 1, 2, 3).
@@ -670,7 +669,7 @@ def _structure_factor_low_q(positions_frac_batch):
 def _run_ideal_suspension(integrator, *, n, phi, kT, dt, n_steps, seed,
                           replicas):
   from jax_md.hydro.rpy_brownian_constrained import run_brownian_chunked
-  # Accuracy note: this gate tests FDT *consistency* (noise/drift matched to
+  # Accuracy note: this test checks FDT *consistency* (noise/drift matched to
   # whatever splitting M is implemented), which holds at any Ewald
   # parameters -- so the split is deliberately cheap/loose to buy physical
   # time per wall-clock second.  The small box (n = 16, L ~ 6.9a) makes the
@@ -709,7 +708,7 @@ def test_ideal_suspension_structure_factor_midpoint_vs_em():
   must keep S(q) = 1 at low q.  Euler-Maruyama omits the many-body thermal
   drift k_B T div R_FU^{-1} -- an O(1) error in the Fokker-Planck equation
   -- and drives the low-q structure away from 1 (paper Figs. 4-5).  This is
-  the only in-budget gate sensitive to the *wave-space* (collective) part
+  the only in-budget test sensitive to the *wave-space* (collective) part
   of the drift.
   """
   common = dict(n=16, phi=0.2, kT=1.0, dt=0.15, n_steps=4000, seed=70,
@@ -729,7 +728,7 @@ def test_ideal_suspension_structure_factor_midpoint_vs_em():
   # (ii) EM shows the documented low-q suppression (one-sided)...
   assert sq_em < 1.0 - 3.0 * se_em, (
       f'EM S(q->0) = {sq_em:.3f} +- {se_em:.3f} is not suppressed below 1 '
-      f'-- the gate has no power to detect the omitted drift.')
+      f'-- the test has no power to detect the omitted drift.')
   # (iii) ...and is cleanly separated from the midpoint result.
   assert sq_mid - sq_em > 2.5 * se_diff, (
       f'midpoint {sq_mid:.3f} vs EM {sq_em:.3f} not separated '

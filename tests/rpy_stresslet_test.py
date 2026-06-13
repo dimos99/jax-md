@@ -1,6 +1,6 @@
-"""Validation gates for the Phase-1 grand mobility (force + couplet).
+"""Validation tests for the grand mobility (force + couplet).
 
-The stresslet extension is gated by external pins, not internal
+The stresslet extension is validated against external pins, not internal
 self-consistency alone:
 
   * Scalar radial functions: golden values from the FSD reference code
@@ -14,16 +14,16 @@ self-consistency alone:
     (``_mw_bruteforce_grand``), drop-zz packing against a full 9-component
     pipeline including the post-NUFFT grid-traceless property, and
     spread/gather adjointness at 11 moment channels.
-  * Ewald split: per-block xi-invariance of the total grand mobility (the
-    decisive transcription-error detector), symmetry + positive
+  * Ewald split: per-block xi-invariance of the total grand mobility (a
+    sensitive transcription-error detector), symmetry + positive
     semi-definiteness in Frobenius-orthonormal moment coordinates, Dense vs
     OrderedSparse parity (including self-image terms when rcut exceeds the
     box), the DC r -> 0 fallback limit, and the live-box shear path.
-  * Regression: ``use_stresslet=False`` must reproduce the legacy operator
-    bit-for-bit, and the grand operator at C = 0 must reproduce legacy
+  * Regression: ``use_stresslet=False`` must reproduce the force-only operator
+    bit-for-bit, and the grand operator at C = 0 must reproduce the force-only
     velocities.
 
-Long-running gates are marked ``slow`` (deselected by default; run with
+Long-running tests are marked ``slow`` (deselected by default; run with
 ``pytest -m slow``).  Tolerances adapt to ``jax_enable_x64``; the scalar
 cancellation tests are skipped in float32 where the skeleton loses too many
 digits by construction.
@@ -553,7 +553,7 @@ def test_ordered_sparse_self_image_contributions():
 
   OrderedSparse drops (i, i) edges, which Dense uses to pick up self-image
   contributions whenever rcut exceeds the box; the grand lattice core adds
-  them explicitly (the legacy UF-only core does not, so this guards the new
+  them explicitly (the force-only UF core does not, so this guards the new
   path only).  Opposite images cancel for the odd UC/DF blocks, so a missing
   self-image pass shows up only in UF/DC.
   """
@@ -625,9 +625,9 @@ def test_antisymmetric_couplet_reproduces_rotlet():
   ``C = -(1/2) eps . T`` in our convention (``f_m = -C_mn d_n delta``), and
   drives the far-field rotlet flow ``U = (T x r) / (8 pi eta r^3)``.
 
-  This is the only gate with *external* ground truth for the couplet index
+  This is the only test with *external* ground truth for the couplet index
   convention: symmetry and xi-invariance hold under either index choice, and
-  a wrong choice would silently break the Phase-2 constraint solve.  Together
+  a wrong choice would break the stresslet-constraint solve.  Together
   with ``test_real_space_pair_tensors_match_quadrature_reference`` (operator
   == quadrature tensors at machine precision) this pins the operator itself.
   """

@@ -1,25 +1,24 @@
-"""Validation gates for the Phase-2 stresslet-constrained mobility.
+"""Validation tests for the stresslet-constrained mobility (Fiore & Swan 2018).
 
-Gates (in increasing stringency; spec Part E):
+In increasing stringency:
 
-  A. Decomposition round-trips ``C <-> (S, L)`` / ``D <-> (E, Omega)`` to
-     machine precision, and the torque embed matches the rotlet-pinned
-     convention ``C = -(1/2) eps . L`` from ``rpy_stresslet_test.py``.
-  1. Constraint residual: the solved stresslet, fed back through the
-     *unconstrained* Phase-1 grand operator together with the forces, must
-     produce vanishing rate of strain E = 0 (this catches embed/extract
-     basis mismatches end to end).
-  2. M_ES probed densely in orthonormal coordinates is symmetric PSD,
-     including a configuration with an overlapping pair.
-  3. Dense cross-check: matrix-free constrained velocities match the dense
-     Schur complement R_FU^{-1} = M_UF - M_US M_ES^{-1} M_EF formed from
-     the probed 11N x 11N grand matrix (with and without applied torques).
-  5. Regression: the unconstrained paths are bit-identical with the new
-     builder kwargs at their defaults.
-  6. xi-invariance of the constrained velocities (composes Phase-1
-     invariance with a correct solve).
+  * Decomposition round-trips ``C <-> (S, L)`` / ``D <-> (E, Omega)`` to
+    machine precision, and the torque embed matches the rotlet-pinned
+    convention ``C = -(1/2) eps . L`` from ``rpy_stresslet_test.py``.
+  * Constraint residual: the solved stresslet, fed back through the
+    *unconstrained* grand operator together with the forces, must produce
+    vanishing rate of strain E = 0 (catches embed/extract basis mismatches
+    end to end).
+  * M_ES probed densely in orthonormal coordinates is symmetric PSD,
+    including a configuration with an overlapping pair.
+  * Dense cross-check: matrix-free constrained velocities match the dense
+    Schur complement R_FU^{-1} = M_UF - M_US M_ES^{-1} M_EF formed from the
+    probed 11N x 11N grand matrix (with and without applied torques).
+  * Regression: the unconstrained paths are bit-identical with the new
+    builder kwargs at their defaults.
+  * xi-invariance of the constrained velocities.
 
-Gate 4 (slow): short-time translational self-diffusivity D^s(phi) must
+A slow test checks short-time translational self-diffusivity D^s(phi): it must
 decrease with volume fraction -- bare RPY is phi-independent, so the decrease
 is the signature of a working constraint -- and match digitized values from
 Fiore & Swan 2018 Fig. 7 to +-0.05.
@@ -123,7 +122,7 @@ def _dense_blocks(M, n_particles):
 
 
 # -----------------------------------------------------------------------------
-# Gate A: decomposition maps
+# Moment decomposition maps
 # -----------------------------------------------------------------------------
 def test_decomposition_round_trip():
   rng = np.random.default_rng(0)
@@ -176,7 +175,7 @@ def test_torque_channel_matches_rotlet_embed():
 
 
 def test_embed_extract_match_fsd_kernels():
-  """Pin the Phase-2 embed/extract maps against the FSD reference source.
+  """Pin the embed/extract maps against the FSD reference source.
 
   Mechanical transcription of Fiore's FSD ``Helper_Mobility.cu``:
   ``Mobility_TS2C_kernel`` (torque/stresslet -> couplet, including the
@@ -188,7 +187,7 @@ def test_embed_extract_match_fsd_kernels():
   resistance set to zero, FSD's saddle-point system (``Saddle.cu``,
   ``Saddle_Multiply``) eliminates to exactly the far-field Schur complement
   R_FU^{-1} = M_UF - M_US M_ES^{-1} M_EF solved here, and the underlying
-  M^ff kernels were matched to ~2e-15 by the Phase-1 gates.
+  M^ff kernels were matched to ~2e-15 by the grand-mobility tests.
   """
   rng = np.random.default_rng(20)
   for _ in range(4):
@@ -228,7 +227,7 @@ def test_embed_extract_match_fsd_kernels():
 
 
 # -----------------------------------------------------------------------------
-# Gate 1: constraint residual / E = 0 feedback through the grand operator
+# Constraint residual / E = 0 feedback through the grand operator
 # -----------------------------------------------------------------------------
 def test_constraint_residual_and_zero_strain():
   box = _box(10.0)
@@ -256,8 +255,36 @@ def test_constraint_residual_and_zero_strain():
   assert float(jnp.max(jnp.abs(jnp.trace(S, axis1=-2, axis2=-1)))) < 1e-6
 
 
+def test_return_residual_reports_solver_convergence():
+  """``return_residual=True`` exposes the post-solve relative residual.
+
+  The diagnostic must be present, finite, and consistent with the requested
+  GMRES tolerance after the solve has converged.
+  """
+  box = _box(10.0)
+  positions = rtu._nonoverlap_positions(4, np.asarray(box), a=0.4, seed=5)
+  rng = np.random.default_rng(7)
+  forces = jnp.asarray(rng.normal(size=(4, 3)), dtype=_dtype())
+
+  solve_tol = 1e-8 if jax.config.jax_enable_x64 else 1e-5
+  grand_mv = _grand_matvec_for(positions, box)
+  solve_fn = make_constrained_solver(
+      grand_mv, solve_tol=solve_tol, solve_maxiter=50, return_residual=True)
+  _, _, _, info = solve_fn(forces)
+
+  assert 'solve_rel_residual' in info
+  residual = float(info['solve_rel_residual'])
+  assert np.isfinite(residual)
+  assert residual < max(10 * solve_tol, 1e-4)
+
+  # Default (off) carries no residual key.
+  solve_off = make_constrained_solver(
+      grand_mv, solve_tol=solve_tol, solve_maxiter=50)
+  assert 'solve_rel_residual' not in solve_off(forces)[3]
+
+
 # -----------------------------------------------------------------------------
-# Gate 2: M_ES symmetry / PSD in orthonormal coordinates
+# M_ES symmetry / PSD in orthonormal coordinates
 # -----------------------------------------------------------------------------
 @pytest.mark.parametrize('config', ['nonoverlap', 'overlap'])
 def test_m_es_symmetry_psd_dense(config):
@@ -286,7 +313,7 @@ def test_m_es_symmetry_psd_dense(config):
 
 
 # -----------------------------------------------------------------------------
-# Gate 3: dense cross-check of R_FU^{-1}
+# Dense cross-check of R_FU^{-1}
 # -----------------------------------------------------------------------------
 def test_constrained_vs_dense_resistance_inverse():
   box = _box(10.0)
@@ -330,7 +357,7 @@ def test_constrained_with_torque_vs_dense():
   dense = rtu._grand_dense_from_matvec(grand_mv, n)
 
   # Dense reference, run through the *same* embed/extract maps (which are
-  # independently pinned by the round-trip and rotlet gates): build the 11N
+  # independently pinned by the round-trip and rotlet tests): build the 11N
   # input vector from (F, L), solve the sym-block constraint, assemble.
   basis = np.asarray(traceless_orthonormal_basis(), dtype=np.float64)
   C_applied = np.asarray(torque_to_couplet(torques), dtype=np.float64)
@@ -364,7 +391,7 @@ def test_constrained_with_torque_vs_dense():
 
 
 # -----------------------------------------------------------------------------
-# Gate 5: regression -- unconstrained paths unchanged
+# Regression -- unconstrained paths unchanged
 # -----------------------------------------------------------------------------
 def test_unconstrained_regression_bit_identical():
   box = _box(10.0)
@@ -373,7 +400,7 @@ def test_unconstrained_regression_bit_identical():
   forces = jnp.asarray(rng.normal(size=(4, 3)), dtype=_dtype())
   couplets = traceless(jnp.asarray(rng.normal(size=(4, 3, 3)), dtype=_dtype()))
 
-  # Legacy RPY path with explicit constrained=False vs default kwargs.
+  # Unconstrained RPY path with explicit constrained=False vs default kwargs.
   state_a, apply_a = _build_operator(positions, box)
   state_b, apply_b = _build_operator(positions, box, constrained=False)
   U_a, _ = apply_a(state_a, positions, forces)
@@ -445,7 +472,7 @@ def test_warm_start_and_jit():
 
 
 # -----------------------------------------------------------------------------
-# Gate 6: xi-invariance of the constrained mobility
+# xi-invariance of the constrained mobility
 # -----------------------------------------------------------------------------
 @pytest.mark.slow
 def test_constrained_xi_invariance():
@@ -507,7 +534,7 @@ def test_shear_constrained_gamma_zero_matches_static():
 
 
 # -----------------------------------------------------------------------------
-# Gate 4: short-time self-diffusivity vs Fiore & Swan 2018 Fig. 7
+# Short-time self-diffusivity vs Fiore & Swan 2018 Fig. 7
 # -----------------------------------------------------------------------------
 # Digitized from Fiore & Swan, J. Chem. Phys. 148, 044114 (2018), Fig. 7
 # (translational short-time self-diffusivity of the stresslet-constrained
