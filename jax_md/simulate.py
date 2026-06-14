@@ -2018,6 +2018,497 @@ def rpy_with_shear(space_fns: Tuple[Callable, ...],
   return init_fn, apply_fn
 
 
+# -----------------------------------------------------------------------------
+# Stresslet-constrained RPY Brownian dynamics (Fiore & Swan 2018)
+# -----------------------------------------------------------------------------
+@dataclasses.dataclass
+class ConstrainedRPYState:
+  """State for free stresslet-constrained RPY Brownian dynamics.
+
+  `brownian_state` is the constrained midpoint stepper's own state
+  (`hydro.rpy_brownian_constrained.ConstrainedBrownianState`): fractional
+  positions, mobility state, the warm-start stresslet `(N, 5)`, the PRNG key,
+  and an integer step counter. `real_position` stores the Cartesian trajectory
+  representation; `time = t0 + step * dt`.
+  """
+  real_position: Array
+  brownian_state: Any
+  time: float
+
+
+@dataclasses.dataclass
+class ShearedConstrainedRPYState:
+  """State for stresslet-constrained RPY Brownian dynamics under shear.
+
+  Mirrors `ConstrainedRPYState`; the Lees-Edwards remap of the fractional
+  positions is applied to `brownian_state.positions` each step before the
+  constrained stepper advances them.
+  """
+  real_position: Array
+  brownian_state: Any
+  time: float
+
+
+def _resolve_box_matrix_for_params(space_fns: Tuple[Callable, ...],
+                                   t0: float) -> Tuple[Array, int]:
+  """Best-effort physical box matrix (and spatial dim) for `estimate_rpy_params`.
+
+  For a sheared space (`(displacement, shift, box_of)`) the box is read from
+  `box_of(t=t0)`. For a free `space.periodic_general` space the box matrix is
+  recovered from the `box` free variable captured in the displacement closure.
+  Raises if it cannot be inferred, so the caller can ask for explicit params.
+  """
+  displacement_fn = space_fns[0]
+  box_fn = space_fns[2] if len(space_fns) > 2 else None
+  if box_fn is not None:
+    box = jnp.asarray(box_fn(t=float(t0)))
+    return box, int(box.shape[0])
+
+  closure = getattr(displacement_fn, '__closure__', None) or ()
+  freevars = getattr(getattr(displacement_fn, '__code__', None),
+                     'co_freevars', ()) or ()
+  for name, cell in zip(freevars, closure):
+    if name not in ('box', '_box'):
+      continue
+    arr = jnp.asarray(cell.cell_contents)
+    if arr.ndim == 2 and arr.shape[0] == arr.shape[1]:
+      return arr, int(arr.shape[0])
+    if arr.ndim == 1:
+      return jnp.diag(arr), int(arr.shape[0])
+    break
+  raise ValueError(
+      "Could not infer a box matrix for automatic Ewald-parameter estimation. "
+      "Pass xi (and, if desired, rcut/P/Mgrid/theta/lattice_extent) explicitly, "
+      "or use a space built from a (spatial_dim, spatial_dim) box matrix.")
+
+
+def _resolve_constrained_ewald_params(
+    *,
+    space_fns: Tuple[Callable, ...],
+    a: float,
+    t0: float,
+    xi: Optional[float],
+    rcut: Optional[float],
+    P: Optional[int],
+    Mgrid: Optional[int],
+    theta: Optional[float],
+    lattice_extent: Optional[int],
+    tol: Optional[float],
+    n_particles: Optional[int],
+    phi: Optional[float],
+    shear_vector_schedule: Optional[Callable[[Array], Sequence[Array]]] = None,
+    shear_t_bounds: Optional[Tuple[float, float]] = None,
+    shear_remap: bool = False,
+) -> Tuple[float, Optional[float], Optional[int], Optional[int],
+           Optional[float], Optional[int]]:
+  """Fill any unset Ewald parameters from `estimate_rpy_params`.
+
+  When `tol` is set and at least one of `{xi, rcut, P, Mgrid, theta,
+  lattice_extent}` is `None`, the Fiore (2017) estimator is run and fills the
+  unset parameters; explicitly supplied values are always preserved (an
+  explicit `xi` is forwarded as `xi_override`). With `tol=None` the caller is
+  fully explicit: parameters pass through unchanged, but then `xi` is required.
+  """
+  unset = any(p is None
+              for p in (xi, rcut, P, Mgrid, theta, lattice_extent))
+  if not unset:
+    return xi, rcut, P, Mgrid, theta, lattice_extent
+  if tol is None:
+    if xi is None:
+      raise ValueError(
+          "Automatic Ewald-parameter estimation needs a tolerance: pass xi=... "
+          "explicitly, or tol=... so xi/rcut/P/Mgrid/theta can be estimated.")
+    return xi, rcut, P, Mgrid, theta, lattice_extent
+
+  box, dim = _resolve_box_matrix_for_params(space_fns, t0)
+  N = int(n_particles) if n_particles is not None else 1
+  if phi is not None:
+    phi_val = float(phi)
+  elif n_particles is not None:
+    volume = float(jnp.abs(jnp.linalg.det(box)))
+    phi_val = N * (4.0 / 3.0) * float(np.pi) * float(a) ** 3 / volume
+  else:
+    # Underspecified: xi falls back to the xi*a ~= 0.5 heuristic (Fiore Table I).
+    phi_val = 0.0
+
+  est = hydro_rpy.estimate_rpy_params(
+      tol=float(tol),
+      A=box,
+      a=float(a),
+      N=N,
+      phi=phi_val,
+      xi_override=None if xi is None else float(xi),
+      shear_vector_schedule=shear_vector_schedule,
+      shear_t_bounds=shear_t_bounds,
+      shear_remap=shear_remap,
+  )
+  return (
+      xi if xi is not None else float(est.xi),
+      rcut if rcut is not None else float(est.rcut),
+      P if P is not None else int(est.P),
+      Mgrid if Mgrid is not None else int(est.M),
+      theta if theta is not None else float(est.theta),
+      lattice_extent if lattice_extent is not None else int(est.lattice_extent),
+  )
+
+
+def _build_constrained_brownian_stepper(
+    *,
+    space_fns: Tuple[Callable, ...],
+    a: float,
+    xi: float,
+    eta: float,
+    kT: float,
+    dt: float,
+    force_fn: Optional[Callable[..., Array]],
+    integrator: str,
+    torque_fn: Optional[Callable[..., Array]],
+    with_torque: bool,
+    mr_iters: int,
+    lanczos_tol: float,
+    solve_tol: float,
+    solve_maxiter: int,
+    return_residual: bool,
+    rcut: Optional[float],
+    P: Optional[int],
+    Mgrid: Optional[int],
+    Mx: Optional[int],
+    My: Optional[int],
+    Mz: Optional[int],
+    theta: Optional[float],
+    fractional_coordinates: bool,
+    dr_threshold: Optional[float],
+    capacity_multiplier: float,
+    disable_cell_list: bool,
+    neighbor_format,
+    extra_capacity: int,
+    lattice_extent: Optional[int],
+    lattice_extra: float,
+    box_jump_threshold: Optional[float],
+    real_space_mode: str,
+    real_space_first: bool,
+) -> Tuple[Callable, Callable]:
+  """Build the constrained Brownian `(brownian_init_fn, step_fn)` pair.
+
+  Wraps `build_rpy_mobility(..., use_stresslet=True, constrained=True)` and its
+  `apply_fn.make_brownian_step` so the integrators below share one construction
+  path (mirrors `_build_rpy_operator_with_brownian` for the unconstrained case).
+  """
+  _, apply_fn = hydro_rpy.build_rpy_mobility(
+      space_fns,
+      a,
+      xi,
+      eta,
+      rcut=rcut,
+      P=P,
+      Mgrid=Mgrid,
+      Mx=Mx,
+      My=My,
+      Mz=Mz,
+      theta=theta,
+      include_brownian=True,
+      fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold,
+      capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list,
+      neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity,
+      lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra,
+      box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode,
+      real_space_first=real_space_first,
+      use_stresslet=True,
+      constrained=True,
+      solve_tol=solve_tol,
+      solve_maxiter=solve_maxiter,
+      with_torque=with_torque,
+  )
+  make_brownian_step = getattr(apply_fn, 'make_brownian_step', None)
+  if make_brownian_step is None:
+    raise ValueError(
+        "build_rpy_mobility did not provide make_brownian_step; the "
+        "constrained RPY wrappers require constrained Brownian support.")
+  return make_brownian_step(
+      force_fn,
+      kT=kT,
+      dt=dt,
+      integrator=integrator,
+      torque_fn=torque_fn,
+      mr_iters=mr_iters,
+      lanczos_tol=lanczos_tol,
+      return_residual=return_residual,
+  )
+
+
+def _constrained_real_position(brownian_state, fractional_coordinates: bool):
+  """Cartesian positions from a constrained-stepper state."""
+  if fractional_coordinates:
+    box_matrix = brownian_state.rpy_state.real.box_matrix
+    return space.transform(box_matrix, brownian_state.positions)
+  return brownian_state.positions
+
+
+def constrained_rpy(space_fns: Tuple[Callable, ...],
+                    energy_or_force: Callable[..., Array],
+                    dt: float,
+                    kT: float,
+                    *,
+                    a: float,
+                    eta: float,
+                    xi: Optional[float] = None,
+                    tol: Optional[float] = 1e-3,
+                    n_particles: Optional[int] = None,
+                    phi: Optional[float] = None,
+                    t0: float = 0.0,
+                    integrator: str = 'midpoint',
+                    with_torque: bool = False,
+                    torque_fn: Optional[Callable[..., Array]] = None,
+                    fractional_coordinates: bool = True,
+                    rcut: Optional[float] = None,
+                    P: Optional[int] = None,
+                    Mgrid: Optional[int] = None,
+                    Mx: Optional[int] = None,
+                    My: Optional[int] = None,
+                    Mz: Optional[int] = None,
+                    theta: Optional[float] = None,
+                    dr_threshold: Optional[float] = None,
+                    capacity_multiplier: float = 1.25,
+                    disable_cell_list: bool = False,
+                    neighbor_format=partition.NeighborListFormat.OrderedSparse,
+                    extra_capacity: int = 0,
+                    lattice_extent: Optional[int] = None,
+                    lattice_extra: float = 0.0,
+                    box_jump_threshold: Optional[float] = None,
+                    real_space_mode: str = 'auto',
+                    real_space_first: bool = True,
+                    mr_iters: int = 50,
+                    lanczos_tol: float = 1e-3,
+                    solve_tol: float = 1e-3,
+                    solve_maxiter: int = 50,
+                    return_residual: bool = False) -> Simulator:
+  """Stresslet-constrained RPY Brownian dynamics (free, unsheared).
+
+  Free-diffusion counterpart of `constrained_rpy_with_shear`: rigid spheres
+  evolve under the stresslet-constrained mobility `R_FU^{-1}` with the Fiore &
+  Swan (2018) midpoint SDAE integrator. `energy_or_force` supplies the
+  conservative interactions; pass `with_torque=True` (and optionally a
+  `torque_fn`) to also evolve orientations under applied torques.
+
+  The Ewald splitting `xi` and the grid parameters can be supplied explicitly,
+  or left unset. If `xi is None`, the Fiore (2017) estimator
+  (`hydro.estimate_rpy_params`) is run at the requested `tol` and fills `xi`
+  plus any of `rcut`/`P`/`Mgrid`/`theta`/`lattice_extent` that are still `None`
+  (explicit values are kept). Pass `n_particles` (and optionally `phi`) to use
+  the cost-optimal `xi`; otherwise `xi` defaults to the `xi*a ~= 0.5` heuristic.
+
+  Returns `(init_fn, apply_fn)`. `apply_fn(state)` advances one step; per-step
+  solver/sampler diagnostics are not surfaced here (use
+  `apply_fn.make_brownian_step` directly for the `info` dict). Neighbor-list
+  overflow is observable at
+  `state.brownian_state.rpy_state.real.neighbors.did_buffer_overflow`.
+  """
+  if len(space_fns) < 2:
+    raise ValueError("space_fns must contain displacement and shift functions.")
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  _dt = f32(dt)
+  t0 = f32(t0)
+
+  xi, rcut, P, Mgrid, theta, lattice_extent = _resolve_constrained_ewald_params(
+      space_fns=space_fns, a=a, t0=float(t0), xi=xi, rcut=rcut, P=P,
+      Mgrid=Mgrid, theta=theta, lattice_extent=lattice_extent, tol=tol,
+      n_particles=n_particles, phi=phi)
+
+  brownian_init_fn, step_fn = _build_constrained_brownian_stepper(
+      space_fns=space_fns, a=a, xi=xi, eta=eta, kT=kT, dt=dt,
+      force_fn=force_fn, integrator=integrator, torque_fn=torque_fn,
+      with_torque=with_torque, mr_iters=mr_iters, lanczos_tol=lanczos_tol,
+      solve_tol=solve_tol, solve_maxiter=solve_maxiter,
+      return_residual=return_residual, rcut=rcut, P=P, Mgrid=Mgrid, Mx=Mx,
+      My=My, Mz=Mz, theta=theta, fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold, capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list, neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity, lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra, box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode, real_space_first=real_space_first)
+
+  def init_fn(key, R, **kwargs):
+    inner = brownian_init_fn(jnp.asarray(R), key, **kwargs)
+    real_position = _constrained_real_position(inner, fractional_coordinates)
+    return ConstrainedRPYState(real_position=real_position,
+                               brownian_state=inner,
+                               time=t0)
+
+  def apply_fn(state, **kwargs):
+    next_inner, _ = step_fn(state.brownian_state, **kwargs)
+    real_position = _constrained_real_position(next_inner,
+                                               fractional_coordinates)
+    time_next = t0 + _dt * next_inner.step.astype(_dt.dtype)
+    return ConstrainedRPYState(real_position=real_position,
+                               brownian_state=next_inner,
+                               time=time_next)
+
+  return init_fn, apply_fn
+
+
+def constrained_rpy_with_shear(
+    space_fns: Tuple[Callable, ...],
+    energy_or_force: Callable[..., Array],
+    dt: float,
+    kT: float,
+    *,
+    a: float,
+    eta: float,
+    shear_vector_schedule: Optional[Callable[[Array], Sequence[Array]]],
+    xi: Optional[float] = None,
+    tol: Optional[float] = 1e-3,
+    n_particles: Optional[int] = None,
+    phi: Optional[float] = None,
+    shear_t_bounds: Optional[Tuple[float, float]] = None,
+    t0: float = 0.0,
+    remap: bool = True,
+    integrator: str = 'midpoint',
+    with_torque: bool = False,
+    torque_fn: Optional[Callable[..., Array]] = None,
+    fractional_coordinates: bool = True,
+    rcut: Optional[float] = None,
+    P: Optional[int] = None,
+    Mgrid: Optional[int] = None,
+    Mx: Optional[int] = None,
+    My: Optional[int] = None,
+    Mz: Optional[int] = None,
+    theta: Optional[float] = None,
+    dr_threshold: Optional[float] = None,
+    capacity_multiplier: float = 1.25,
+    disable_cell_list: bool = False,
+    neighbor_format=partition.NeighborListFormat.OrderedSparse,
+    extra_capacity: int = 0,
+    lattice_extent: Optional[int] = None,
+    lattice_extra: float = 0.0,
+    box_jump_threshold: Optional[float] = None,
+    real_space_mode: str = 'auto',
+    real_space_first: bool = True,
+    mr_iters: int = 50,
+    lanczos_tol: float = 1e-3,
+    solve_tol: float = 1e-3,
+    solve_maxiter: int = 50,
+    return_residual: bool = False) -> Simulator:
+  """Stresslet-constrained RPY Brownian dynamics with the shearing utilities.
+
+  Couples the Fiore & Swan (2018) constrained midpoint SDAE stepper to the
+  Lees-Edwards shear bookkeeping used by `rpy_with_shear`: each step the
+  affine strain from `shear_vector_schedule` is reduced into `[-0.5, 0.5)` and
+  the fractional positions are remapped accordingly, so the strain (and the
+  neighbor-list cell size) stays bounded over arbitrarily long runs.
+
+  `space_fns` must be the 3-tuple `(displacement, shift, box_of)` from
+  `space.shearing`. `shear_vector_schedule(t) -> (gamma_xy, gamma_xz,
+  gamma_yz)`; `None` is zero strain. Runtime time is step-based with
+  `state.time = t0 + step * dt`.
+
+  As in `constrained_rpy`, leaving `xi is None` triggers automatic
+  Ewald-parameter estimation at the requested `tol` (filling any unset
+  `rcut`/`P`/`Mgrid`/`theta`/`lattice_extent`). The shear schedule is passed to
+  the estimator so the quadrature support accounts for the box deformation; with
+  `remap=True` the strain is bounded and `shear_t_bounds` may be omitted.
+
+  Stress diagnostics are not accumulated inside the integrator. The
+  hydrodynamic particle stresslets are available at
+  `state.brownian_state.stresslet` (orthonormal `(N, 5)`; convert with
+  `hydro.stresslet_to_couplet`); derive the inter-particle stress externally
+  with `rheo.make_pairwise_stress_fn`.
+
+  Returns `(init_fn, apply_fn)`; `apply_fn(state)` advances one step.
+  Neighbor-list overflow is observable at
+  `state.brownian_state.rpy_state.real.neighbors.did_buffer_overflow`.
+  """
+  if len(space_fns) < 3:
+    raise ValueError(
+        "constrained_rpy_with_shear expects (displacement, shift, box_of) "
+        "from space.shearing.")
+
+  _, _, box_of = space_fns[:3]
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  _dt = f32(dt)
+  t0 = f32(t0)
+
+  box = box_of(t=t0)
+  dim = box.shape[0]
+
+  sf_xy, sf_xz, sf_yz = _normalize_rpy_shear_vector_schedule(
+      shear_vector_schedule)
+
+  xi, rcut, P, Mgrid, theta, lattice_extent = _resolve_constrained_ewald_params(
+      space_fns=space_fns, a=a, t0=float(t0), xi=xi, rcut=rcut, P=P,
+      Mgrid=Mgrid, theta=theta, lattice_extent=lattice_extent, tol=tol,
+      n_particles=n_particles, phi=phi,
+      shear_vector_schedule=shear_vector_schedule,
+      shear_t_bounds=shear_t_bounds, shear_remap=remap)
+
+  brownian_init_fn, step_fn = _build_constrained_brownian_stepper(
+      space_fns=space_fns, a=a, xi=xi, eta=eta, kT=kT, dt=dt,
+      force_fn=force_fn, integrator=integrator, torque_fn=torque_fn,
+      with_torque=with_torque, mr_iters=mr_iters, lanczos_tol=lanczos_tol,
+      solve_tol=solve_tol, solve_maxiter=solve_maxiter,
+      return_residual=return_residual, rcut=rcut, P=P, Mgrid=Mgrid, Mx=Mx,
+      My=My, Mz=Mz, theta=theta, fractional_coordinates=fractional_coordinates,
+      dr_threshold=dr_threshold, capacity_multiplier=capacity_multiplier,
+      disable_cell_list=disable_cell_list, neighbor_format=neighbor_format,
+      extra_capacity=extra_capacity, lattice_extent=lattice_extent,
+      lattice_extra=lattice_extra, box_jump_threshold=box_jump_threshold,
+      real_space_mode=real_space_mode, real_space_first=real_space_first)
+
+  def init_fn(key, R, **kwargs):
+    shear_kwargs = dict(kwargs)
+    curr_xy, curr_xz, curr_yz = _init_reduced_shear(
+        sf_xy, sf_xz, sf_yz, t0, dim, remap)
+    shear_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
+
+    inner = brownian_init_fn(jnp.asarray(R), key, **shear_kwargs)
+    real_position = _constrained_real_position(inner, fractional_coordinates)
+    return ShearedConstrainedRPYState(real_position=real_position,
+                                      brownian_state=inner,
+                                      time=t0)
+
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    inner = state.brownian_state
+
+    prev_step = jnp.asarray(inner.step, dtype=jnp.int32)
+    next_step = prev_step + jnp.int32(1)
+    time_prev = t0 + _dt * prev_step.astype(_dt.dtype)
+    time_next = t0 + _dt * next_step.astype(_dt.dtype)
+
+    remapped, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
+        inner.positions,
+        sf_xy=sf_xy,
+        sf_xz=sf_xz,
+        sf_yz=sf_yz,
+        time_prev=time_prev,
+        time_next=time_next,
+        dim=dim,
+        remap=remap,
+        fractional_coordinates=fractional_coordinates,
+    )
+    inner = dataclasses.replace(inner, positions=remapped)
+    step_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
+
+    next_inner, _ = step_fn(inner, **step_kwargs)
+
+    current_box = _current_box_from_reduced_shear(
+        box_of, dim, curr_xy, curr_xz, curr_yz)
+    if fractional_coordinates:
+      real_position = space.transform(current_box, next_inner.positions)
+    else:
+      real_position = next_inner.positions
+
+    return ShearedConstrainedRPYState(real_position=real_position,
+                                      brownian_state=next_inner,
+                                      time=time_next)
+
+  return init_fn, apply_fn
+
+
 """Experimental Simulations.
 
 

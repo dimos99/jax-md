@@ -195,6 +195,47 @@ state = brownian_init(positions, jax.random.PRNGKey(0))
 state, info = step(state)   # advance one constrained Brownian step
 ```
 
+### Full simulations (recommended entry point)
+
+For writing simulation *scripts* — a chosen pair potential, time stepping, and
+shear — use the JAX-MD-conventional integrators in `simulate.py`, which wrap the
+stepper above and add the Lees-Edwards shear schedule + fractional remap so the
+strain (and the neighbor-list cell size) stay bounded over long runs:
+
+```python
+from jax_md import energy, simulate, space
+
+displacement, shift, box_of = space.shearing(
+    box, shear_schedule=lambda t: gamma_dot * t,
+    fractional_coordinates=True, remap=True)
+energy_fn = energy.soft_sphere_pair(displacement, sigma=0.6, epsilon=2.0)
+
+init_fn, apply_fn = simulate.constrained_rpy_with_shear(
+    (displacement, shift, box_of), energy_fn, dt=1e-3, kT=1.0,
+    a=0.15, eta=1.0,
+    shear_vector_schedule=lambda t: (gamma_dot * t, 0.0 * t, 0.0 * t),
+    tol=1e-3, n_particles=positions.shape[0])
+
+state = init_fn(jax.random.PRNGKey(0), positions)
+apply_fn = jax.jit(apply_fn)
+for _ in range(n_steps):
+    state = apply_fn(state)
+# Per-particle hydrodynamic stresslets: state.brownian_state.stresslet  (N, 5)
+```
+
+`xi` and the grid (`rcut`/`P`/`Mgrid`/`theta`/`lattice_extent`) are left unset
+here, so the integrator sizes them from `tol` via
+[`estimate_rpy_params`](#stresslet-constrained-mobility-fiore--swan-2018) (pass
+`n_particles`/`phi` for the cost-optimal `xi`). Supply any of them explicitly to
+pin it; pass `xi=...` to fix the splitting and have only the unset grid
+parameters estimated.
+
+Use `simulate.constrained_rpy` (with `space.periodic_general`) for the free,
+unsheared case. Worked end-to-end examples:
+[`examples/shear/shear_constrained_rpy.py`](../../examples/shear/shear_constrained_rpy.py)
+and the notebook
+[`notebooks/constrained_rpy_shear_tutorial.ipynb`](../../notebooks/constrained_rpy_shear_tutorial.ipynb).
+
 ## Implementation Details
 
 ### Coordinate Systems
