@@ -396,9 +396,15 @@ def _compute_xi_candidate(
     xi = float(xi_override)
   else:
     if phi > 0.0 and N > 1 and d_f > 0.0:
-      xi = (3.0 * C_W * math.log(float(N)) /
-            (C_R * float(d_f) * float(n_iter) * float(phi) ** 2)) ** (
-                -1.0 / (float(d_f) + 3.0))
+      # Fiore (2017) Eq. (23) gives the cost-optimal *dimensionless* group
+      # (xi*a)*, since both the real- and wave-space operation counts depend
+      # on lengths only through xi*a (the paper nondimensionalizes lengths by
+      # the radius, i.e. a = 1). Divide by a to recover xi* itself, which
+      # scales as 1/a — consistent with the xi*a -> XI_OPT_A fallback below.
+      xi_a = (3.0 * C_W * math.log(float(N)) /
+              (C_R * float(d_f) * float(n_iter) * float(phi) ** 2)) ** (
+                  -1.0 / (float(d_f) + 3.0))
+      xi = xi_a / float(a)
     else:
       xi = float(XI_OPT_A / a)
   if xi <= 0.0 or not math.isfinite(xi):

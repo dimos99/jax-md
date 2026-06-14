@@ -476,6 +476,53 @@ def test_xi_invariance_and_split_repartition():
   assert mw_var >= 1e-2
 
 
+def test_cost_optimal_xi_scales_as_inverse_radius():
+  """Validate that the cost-optimal xi from Eq. (23) scales as 1/a.
+
+  Fiore (2017) Eq. (22)-(23) balances the real- and wave-space operation
+  counts, both of which depend on lengths only through the dimensionless
+  group xi*a (the paper measures lengths in units of the radius). The
+  cost-optimal solution is therefore a value of (xi*a)*, depending only on
+  (N, phi, d_f, n_iter, C_R, C_W) and *not* on a; the optimal xi itself
+  scales as xi* = (xi*a)*/a.
+
+  Holding (N, phi, d_f, n_iter) fixed and sweeping only the radius a, we
+  assert two falsifiable predictions:
+
+  1. **Invariance of xi*a**: estimate.xi * a is constant across a (rel <= 1e-12).
+     This is the a-independent dimensionless optimum.
+  2. **Non-trivial a-dependence of xi**: estimate.xi itself changes with a
+     (it must, since xi ∝ 1/a). A regression where xi were independent of a
+     (the pre-fix behavior) would leave xi*a proportional to a and fail (1).
+  """
+  box = _box(40.0)
+  N = 4096
+  phi = 0.2
+  radii = [0.25, 0.5, 1.0, 2.0]
+  xi_a_products = []
+  xi_values = []
+  for a in radii:
+    est = rpy.estimate_rpy_params(tol=1e-3, A=box, a=a, N=N, phi=phi)
+    xi_a_products.append(float(est.xi) * a)
+    xi_values.append(float(est.xi))
+    print(f"  a={a:>5}: xi={est.xi:.6f}, xi*a={float(est.xi) * a:.6f}")
+
+  # (1) xi*a is invariant under rescaling a.
+  ref = xi_a_products[0]
+  for a, prod in zip(radii, xi_a_products):
+    rel = abs(prod - ref) / ref
+    assert rel <= 1e-12, f"xi*a not invariant at a={a}: rel={rel:.3e}"
+
+  # (2) xi itself responds to a (guards against the a-independent regression).
+  assert max(xi_values) / min(xi_values) >= 1.5
+
+  # The xi(a)*a product matches the closed-form (xi*a)* from Eq. (23) with
+  # default implementation constants C_R = C_W = 1, n_iter = 10, d_f = 3.
+  expected_xi_a = (3.0 * math.log(float(N)) /
+                   (3.0 * 10.0 * phi ** 2)) ** (-1.0 / 6.0)
+  assert abs(ref - expected_xi_a) / expected_xi_a <= 1e-12
+
+
 def test_min_image_matches_lattice_in_safe_cutoff_regime():
   """Validate that min-image and lattice real-space modes agree in safe-cutoff regime.
 
