@@ -37,11 +37,12 @@ from jax_md.hydro.rpy_wave_det_helpers import (
     make_reciprocal,
     positions_to_fractional,
     q_grid,
-    k_from_q,
+    k_from_q,  # noqa: F401 -- re-exported via rpy_wave
     se_alpha,
     choose_theta,
     sinc,
     build_P_modes,
+    build_Pdip_modes,  # noqa: F401 -- re-exported via rpy_wave
     _build_mode_grid,
     _build_se_deconv_window,
     build_B_modes,

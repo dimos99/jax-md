@@ -8,6 +8,7 @@ import numpy as np
 
 from jax_md import space
 from jax_md.hydro import rpy, rpy_real, rpy_wave
+from jax_md.hydro.rpy_moments import traceless_orthonormal_basis
 
 
 HASIMOTO_EHAT = 2.837297
@@ -58,6 +59,39 @@ def _dense_matrix_from_matvec(matvec_fn: Callable[[jnp.ndarray], jnp.ndarray],
     if hasattr(out, 'block_until_ready'):
       out = out.block_until_ready()
     dense[:, k] = np.asarray(out, dtype=np.float64).reshape(-1)
+  return dense
+
+
+def _grand_dense_from_matvec(matvec_fn: Callable[[jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]],
+                             n_particles: int,
+                             *,
+                             dtype=np.float64) -> np.ndarray:
+  """Build an 11N x 11N grand-mobility matrix in orthonormal moment coordinates."""
+  basis_c = np.asarray(traceless_orthonormal_basis(), dtype=np.float64)
+  ndof = 11 * n_particles
+  dense = np.zeros((ndof, ndof), dtype=np.float64)
+
+  def _output_to_coords(vel, grad):
+    vel = np.asarray(vel, dtype=np.float64)
+    grad = np.asarray(grad, dtype=np.float64)
+    out = np.zeros((n_particles, 11), dtype=np.float64)
+    out[:, :3] = vel
+    out[:, 3:] = np.einsum('nij,aij->na', grad, basis_c)
+    return out.reshape(-1)
+
+  for col in range(ndof):
+    particle = col // 11
+    local = col % 11
+    forces = np.zeros((n_particles, 3), dtype=dtype)
+    couplets = np.zeros((n_particles, 3, 3), dtype=dtype)
+    if local < 3:
+      forces[particle, local] = 1.0
+    else:
+      couplets[particle] = basis_c[local - 3]
+    vel, grad = matvec_fn(jnp.asarray(forces), jnp.asarray(couplets))
+    if hasattr(vel, 'block_until_ready'):
+      vel.block_until_ready()
+    dense[:, col] = _output_to_coords(vel, grad)
   return dense
 
 

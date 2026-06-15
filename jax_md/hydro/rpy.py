@@ -34,6 +34,7 @@ from jax_md.hydro.rpy_wave import (
   q_grid,
   k_from_q,
   build_P_modes,
+  build_Pdip_modes,
   build_B_modes,
   build_stencils_frac,
   spread,
@@ -51,7 +52,26 @@ from jax_md.hydro.rpy_real import (
   identity_preconditioner,
   Preconditioner,
 )
-from jax_md.hydro.rpy_wave_stoch import _hermitian_gaussian_modes
+from jax_md.hydro.rpy_moments import (
+  N_MOMENTS,
+  couplet_to_components,
+  components_to_couplet,
+  couplet_to_stresslet_torque,
+  stresslet_to_couplet,
+  torque_to_couplet,
+  traceless,
+)
+from jax_md.hydro.rpy_constrained import make_constrained_solver
+from jax_md.hydro.rpy_real_det_dipole import build_Mr_grand_apply, mr_grand_matvec
+from jax_md.hydro.rpy_wave_det_dipole import build_Mw_grand_state
+from jax_md.hydro.rpy_wave_stoch import (
+    _hermitian_gaussian_modes,
+    grand_readout_noise_modes,
+)
+from jax_md.hydro.rpy_brownian_constrained import (
+    grand_jacobi_preconditioner,
+    make_constrained_brownian_step,
+)
 
 XI_OPT_A = 0.5  # default target for xi * a
 REAL_DTYPE = jnp.float64 if jax_config.jax_enable_x64 else jnp.float32 #type: ignore[assignment]
@@ -105,7 +125,7 @@ def _deformation_matrix_from_shear(dim: int, gamma: ShearVector) -> jnp.ndarray:
 
 
 def _normalize_runtime_shear_kwargs(kwargs, dim: int):
-  """Reject legacy dict shear inputs and expand typed shear vectors."""
+  """Reject deprecated dict shear inputs and expand typed shear vectors."""
   result = dict(kwargs)
   gamma = result.get('gamma', None)
   if isinstance(gamma, dict):
@@ -376,9 +396,15 @@ def _compute_xi_candidate(
     xi = float(xi_override)
   else:
     if phi > 0.0 and N > 1 and d_f > 0.0:
-      xi = (3.0 * C_W * math.log(float(N)) /
-            (C_R * float(d_f) * float(n_iter) * float(phi) ** 2)) ** (
-                -1.0 / (float(d_f) + 3.0))
+      # Fiore (2017) Eq. (23) gives the cost-optimal *dimensionless* group
+      # (xi*a)*, since both the real- and wave-space operation counts depend
+      # on lengths only through xi*a (the paper nondimensionalizes lengths by
+      # the radius, i.e. a = 1). Divide by a to recover xi* itself, which
+      # scales as 1/a — consistent with the xi*a -> XI_OPT_A fallback below.
+      xi_a = (3.0 * C_W * math.log(float(N)) /
+              (C_R * float(d_f) * float(n_iter) * float(phi) ** 2)) ** (
+                  -1.0 / (float(d_f) + 3.0))
+      xi = xi_a / float(a)
     else:
       xi = float(XI_OPT_A / a)
   if xi <= 0.0 or not math.isfinite(xi):
@@ -594,6 +620,14 @@ def _check_xi(xi: float) -> float:
   return xi_float
 
 
+def _check_positive(value: float, name: str) -> float:
+  """Validate a scalar physical parameter is positive and finite."""
+  value_float = float(value)
+  if not math.isfinite(value_float) or value_float <= 0.0:
+    raise ValueError(f"{name} must be positive and finite; got {name}={value_float}.")
+  return value_float
+
+
 @dataclasses.dataclass
 class RpyState:
   real: RealSpaceState
@@ -745,6 +779,110 @@ def _apply_wave_exact(
   return velocities, wave_noise
 
 
+def _apply_wave_exact_grand(
+    *,
+    static: _WaveStaticFactors,
+    current_box: jnp.ndarray,
+    positions_frac: jnp.ndarray,
+    forces: jnp.ndarray,
+    couplets: jnp.ndarray,
+    a: float,
+    xi: float,
+    eta: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Exact grand wave-space operator under the live box."""
+  box = jnp.asarray(current_box, dtype=REAL_DTYPE)
+  positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+  forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+  couplets = traceless(jnp.asarray(couplets, dtype=REAL_DTYPE))
+
+  Brecip = make_reciprocal(box)
+  k, K, K2 = k_from_q(static.QX, static.QY, static.QZ, Brecip)
+  V_box = jnp.linalg.det(box)
+  sigma_inv = static.Ngrid / V_box
+  Pshape = build_P_modes(K, a)
+  Pdip = build_Pdip_modes(K, a)
+  Bfluid, _ = build_B_modes(k, K, K2, xi, eta, V_box, static.deconv)
+
+  st = build_stencils_frac(
+      positions_frac,
+      static.Mx,
+      static.My,
+      static.Mz,
+      static.P_support,
+      static.alpha_eff,
+  )
+  moments = jnp.concatenate([forces, couplet_to_components(couplets)], axis=-1)
+  moment_grid = sigma_inv * spread(moments, st, static.Mx, static.My, static.Mz)
+  moment_q = fft_vec(moment_grid)
+  Fq = moment_q[..., :3]
+  Cq = components_to_couplet(moment_q[..., 3:N_MOMENTS])
+
+  fq = (Pshape[..., None] * Fq -
+        1j * Pdip[..., None] * jnp.einsum('...mn,...n->...m', Cq, k))
+  uq = jnp.einsum('...ij,...j->...i', Bfluid, fq)
+  Uq = Pshape[..., None] * uq
+  Dq = 1j * Pdip[..., None, None] * jnp.einsum('...i,...j->...ij', uq, k)
+
+  out_q = jnp.concatenate([Uq, couplet_to_components(Dq)], axis=-1)
+  out_grid = ifft_vec(out_q)
+  out = V_box * gather(out_grid, st, static.Mx, static.My, static.Mz)
+  velocities = out[..., :3]
+  gradients = components_to_couplet(out[..., 3:N_MOMENTS])
+  return velocities, traceless(gradients)
+
+
+def _sample_wave_grand_noise(
+    *,
+    static: _WaveStaticFactors,
+    current_box: jnp.ndarray,
+    positions_frac: jnp.ndarray,
+    key_wave: jax.Array,
+    a: float,
+    xi: float,
+    eta: float,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+  """Grand wave-space sqrt sample under the live box (covariance M^(w)_grand).
+
+  Live-box counterpart of ``rpy_wave_stoch.build_Mw_grand_sqrt_sampler``:
+  per-box ``Pshape``/``Pdip``/``Bhalf`` are rebuilt exactly as in
+  ``_apply_wave_exact_grand`` and the readout adjoint
+  ``[Pshape uq ; +i Pdip uq (x) k]`` is applied to ``Bhalf @ xi`` with
+  Hermitian Gaussian grid noise, so the gathered pair is real-valued with
+  joint covariance M^(w)_grand.
+  """
+  box = jnp.asarray(current_box, dtype=REAL_DTYPE)
+  positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+
+  Brecip = make_reciprocal(box)
+  k, K, K2 = k_from_q(static.QX, static.QY, static.QZ, Brecip)
+  V_box = jnp.linalg.det(box)
+  sigma_inv = static.Ngrid / V_box
+  Pshape = build_P_modes(K, a)
+  Pdip = build_Pdip_modes(K, a)
+  _, Bhalf = build_B_modes(k, K, K2, xi, eta, V_box, static.deconv)
+
+  st = build_stencils_frac(
+      positions_frac,
+      static.Mx,
+      static.My,
+      static.Mz,
+      static.P_support,
+      static.alpha_eff,
+  )
+  Bhalf_complex = jnp.asarray(Bhalf, dtype=COMPLEX_DTYPE)
+  out_q = grand_readout_noise_modes(
+      key_wave, Pshape=Pshape, Pdip=Pdip, k=k, Bhalf_complex=Bhalf_complex,
+      Mx=static.Mx, My=static.My, Mz=static.Mz)
+  out_grid = ifft_vec(out_q)
+  noise_scale = jnp.sqrt(sigma_inv * static.Ngrid)
+  out = noise_scale * (jnp.sqrt(V_box) *
+                       gather(out_grid, st, static.Mx, static.My, static.Mz))
+  U_half = out[..., :3]
+  D_half = traceless(components_to_couplet(out[..., 3:N_MOMENTS]))
+  return U_half, D_half
+
+
 def _compose_next_state(
     *,
     real_state: RealSpaceState,
@@ -817,7 +955,12 @@ def build_rpy_mobility(space_fns,
                        lattice_extent: Optional[int] = None,
                        lattice_extra: float = 0.0,
                        box_jump_threshold: Optional[float] = None,
-                       real_space_mode: str = 'auto'):
+                       real_space_mode: str = 'auto',
+                       use_stresslet: bool = False,
+                       constrained: bool = False,
+                       solve_tol: float = 1e-3,
+                       solve_maxiter: int = 50,
+                       with_torque: bool = False):
   """Construct init/apply functions for the split-Ewald RPY mobility.
 
   Args:
@@ -869,23 +1012,47 @@ def build_rpy_mobility(space_fns,
       lattice-image accumulation, ``'min_image'`` enforces minimum-image-only
       evaluation (requires ``rcut <= 0.5 * sigma_min(box)``), and ``'auto'``
       picks the safe option per box (default).
+    use_stresslet: If True, build the grand mobility from force and
+      traceless couplet inputs and return velocity plus traceless velocity
+      gradient. Brownian sampling is not implemented for this mode.
+    constrained: If True (requires ``use_stresslet=True``), apply the
+      stresslet-constrained mobility ``R_FU^{-1} = M_UF - M_US M_ES^{-1}
+      M_EF``: the rigid constraint E = 0 is enforced by solving for the
+      stresslet matrix-free (GMRES on M_ES), and ``apply_fn`` returns
+      ``((velocities, stresslets), next_state)``. The couplet input is gone
+      from this path -- the stresslet is solved for, not supplied.
+    solve_tol: Relative GMRES tolerance for the stresslet constraint solve
+      (constrained mode only). Default 1e-3 (Fiore & Swan 2018); tighten
+      to ~1e-6+ when separating solver error from physics error.
+    solve_maxiter: GMRES Krylov basis size (static int, constrained mode
+      only). M_ES is well conditioned (~8-10 iterations); approaching this
+      limit signals a bug, not a tight tolerance.
+    with_torque: If True (requires ``constrained=True``), ``apply_fn``
+      accepts applied ``torques`` and returns
+      ``((velocities, stresslets, angular_velocities), next_state)``.
 
   Returns:
     A tuple ``(init_fn, apply_fn)`` where:
 
-    **init_fn(positions_frac, \*\*kwargs) -> RpyState**
+    **init_fn(positions_frac, *, wave_state=None, **kwargs) -> RpyState**
       Build the initial mobility state (neighbor list + wave-space arrays)
       for a given configuration. Keyword arguments such as ``gamma_xy`` or
       ``shear=(γ_xy, γ_xz, γ_yz)`` are forwarded to set the current box
-      deformation.
+      deformation. ``wave_state`` may be reused across configurations with
+      identical box and wave-grid parameters to avoid rebuilding the same
+      wave-space modes.
 
-    **apply_fn(state, positions_frac, forces, \*, brownian_key=None,
-    kT=None, dt=None, mr_iters=10, \*\*kwargs)**
+    **apply_fn(state, positions_frac, forces, *, couplets=None,
+    brownian_key=None,
+    kT=None, dt=None, mr_iters=10, **kwargs)**
       Apply the mobility operator and optionally sample Brownian noise.
 
       *Deterministic mode* (``brownian_key=None``):
         Returns ``(velocities, next_state)`` where
         ``velocities = M · forces`` (shape ``(N, dim)``).
+        With ``use_stresslet=True``, returns
+        ``((velocities, gradients), next_state)`` where ``gradients`` has
+        shape ``(N, 3, 3)`` and ``couplets`` defaults to zeros.
 
       *Stochastic mode* (``brownian_key`` provided, requires ``kT`` and
       ``dt``):
@@ -895,8 +1062,8 @@ def build_rpy_mobility(space_fns,
         ``'real_solver_rel_change'``, ``'real_solver_iters'``, and
         ``'real_solver_converged'``.
 
-    **apply_fn.with_brownian(state, positions_frac, forces, key, \*,
-    kT, dt, mr_iters=10, \*\*kwargs)**
+    **apply_fn.with_brownian(state, positions_frac, forces, key, *,
+    kT, dt, mr_iters=10, **kwargs)**
       Convenience wrapper that always includes Brownian noise. Returns
       ``(velocities, noise, next_state, rel_change, iters, converged)``.
       
@@ -932,6 +1099,14 @@ def build_rpy_mobility(space_fns,
 
   # -- Validate inputs and unpack space functions ---------------------------
   xi = _check_xi(xi)
+  a = _check_positive(a, 'a')
+  eta = _check_positive(eta, 'eta')
+
+  if constrained and not use_stresslet:
+    raise ValueError('constrained=True requires use_stresslet=True '
+                     '(no dipole machinery to constrain).')
+  if with_torque and not constrained:
+    raise ValueError('with_torque=True requires constrained=True.')
 
   if len(space_fns) < 2:
     raise ValueError('space_fns must contain displacement and shift functions.')
@@ -943,7 +1118,8 @@ def build_rpy_mobility(space_fns,
   # -- Build real-space operator (neighbor list + pairwise RPY) -------------
   rcut_value = _resolve_rcut(xi, rcut)
 
-  Mr_init, Mr_apply = build_Mr_apply(
+  real_builder = build_Mr_grand_apply if use_stresslet else build_Mr_apply
+  Mr_init, Mr_apply = real_builder(
       space_fns,
       a,
       xi,
@@ -983,6 +1159,20 @@ def build_rpy_mobility(space_fns,
 
   # -- Wave-state factory (rebuilt per box for exact deformed mobility) -----
   def _build_wave_state_for_box(box_matrix: jnp.ndarray) -> WaveSpaceState:
+    if use_stresslet:
+      return build_Mw_grand_state(
+          box_matrix,
+          a,
+          xi,
+          eta,
+          Mx_,
+          My_,
+          Mz_,
+          P_,
+          theta=theta_,
+          fractional_coordinates=True,
+          attach_sqrt=constrained and include_brownian,
+      )
     return build_Mw_state(
         box_matrix,
         a,
@@ -999,7 +1189,8 @@ def build_rpy_mobility(space_fns,
     )
 
   # -- init_fn: allocate neighbor list and wave-space arrays ---------------
-  def init_fn(positions_frac, **kwargs):
+  def init_fn(positions_frac, *, wave_state: Optional[WaveSpaceState] = None,
+              **kwargs):
     positions_frac = jnp.asarray(positions_frac)
     dim = int(positions_frac.shape[1])
     combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
@@ -1019,7 +1210,8 @@ def build_rpy_mobility(space_fns,
 
     real_state = Mr_init(positions_frac, **combined_kwargs)
 
-    wave_state = _build_wave_state_for_box(active_box)
+    if wave_state is None:
+      wave_state = _build_wave_state_for_box(active_box)
 
     return RpyState(
         real=real_state,
@@ -1047,6 +1239,29 @@ def build_rpy_mobility(space_fns,
         preconditioner=state_preconditioner,
     )
     return velocities, next_state
+
+  def _finalize_grand_step(
+      *,
+      Ur: jnp.ndarray,
+      Dr: jnp.ndarray,
+      Uw: jnp.ndarray,
+      Dw: jnp.ndarray,
+      real_state: RealSpaceState,
+      wave_state: WaveSpaceState,
+      state_preconditioner: Optional[Preconditioner],
+  ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], RpyState]:
+    if real_space_first:
+      velocities = Ur + Uw
+      gradients = Dr + Dw
+    else:
+      velocities = Uw + Ur
+      gradients = Dw + Dr
+    next_state = _compose_next_state(
+        real_state=real_state,
+        wave_state=wave_state,
+        preconditioner=state_preconditioner,
+    )
+    return (velocities, traceless(gradients)), next_state
 
   def _apply_wave_components(
       *,
@@ -1097,11 +1312,42 @@ def build_rpy_mobility(space_fns,
     wave_noise = wave_state.sqrt_fn(key_wave, positions_frac)
     return Uw, wave_noise, wave_state
 
+  def _apply_wave_components_grand(
+      *,
+      wave_state: WaveSpaceState,
+      positions_frac: jnp.ndarray,
+      forces: jnp.ndarray,
+      couplets: jnp.ndarray,
+      current_box: Optional[jnp.ndarray],
+  ) -> Tuple[jnp.ndarray, jnp.ndarray, WaveSpaceState]:
+    if current_box is not None:
+      Uw, Dw = _apply_wave_exact_grand(
+          static=wave_static,
+          current_box=current_box,
+          positions_frac=positions_frac,
+          forces=forces,
+          couplets=couplets,
+          a=a,
+          xi=xi,
+          eta=eta,
+      )
+      if not isinstance(current_box, jax_core.Tracer):
+        wave_state = _build_wave_state_for_box(current_box)
+      return Uw, Dw, wave_state
+
+    if wave_state.apply_fn is None:
+      raise ValueError('grand wave-space operator missing from state; run init_fn first.')
+    Uw, Dw = wave_state.apply_fn(positions_frac, forces, couplets)
+    return Uw, Dw, wave_state
+
   # -- apply_fn: deterministic + optional Brownian in one call -------------
   def apply_fn(state: RpyState,
                positions_frac,
                forces,
                *,
+               couplets: Optional[jnp.ndarray] = None,
+               torques: Optional[jnp.ndarray] = None,
+               stresslet_guess: Optional[jnp.ndarray] = None,
                brownian_key: Optional[jax.Array] = None,
                kT: Optional[float] = None,
                dt: Optional[float] = None,
@@ -1113,6 +1359,136 @@ def build_rpy_mobility(space_fns,
     dim = int(positions_frac.shape[1])
     combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
     current_box = _resolve_current_box(dim, combined_kwargs)
+
+    if not constrained:
+      if torques is not None:
+        raise ValueError('torques are only accepted in constrained mode '
+                         '(build_rpy_mobility(..., constrained=True, '
+                         'with_torque=True)).')
+      if stresslet_guess is not None:
+        raise ValueError('stresslet_guess is only accepted in constrained mode.')
+
+    if constrained:
+      if brownian_key is not None:
+        raise ValueError(
+            'A single constrained mobility application with Brownian slip '
+            'has no meaning outside a time step. Use '
+            'apply_fn.make_brownian_step(...) to build the constrained '
+            'Brownian midpoint stepper.')
+      if couplets is not None:
+        raise ValueError('couplets may not be passed in constrained mode; '
+                         'the stresslet is solved for, not supplied.')
+      if torques is not None and not with_torque:
+        raise ValueError('torques require build_rpy_mobility(..., '
+                         'with_torque=True).')
+
+      forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+      if with_torque and torques is not None:
+        torques_local = jnp.asarray(torques, dtype=REAL_DTYPE)
+        C_applied = torque_to_couplet(torques_local)
+      else:
+        torques_local = None
+        C_applied = jnp.zeros(
+            positions_frac.shape[:-1] + (3, 3), dtype=REAL_DTYPE)
+
+      # RHS grand call fused with the state refresh: one Mr_apply rebuilds
+      # the neighbor list, one wave call refreshes/rebuilds the wave state.
+      (Ur, Dr), real_state = Mr_apply(
+          state.real, positions_frac, forces, C_applied, **combined_kwargs)
+      Uw, Dw, wave_state = _apply_wave_components_grand(
+          wave_state=state.wave,
+          positions_frac=positions_frac,
+          forces=forces,
+          couplets=C_applied,
+          current_box=current_box,
+      )
+      if real_space_first:
+        U_applied, D_applied = Ur + Uw, traceless(Dr + Dw)
+      else:
+        U_applied, D_applied = Uw + Ur, traceless(Dw + Dr)
+
+      # Fixed-state grand matvec over the refreshed states; covers both the
+      # static-box and live-box/shear paths.
+      def grand_mv(F, C):
+        Ur_, Dr_ = mr_grand_matvec(real_state, positions_frac, F, C)
+        if current_box is not None:
+          Uw_, Dw_ = _apply_wave_exact_grand(
+              static=wave_static,
+              current_box=current_box,
+              positions_frac=positions_frac,
+              forces=F,
+              couplets=C,
+              a=a,
+              xi=xi,
+              eta=eta,
+          )
+        else:
+          Uw_, Dw_ = wave_state.apply_fn(positions_frac, F, C)
+        if real_space_first:
+          return Ur_ + Uw_, traceless(Dr_ + Dw_)
+        return Uw_ + Ur_, traceless(Dw_ + Dr_)
+
+      if stresslet_guess is None:
+        guess5 = jnp.zeros(positions_frac.shape[:-1] + (5,), dtype=REAL_DTYPE)
+      else:
+        stresslet_guess = jnp.asarray(stresslet_guess, dtype=REAL_DTYPE)
+        if stresslet_guess.shape[-1] == 5:
+          guess5 = stresslet_guess
+        else:
+          guess5 = couplet_to_stresslet_torque(stresslet_guess)[0]
+
+      solve_fn = make_constrained_solver(
+          grand_mv,
+          with_torque=with_torque,
+          solve_tol=solve_tol,
+          solve_maxiter=solve_maxiter,
+      )
+      U, S5, Omega, _ = solve_fn(
+          forces,
+          torques=torques_local,
+          stresslet_guess=guess5,
+          applied_output=(U_applied, D_applied),
+      )
+      stresslets = stresslet_to_couplet(S5)
+      next_state = _compose_next_state(
+          real_state=real_state,
+          wave_state=wave_state,
+          preconditioner=state.preconditioner,
+      )
+      if with_torque:
+        return (U, stresslets, Omega), next_state
+      return (U, stresslets), next_state
+
+    if use_stresslet:
+      if brownian_key is not None:
+        raise NotImplementedError(
+            'Brownian sampling for stresslet/couplet moments is not implemented.')
+      if couplets is None:
+        couplets_local = jnp.zeros(positions_frac.shape[:-1] + (3, 3), dtype=REAL_DTYPE)
+      else:
+        couplets_local = traceless(jnp.asarray(couplets, dtype=REAL_DTYPE))
+      (Ur, Dr), real_state = Mr_apply(
+          state.real, positions_frac, forces, couplets_local, **combined_kwargs)
+      Uw, Dw, wave_state = _apply_wave_components_grand(
+          wave_state=state.wave,
+          positions_frac=positions_frac,
+          forces=forces,
+          couplets=couplets_local,
+          current_box=current_box,
+      )
+      return _finalize_grand_step(
+          Ur=Ur,
+          Dr=Dr,
+          Uw=Uw,
+          Dw=Dw,
+          real_state=real_state,
+          wave_state=wave_state,
+          state_preconditioner=state.preconditioner,
+      )
+
+    if couplets is not None:
+      raise ValueError("couplets may only be passed when build_rpy_mobility(..., use_stresslet=True).")
+
     Ur, real_state = Mr_apply(state.real, positions_frac, forces, **combined_kwargs)
 
     if brownian_key is None:
@@ -1204,6 +1580,129 @@ def build_rpy_mobility(space_fns,
     )
 
   apply_fn.with_brownian = apply_with_brownian
+
+  # -- Constrained Brownian midpoint stepper --------------------------------
+  if constrained and include_brownian:
+    shift_fn = space_fns[1]
+
+    def _mobility_init_for_step(positions_frac, *,
+                                extra_capacity_override=None,
+                                wave_state: Optional[WaveSpaceState] = None,
+                                **kwargs):
+      """Allocate an `RpyState` for the constrained stepper at the live box.
+
+      Passed to `make_constrained_brownian_step` as `mobility_init_fn`; rebuilds
+      the real-space neighbor list (honoring `extra_capacity_override` for
+      overflow replay) and the wave state for the box implied by the shear
+      kwargs, reusing a supplied `wave_state` when one is threaded in.
+      """
+      positions_frac = jnp.asarray(positions_frac)
+      dim = int(positions_frac.shape[1])
+      combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
+      active_box = current_box_matrix(
+          displacement_fn, box_fn, dim, **combined_kwargs)
+      real_state = Mr_init(
+          positions_frac, extra_capacity_override=extra_capacity_override,
+          **combined_kwargs)
+      if wave_state is None:
+        wave_state = _build_wave_state_for_box(active_box)
+      return RpyState(
+          real=real_state,
+          wave=wave_state,
+          preconditioner=precond,
+      )
+
+    def _wave_apply_grand_for_step(wave_state, positions_frac, forces,
+                                   couplets, current_box):
+      """Grand wave-space apply (returns refreshed state) for the RHS build."""
+      return _apply_wave_components_grand(
+          wave_state=wave_state,
+          positions_frac=positions_frac,
+          forces=forces,
+          couplets=couplets,
+          current_box=current_box,
+      )
+
+    def _wave_matvec_for_step(wave_state, positions_frac, forces, couplets,
+                              current_box):
+      """Fixed-state grand wave matvec for the GMRES M_ES operator.
+
+      Uses the exact deformed-box path when a `current_box` is supplied (safe
+      inside scan/fori_loop), else the precomputed cached modes.
+      """
+      if current_box is not None:
+        return _apply_wave_exact_grand(
+            static=wave_static,
+            current_box=current_box,
+            positions_frac=positions_frac,
+            forces=forces,
+            couplets=couplets,
+            a=a,
+            xi=xi,
+            eta=eta,
+        )
+      return wave_state.apply_fn(positions_frac, forces, couplets)
+
+    def _wave_noise_for_step(wave_state, positions_frac, key, current_box):
+      """Draw the wave-space grand Brownian slip (analytic Fourier sqrt).
+
+      Deformed-box path when sheared; otherwise the precomputed `sqrt_fn`
+      attached to the wave state by `build_grand_wave_modes(attach_sqrt=True)`.
+      """
+      if current_box is not None:
+        return _sample_wave_grand_noise(
+            static=wave_static,
+            current_box=current_box,
+            positions_frac=positions_frac,
+            key_wave=key,
+            a=a,
+            xi=xi,
+            eta=eta,
+        )
+      if wave_state.sqrt_fn is None:
+        raise ValueError('grand wave-space sampler missing from state; '
+                         'run init_fn (or brownian_init_fn) first.')
+      return wave_state.sqrt_fn(key, positions_frac)
+
+    def make_brownian_step(force_fn=None, *, kT, dt, integrator='midpoint',
+                           torque_fn=None, mr_iters=50, lanczos_tol=1e-3,
+                           return_residual=False):
+      """Build (brownian_init_fn, step_fn) for constrained Brownian dynamics.
+
+      ``force_fn(positions_frac, **step_kwargs) -> (N, 3)`` supplies the
+      conservative forces (evaluated at the start-of-step configuration);
+      None means free diffusion.  ``torque_fn`` requires the builder flag
+      ``with_torque=True``.  See
+      ``rpy_brownian_constrained.make_constrained_brownian_step``.
+      """
+      if torque_fn is not None and not with_torque:
+        raise ValueError('torque_fn requires build_rpy_mobility(..., '
+                         'with_torque=True).')
+      return make_constrained_brownian_step(
+          mobility_init_fn=_mobility_init_for_step,
+          mr_apply=Mr_apply,
+          wave_apply_grand=_wave_apply_grand_for_step,
+          wave_matvec=_wave_matvec_for_step,
+          wave_noise=_wave_noise_for_step,
+          normalize_kwargs=_normalize_runtime_shear_kwargs,
+          resolve_current_box=_resolve_current_box,
+          grand_precond=grand_jacobi_preconditioner(a, xi, eta),
+          real_space_first=real_space_first,
+          shift_fn=shift_fn,
+          force_fn=force_fn,
+          kT=kT,
+          dt=dt,
+          integrator=integrator,
+          torque_fn=torque_fn,
+          with_torque=with_torque,
+          mr_iters=mr_iters,
+          lanczos_tol=lanczos_tol,
+          solve_tol=solve_tol,
+          solve_maxiter=solve_maxiter,
+          return_residual=return_residual,
+      )
+
+    apply_fn.make_brownian_step = make_brownian_step
 
   return init_fn, apply_fn
 

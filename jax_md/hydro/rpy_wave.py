@@ -10,6 +10,7 @@ from jax_md.hydro.rpy_wave_det import (
     se_alpha,
     choose_theta,
     build_P_modes,
+    build_Pdip_modes,
     build_B_modes,
     build_wave_modes,
     build_stencils_frac,
@@ -22,7 +23,19 @@ from jax_md.hydro.rpy_wave_det import (
     mw_matvec,
     build_Mw_state,
 )
-from jax_md.hydro.rpy_wave_stoch import build_Mw_sqrt_sampler, build_Mw_apply_and_sample
+from jax_md.hydro.rpy_wave_det_dipole import (
+    build_grand_wave_modes,
+    make_grand_wave_matvec,
+    build_Mw_grand_state,
+    mw_grand_matvec,
+    _mw_bruteforce_grand,
+)
+from jax_md.hydro.rpy_wave_stoch import (
+    build_Mw_sqrt_sampler,
+    build_Mw_apply_and_sample,
+    build_Mw_grand_sqrt_sampler,
+    grand_readout_noise_modes,
+)
 
 __all__ = [
     'REAL_DTYPE',
@@ -34,6 +47,7 @@ __all__ = [
     'se_alpha',
     'choose_theta',
     'build_P_modes',
+    'build_Pdip_modes',
     'build_B_modes',
     'build_wave_modes',
     'build_stencils_frac',
@@ -45,6 +59,12 @@ __all__ = [
     'build_Mw_apply',
     'mw_matvec',
     'build_Mw_state',
+    'build_grand_wave_modes',
+    'make_grand_wave_matvec',
+    'build_Mw_grand_state',
+    'mw_grand_matvec',
     'build_Mw_sqrt_sampler',
     'build_Mw_apply_and_sample',
+    'build_Mw_grand_sqrt_sampler',
+    'grand_readout_noise_modes',
 ]
