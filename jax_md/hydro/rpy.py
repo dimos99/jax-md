@@ -620,6 +620,14 @@ def _check_xi(xi: float) -> float:
   return xi_float
 
 
+def _check_positive(value: float, name: str) -> float:
+  """Validate a scalar physical parameter is positive and finite."""
+  value_float = float(value)
+  if not math.isfinite(value_float) or value_float <= 0.0:
+    raise ValueError(f"{name} must be positive and finite; got {name}={value_float}.")
+  return value_float
+
+
 @dataclasses.dataclass
 class RpyState:
   real: RealSpaceState
@@ -1091,6 +1099,8 @@ def build_rpy_mobility(space_fns,
 
   # -- Validate inputs and unpack space functions ---------------------------
   xi = _check_xi(xi)
+  a = _check_positive(a, 'a')
+  eta = _check_positive(eta, 'eta')
 
   if constrained and not use_stresslet:
     raise ValueError('constrained=True requires use_stresslet=True '
@@ -1579,6 +1589,13 @@ def build_rpy_mobility(space_fns,
                                 extra_capacity_override=None,
                                 wave_state: Optional[WaveSpaceState] = None,
                                 **kwargs):
+      """Allocate an `RpyState` for the constrained stepper at the live box.
+
+      Passed to `make_constrained_brownian_step` as `mobility_init_fn`; rebuilds
+      the real-space neighbor list (honoring `extra_capacity_override` for
+      overflow replay) and the wave state for the box implied by the shear
+      kwargs, reusing a supplied `wave_state` when one is threaded in.
+      """
       positions_frac = jnp.asarray(positions_frac)
       dim = int(positions_frac.shape[1])
       combined_kwargs = _normalize_runtime_shear_kwargs(kwargs, dim)
@@ -1597,6 +1614,7 @@ def build_rpy_mobility(space_fns,
 
     def _wave_apply_grand_for_step(wave_state, positions_frac, forces,
                                    couplets, current_box):
+      """Grand wave-space apply (returns refreshed state) for the RHS build."""
       return _apply_wave_components_grand(
           wave_state=wave_state,
           positions_frac=positions_frac,
@@ -1607,6 +1625,11 @@ def build_rpy_mobility(space_fns,
 
     def _wave_matvec_for_step(wave_state, positions_frac, forces, couplets,
                               current_box):
+      """Fixed-state grand wave matvec for the GMRES M_ES operator.
+
+      Uses the exact deformed-box path when a `current_box` is supplied (safe
+      inside scan/fori_loop), else the precomputed cached modes.
+      """
       if current_box is not None:
         return _apply_wave_exact_grand(
             static=wave_static,
@@ -1621,6 +1644,11 @@ def build_rpy_mobility(space_fns,
       return wave_state.apply_fn(positions_frac, forces, couplets)
 
     def _wave_noise_for_step(wave_state, positions_frac, key, current_box):
+      """Draw the wave-space grand Brownian slip (analytic Fourier sqrt).
+
+      Deformed-box path when sheared; otherwise the precomputed `sqrt_fn`
+      attached to the wave state by `build_grand_wave_modes(attach_sqrt=True)`.
+      """
       if current_box is not None:
         return _sample_wave_grand_noise(
             static=wave_static,

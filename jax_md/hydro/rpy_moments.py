@@ -140,11 +140,6 @@ for _i, _j, _k in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
   _LEVI_CIVITA_NP[_i, _k, _j] = -1.0
 
 
-def levi_civita() -> jnp.ndarray:
-  """Levi-Civita symbol as a (3, 3, 3) array in the working real dtype."""
-  return jnp.asarray(_LEVI_CIVITA_NP, dtype=REAL_DTYPE)
-
-
 def traceless_orthonormal_basis() -> jnp.ndarray:
   """Frobenius-orthonormal basis of the traceless 3x3 subspace, shape (8, 3, 3).
 

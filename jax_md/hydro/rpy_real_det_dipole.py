@@ -106,6 +106,8 @@ def _build_pair_contrib_grand_fn(a: float, xi: float, eta: float):
     Fr = jnp.einsum("...i,...i->...", forces, rhat)
     rr = rhat[..., :, None] * rhat[..., None, :]
 
+    # UF block: M_UF F = F1 F + (F2 - F1)(F.rhat) rhat (Fiore & Swan Eq. 25).
+    # F_iso is the trace-isotropic limit used as the r -> 0 fallback below.
     u_force = prefactor_uf * (
         F1[..., None] * forces +
         (F2 - F1)[..., None] * Fr[..., None] * rhat)
@@ -119,10 +121,14 @@ def _build_pair_contrib_grand_fn(a: float, xi: float, eta: float):
     # rhat here points receiver -> sender (rij = xj - xi); the quadrature
     # ground-truth tensors use r = x_receiver - x_sender = -rhat, which flips
     # the sign of every odd-in-rhat (UC/DF) term and leaves DC unchanged.
+    # UC block: M_UC C = velocity from a neighbour's couplet (G1, G2 scalars).
     u_couplet = prefactor_uc * (
         0.5 * G1[..., None] * (Cr - rCr[..., None] * rhat) -
         0.5 * G2[..., None] * (rC - 4.0 * rCr[..., None] * rhat))
 
+    # DF block: M_DF F = velocity-gradient sourced by a neighbour's force.
+    # Adjoint of UC (same G1, G2) up to DF_ADJOINT_SIGN, so it reuses
+    # prefactor_uc.
     F_i_r_j = forces[..., :, None] * rhat[..., None, :]
     r_i_F_j = rhat[..., :, None] * forces[..., None, :]
     d_force = DF_ADJOINT_SIGN * prefactor_uc * (
@@ -131,6 +137,9 @@ def _build_pair_contrib_grand_fn(a: float, xi: float, eta: float):
             r_i_F_j + Fr[..., None, None] * eye -
             4.0 * Fr[..., None, None] * rr))
 
+    # DC block: M_DC C = velocity-gradient sourced by a neighbour's couplet
+    # (K1, K2, K3 scalars). Even in rhat, so no sign flip relative to the
+    # quadrature reference.
     C_T = jnp.swapaxes(couplets, -1, -2)
     r_i_Cr_j = rhat[..., :, None] * Cr[..., None, :]
     Cr_i_r_j = Cr[..., :, None] * rhat[..., None, :]
@@ -143,6 +152,10 @@ def _build_pair_contrib_grand_fn(a: float, xi: float, eta: float):
             rCr[..., None, None] * eye + rC_i_r_j + r_i_Cr_j + r_i_rC_j -
             6.0 * rCr[..., None, None] * rr - couplets))
 
+    # Near-coincident pairs (r below the regularization floor) would divide by
+    # ~0 in the G/K scalars; replace those entries with the r -> 0 limits: the
+    # isotropic UF mobility for velocity, zero UC, zero DF, and the self-dipole
+    # DC structure (matching the self term accumulated in the cores).
     tiny_pairs = mask & (r2 <= pair_eps2)
     zeros_u = jnp.zeros_like(u_couplet)
     d_fallback = prefactor_dc * self_dipole * (C_T - 4.0 * couplets)
@@ -298,6 +311,11 @@ def _build_mr_core_lattice_grand(
         gradients = gradients + ops.segment_sum(contrib_d_rev.sum(axis=1), senders_batch, n_particles)
       return velocities, gradients
 
+    # Each edge is evaluated against every lattice image at once, so the peak
+    # intermediate is (capacity x n_images x 3x3). Cap that product to bound
+    # memory: small problems run in a single batch, larger ones are scanned in
+    # edge-chunks of `chunk_size` (chosen so chunk_size * n_images stays under
+    # the limit). The limit is a memory knob only -- results are identical.
     pair_image_limit = 8_000_000
     pair_image_work = capacity * n_images
     if pair_image_work <= pair_image_limit:

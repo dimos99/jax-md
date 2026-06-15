@@ -268,19 +268,23 @@ The method has three independent error sources:
 
 ## Testing
 
-See `tests/rpy_test.py` for fast (`not slow`) Fiore-inspired coverage:
-- Analytic RPY limits (self + pair mobility) with overlap / non-overlap
-- Two-particle tensor-structure symmetry checks
-- Split consistency (`M = M^(r) + M^(w)`) and xi-invariance
-- Symmetry / PSD / translational / Galilean invariance
-- Lightweight fluctuation-dissipation covariance checks
+The test suite lives under `tests/`. Fast (`not slow`) coverage:
+- `tests/rpy_test.py` — core mobility: analytic RPY limits (self + pair),
+  two-particle tensor symmetry, split consistency (`M = M^(r) + M^(w)`) and
+  xi-invariance, symmetry / PSD / translational / Galilean invariance,
+  lightweight fluctuation-dissipation covariance, and parameter validation.
+- `tests/rpy_stresslet_test.py` — grand mobility / couplet conventions,
+  rotlet-pinned moment signs, post-NUFFT traceless checks.
+- `tests/rpy_constrained_test.py` — stresslet-constrained mobility:
+  zero-strain residual, `M_ES` symmetry/PSD, dense Schur-complement agreement,
+  short-time self-diffusivity pinned to Fiore & Swan (2018) Fig. 7.
+- `tests/rpy_brownian_constrained_test.py` — positive-split covariance,
+  midpoint vs Euler-Maruyama equilibrium (Boltzmann / structure-factor) checks.
+- `tests/rpy_constrained_integrator_test.py` — `simulate.py` integrator wiring.
 
-See `tests/rpy_validation_slow_test.py` for expensive validation (`@pytest.mark.slow`):
-- Direct lattice-sum consistency checks
-- Rigorous fluctuation-dissipation covariance checks
-- Sedimentation trend checks against dilute-theory behavior
-- Ewald parameter convergence-rate regressions
-- Real-space condition-number scaling with system size
+Shared diagnostics live in `tests/rpy_test_utils.py`. Slow physical-validation
+tests are marked `@pytest.mark.slow`; run them with, e.g.:
 
-Slow tests are marked with `@pytest.mark.slow` and can be run with:
-`pytest tests/rpy_validation_slow_test.py -m "slow" -v`
+```bash
+pytest tests/rpy_test.py -m "slow" -v
+```

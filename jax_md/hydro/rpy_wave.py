@@ -63,7 +63,8 @@ __all__ = [
     'make_grand_wave_matvec',
     'build_Mw_grand_state',
     'mw_grand_matvec',
-    '_mw_bruteforce_grand',
     'build_Mw_sqrt_sampler',
     'build_Mw_apply_and_sample',
+    'build_Mw_grand_sqrt_sampler',
+    'grand_readout_noise_modes',
 ]

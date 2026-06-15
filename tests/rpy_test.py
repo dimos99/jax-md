@@ -1169,3 +1169,30 @@ def test_fdt_covariance_rigorous():
   cov_rel  = rtu._frobenius_relative_error(cov_diag, m_dense)
   cov_scale = rtu._wishart_frobenius_relative_scale(m_dense, S)
   print(f"  [diag] Frobenius cov_rel={cov_rel:.3e}  Wishart_scale={cov_scale:.3e}  (biased 1/S)")
+
+
+@pytest.mark.parametrize(
+    'bad_kwargs',
+    [
+        {'a': 0.0},
+        {'a': -0.5},
+        {'eta': 0.0},
+        {'eta': -1.0},
+        {'xi': 0.0},
+        {'xi': -2.0},
+        {'a': float('inf')},
+        {'eta': float('nan')},
+    ],
+)
+def test_build_rejects_nonpositive_physical_params(bad_kwargs):
+  """build_rpy_mobility fails fast on non-positive/non-finite a, eta, xi.
+
+  These feed 1/(6 pi eta a) self-mobility and Ewald-splitting expressions, so a
+  bad value would otherwise surface as cryptic NaNs deep inside the kernels
+  rather than a clear error at the public boundary.
+  """
+  space_fns = space.periodic_general(_box(10.0), fractional_coordinates=True)
+  params = dict(a=0.5, xi=1.0, eta=1.0, P=4, Mgrid=8, include_brownian=False)
+  params.update(bad_kwargs)
+  with pytest.raises(ValueError):
+    rpy.build_rpy_mobility(space_fns, **params)

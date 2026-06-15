@@ -26,7 +26,6 @@ from jax_md.hydro.rpy_real_stoch import (
     diagonal_preconditioner,
     jacobi_from_self,
     lanczos_sqrt_mv,
-    lanczos_sqrt_mv_test,
     sample_mr_sqrt_precond,
     sample_mr_sqrt,
 )
@@ -53,7 +52,6 @@ __all__ = [
     'diagonal_preconditioner',
     'jacobi_from_self',
     'lanczos_sqrt_mv',
-    'lanczos_sqrt_mv_test',
     'sample_mr_sqrt_precond',
     'sample_mr_sqrt',
 ]

@@ -139,6 +139,9 @@ def make_grand_wave_matvec(
     else:
       couplets_local = traceless(jnp.asarray(couplets, dtype=REAL_DTYPE))
 
+    # Factored grand operator D^dagger P^dagger B P D over all 11 channels in a
+    # single spread/FFT/gather pass (Fiore thesis Eq. 3.16-3.19 + 4.20-4.23).
+    # D: NUFFT spread the (force, couplet) moments to the grid, then FFT.
     moments = jnp.concatenate(
         [forces_local, couplet_to_components(couplets_local)], axis=-1)
     st = build_stencils_frac(positions_frac, Mx, My, Mz, P, alpha)
@@ -147,12 +150,18 @@ def make_grand_wave_matvec(
     Fq = moment_q[..., :3]
     Cq = components_to_couplet(moment_q[..., 3:N_MOMENTS])
 
+    # P: particle shape factors map moments to a force density. The couplet
+    # source -i Pdip C.k and the velocity-gradient readout +i Pdip k u are
+    # mutual adjoints, which keeps the grand operator symmetric PSD.
     fq = (Pshape[..., None] * Fq -
           1j * Pdip[..., None] * jnp.einsum("...mn,...n->...m", Cq, k))
+    # B: Hasimoto-screened Stokeslet maps force density to flow.
     uq = jnp.einsum("...ij,...j->...i", Bfluid, fq)
+    # P^dagger: read velocity (sinc) and velocity gradient (i Pdip k) back out.
     Uq = Pshape[..., None] * uq
     Dq = 1j * Pdip[..., None, None] * jnp.einsum("...i,...j->...ij", uq, k)
 
+    # D^dagger: inverse FFT and NUFFT gather back to particles.
     out_q = jnp.concatenate([Uq, couplet_to_components(Dq)], axis=-1)
     out_grid = ifft_vec(out_q)
     out = V_box * gather(out_grid, st, Mx, My, Mz)

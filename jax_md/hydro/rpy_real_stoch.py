@@ -271,35 +271,6 @@ def lanczos_sqrt_mv(matvec: Callable[[object, jnp.ndarray], jnp.ndarray],
     return _pack(approx)
 
 
-def lanczos_sqrt_mv_test(key: jax.Array,
-                         *,
-                         n: int = 64,
-                         iters: int = 10,
-                         tol: float = 1e-3) -> float:
-    """
-    Convenience test helper for ``lanczos_sqrt_mv``.
-
-    Generates a random SPD matrix ``M = A^T A + ε I`` and compares the Lanczos
-    approximation against the dense eigen-decomposition reference. The return
-    value is the relative 2-norm error.
-    """
-    key_mat, key_vec = jax.random.split(key)
-    A = jax.random.normal(key_mat, (n, n), dtype=REAL_DTYPE)
-    M = A.T @ A + 1e-3 * jnp.eye(n, dtype=REAL_DTYPE)
-
-    def mv(params, x):
-        mat, = params
-        return mat @ x
-
-    noise = jax.random.normal(key_vec, (n,), dtype=REAL_DTYPE)
-    approx = lanczos_sqrt_mv(mv, (M,), noise, iters=iters, tol=tol)
-    evals, evecs = jnp.linalg.eigh(M)
-    evals = jnp.clip(evals, min=0.0)
-    exact = evecs @ (jnp.sqrt(evals) * (evecs.T @ noise))
-    rel_err = jnp.linalg.norm(approx - exact) / jnp.linalg.norm(exact)
-    return float(rel_err)
-
-
 @partial(jax.jit, static_argnames=('iters', 'tol', 'return_info'))
 def sample_mr_sqrt_precond(key: jax.Array,
                            state: RealSpaceState,
