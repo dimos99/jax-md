@@ -26,8 +26,8 @@ import pytest  # noqa: E402
 
 from jax_md import space  # noqa: E402
 from jax_md.hydro import rpy_moments  # noqa: E402
-from jax_md.hydro import rpy_nearfield as nf  # noqa: E402
-from jax_md.hydro import rpy_nearfield_table as nf_table  # noqa: E402
+from jax_md.hydro import sd_nearfield as nf  # noqa: E402
+from jax_md.hydro import sd_nearfield_table as nf_table  # noqa: E402
 
 
 _BASIS = np.array(rpy_moments.stresslet_basis())  # (5,3,3)

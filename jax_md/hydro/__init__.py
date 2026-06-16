@@ -58,6 +58,17 @@ from jax_md.hydro.rpy import (
 
 from jax_md.hydro.rpy_constrained import make_constrained_solver
 
+from jax_md.hydro.sd_nearfield import (
+    build_nearfield_resistance,
+    NearFieldState,
+)
+
+from jax_md.hydro.rpy_saddle import (
+    build_saddle_solve,
+    SaddleState,
+    Ic0Preconditioner,
+)
+
 from jax_md.hydro.rpy_moments import (
     couplet_to_stresslet_torque,
     couplet_to_orthonormal,
@@ -91,6 +102,12 @@ __all__ = [
     'ConstrainedBrownianState',
     # Stresslet-constrained mobility.
     'make_constrained_solver',
+    # Full Stokesian Dynamics: near-field + saddle-point solve.
+    'build_nearfield_resistance',
+    'NearFieldState',
+    'build_saddle_solve',
+    'SaddleState',
+    'Ic0Preconditioner',
     # Constrained Brownian dynamics.
     'make_constrained_brownian_step',
     'run_brownian_chunked',

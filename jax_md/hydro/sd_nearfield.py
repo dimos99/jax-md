@@ -49,7 +49,7 @@ from jax_md.hydro.rpy_real_lattice_helpers import (
     _neighbor_box_from_matrix,
     _worst_case_shear_neighbor_box,
 )
-from jax_md.hydro import rpy_nearfield_table as nf_table
+from jax_md.hydro import sd_nearfield_table as nf_table
 
 
 # Packed generalized-coordinate layout (per particle).
@@ -103,7 +103,7 @@ def _build_pair_operators(rhat, scalars, a, eta):
   Args:
     rhat: (E, 3) unit vectors from receiver i to sender j.
     scalars: (E, 22) interpolated near-field scalar functions (FSD bare units),
-      column order :data:`rpy_nearfield_table.COLUMN_NAMES`.
+      column order :data:`sd_nearfield_table.COLUMN_NAMES`.
     a, eta: sphere radius and viscosity.
 
   Returns:
