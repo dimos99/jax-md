@@ -215,6 +215,8 @@ def build_saddle_solve(
 
   zeta = 6.0 * math.pi * float(eta) * float(a)
   r_p = 2.1 * float(a) if r_p is None else float(r_p)
+  r_lub_resolved = (nf_table.R_LUB_OVER_A * float(a) if r_lub is None
+                    else float(r_lub))
 
   # -- Resolve xi (and any grid params the estimator supplies) --------------
   grid_kwargs = dict(rpy_kwargs)
@@ -335,6 +337,11 @@ def build_saddle_solve(
       x0=None,
       zero_nearfield: bool = False,
       preconditioner: Optional[str] = None,
+      slip_top: Optional[jnp.ndarray] = None,
+      extra_force: Optional[jnp.ndarray] = None,
+      ic0=None,
+      tol: Optional[float] = None,
+      atol: Optional[float] = None,
   ):
     """Solve the saddle system at a fixed configuration.
 
@@ -351,6 +358,19 @@ def build_saddle_solve(
       preconditioner: override the builder default (``'ic0'`` or ``'jacobi'``).
         ``'ic0'`` is built host-side from ``state`` and needs concrete positions;
         use ``'jacobi'`` under ``jit``/``vmap``.
+      slip_top: optional far-field Brownian slip ``U^B`` ``(N,11)`` added to the
+        RHS top block (Phase 3); default 0.  Covariance ``(2kT/dt) M_grand``.
+      extra_force: optional generalized force ``(N,6)`` added inside the bottom
+        block (Phase 3): the near-field Brownian force ``F^B_nf`` for the main
+        solve, or the RFD displacement ``Delta q`` for the drift solves.
+      ic0: optional prebuilt :class:`Ic0Preconditioner` used in place of a
+        host rebuild from ``state`` -- lets the RFD displaced solves reuse the
+        factor built at ``q`` (only affects convergence, never the solution).
+      tol: GMRES relative tolerance override (default builder ``gmres_tol``).
+      atol: GMRES absolute tolerance override (default 0.0).  The RFD displaced
+        solves set a fixed ``atol`` (with ``tol=0``) so both converge to the
+        same *absolute* residual regardless of warm-start -- the drift divides
+        ``U_+ - U_-`` by a tiny ``eps`` and amplifies any residual asymmetry.
 
     Returns:
       ``(U_rel, Omega_rel, S5, F_moments, info)`` -- relative velocities
@@ -398,11 +418,18 @@ def build_saddle_solve(
       return (top, bot)
 
     # -- RHS ---------------------------------------------------------------
-    # b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots).
+    # b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots),
+    # plus the optional far-field Brownian slip U^B (Phase 3).
     b1 = grand_to_flat(
         jnp.zeros((N, 3), dtype=dtype), stresslet_to_couplet(e5))
-    # b2 = -(F^P + R^nf_FE : E^inf) in FU force space.
-    b2 = -(fp6 + rnf_FE(e5))
+    if slip_top is not None:
+      b1 = b1 + jnp.asarray(slip_top, dtype=dtype)
+    # b2 = -(F^P + extra_force + R^nf_FE : E^inf) in FU force space.  The
+    # optional extra_force is the near-field Brownian force F^B_nf (main solve)
+    # or the RFD displacement Delta q (drift solves).
+    extra = (jnp.zeros((N, 6), dtype=dtype) if extra_force is None
+             else jnp.asarray(extra_force, dtype=dtype))
+    b2 = -(fp6 + extra + rnf_FE(e5))
 
     if x0 is None:
       x0 = (jnp.zeros((N, 11), dtype=dtype), jnp.zeros((N, 6), dtype=dtype))
@@ -412,16 +439,20 @@ def build_saddle_solve(
     if pc not in ('ic0', 'jacobi'):
       raise ValueError("preconditioner must be 'ic0' or 'jacobi', got %r" % (pc,))
     # With R^nf = 0 the Schur is exactly zeta I, so IC(0) degenerates to
-    # block-Jacobi -- skip the host factor in that case.
+    # block-Jacobi -- skip the host factor in that case.  A prebuilt ic0
+    # (e.g. reused across RFD displaced solves) takes precedence over a rebuild.
     if pc == 'ic0' and not zero_nearfield:
-      ic0 = build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta)
-      M_op = _make_ic0_pinv(ic0)
+      ic0_obj = (ic0 if ic0 is not None
+                 else build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta))
+      M_op = _make_ic0_pinv(ic0_obj)
     else:
       M_op = _apply_pinv
 
+    _tol = gmres_tol if tol is None else float(tol)
+    _atol = 0.0 if atol is None else float(atol)
     x, conv_info = sparse_linalg.gmres(
         apply_A, (b1, b2), x0=x0,
-        tol=gmres_tol, atol=0.0,
+        tol=_tol, atol=_atol,
         restart=int(gmres_restart), maxiter=int(gmres_maxiter),
         M=M_op,
     )
@@ -555,6 +586,13 @@ def build_saddle_solve(
   solve_fn.count_iterations = count_iterations
   solve_fn.zeta = zeta
   solve_fn.r_p = r_p
+  # Exposed for the Phase-3 Brownian builder (sd_brownian.py): the resolved
+  # Ewald split, the near-field apply, and the physical scales.
+  solve_fn.xi = xi
+  solve_fn.nf_apply = nf_apply
+  solve_fn.a = float(a)
+  solve_fn.eta = float(eta)
+  solve_fn.r_lub = r_lub_resolved
 
   return init_fn, solve_fn
 
@@ -629,6 +667,45 @@ def assemble_stilde(cart, box, a, eta, r_p, zeta):
           vals.append(v)
   S = sp.csr_matrix((vals, (rows, cols)), shape=(6 * N, 6 * N))
   return 0.5 * (S + S.T)                        # symmetrize tiny asymmetries
+
+
+def nearfield_FU_diagonal(cart, box, a, eta, r_lub):
+  """Per-DOF diagonal of the *full* ``R^nf_FU`` and the neighborless mask.
+
+  Returns ``(diag6 (N,6), has_neighbor (N,) bool)``: the six diagonal entries
+  of each particle's ``6x6`` FU self block, and whether the particle has any
+  neighbor within ``r_lub``.  Used by the Phase-3 near-field Brownian sampler to
+  build the diagonal scaling ``D`` (small/large/zero cases) and the neighborless
+  projector ``Proj`` / conditioning shift ``Shift_nn``.
+
+  Shares the cutoff membership (strict ``r2 < r_lub^2``) and the
+  ``interpolate_scalars`` + ``_build_pair_operators`` path with the matrix-free
+  matvec (``sd_nearfield._core``), so "my diagonal is exactly zero" agrees with
+  "I do not contribute" bit-for-bit at the cutoff.  This is why ``Proj`` zeros
+  exactly the rows that vanish in the operator -- no covariance error at ``r_lub``.
+  """
+  cart = np.asarray(cart, dtype=np.float64)
+  box = np.asarray(box, dtype=np.float64)
+  N = cart.shape[0]
+  disp = _min_image_cart(cart, box)             # (N,N,3), out[i,j] = r_j - r_i
+  r2 = np.sum(disp * disp, axis=-1)
+  r_lub2 = float(r_lub) ** 2
+  diag6 = np.zeros((N, 6))
+  has_neighbor = np.zeros((N,), dtype=bool)
+  for i in range(N):
+    js = np.where((r2[i] < r_lub2) & (r2[i] > 1e-12))[0]
+    if js.size == 0:
+      continue
+    has_neighbor[i] = True
+    rij = disp[i, js]                            # (k,3) i->j
+    r = np.sqrt(r2[i, js])
+    rhat = rij / r[:, None]
+    scal = np.asarray(nf_table.interpolate_scalars(jnp.asarray(r), a))
+    R_self, _ = _build_pair_operators(
+        jnp.asarray(rhat), jnp.asarray(scal), a, eta)
+    self_block = np.asarray(R_self)[:, :6, :6].sum(axis=0)   # (6,6)
+    diag6[i] = np.diag(self_block)
+  return diag6, has_neighbor
 
 
 def _ic0(A_csc, relax=0.0):
@@ -711,6 +788,25 @@ class Ic0Preconditioner:
     out = np.empty_like(b)
     out[self.perm] = u
     return out
+
+  # -- Forward / inverse triangular applies in the RCM-permuted ordering -----
+  # These expose the factor pieces the Phase-3 near-field Brownian square root
+  # needs (sd_brownian.py): the Lanczos operator uses L^{-1}, L^{-T}; the
+  # unwind uses the forward L.  All act on vectors already in *permuted*
+  # ordering (caller permutes at the boundary via ``perm`` / ``inv_perm``).
+  def apply_L(self, x):
+    """``L @ x`` (forward, lower-triangular) in permuted ordering."""
+    return self.L @ np.asarray(x, dtype=np.float64)
+
+  def apply_L_inv(self, x):
+    """``L^{-1} x`` (lower-triangular solve) in permuted ordering."""
+    return spsolve_triangular(self.L, np.asarray(x, dtype=np.float64),
+                              lower=True)
+
+  def apply_LT_inv(self, x):
+    """``L^{-T} x`` (upper-triangular solve) in permuted ordering."""
+    return spsolve_triangular(self.LT, np.asarray(x, dtype=np.float64),
+                              lower=False)
 
 
 def build_ic0_from_state(state, a, eta, *, r_p, zeta):

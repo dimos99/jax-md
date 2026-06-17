@@ -69,6 +69,13 @@ from jax_md.hydro.rpy_saddle import (
     Ic0Preconditioner,
 )
 
+from jax_md.hydro.sd_brownian import (
+    build_sd_brownian_step,
+    nearfield_brownian_force,
+    make_nearfield_brownian_sampler,
+    make_far_field_slip_sampler,
+)
+
 from jax_md.hydro.rpy_moments import (
     couplet_to_stresslet_torque,
     couplet_to_orthonormal,
