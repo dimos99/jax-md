@@ -40,7 +40,6 @@ from jax_md import space  # noqa: E402
 from jax_md.hydro import sd_brownian as sdb  # noqa: E402
 from jax_md.hydro.rpy_saddle import (  # noqa: E402
     build_saddle_solve,
-    build_ic0_from_state,
     _gv_from_u6,
 )
 
@@ -146,14 +145,11 @@ def test_nearfield_force_covariance_preconditioned_matches_bare():
   state = init_fn(pos)
   R = _dense_rnf_FU(solve_fn, state, pos)
   target = 2.0 * R
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
 
-  # Preconditioned sampler uses host triangular solves (pure_callback) -> loop
-  # the jitted sampler (compiled once) rather than vmap.
+  # Preconditioned sampler is the on-device Jacobi-split square root (no host
+  # IC(0), no pure_callback) and must give the same covariance as the bare one.
   sampler = sdb.make_nearfield_brownian_sampler(
-      solve_fn, state, pos, 1.0, 1.0, preconditioned=True, iters=40,
-      tol=1e-8, ic0=ic0)
+      solve_fn, state, pos, 1.0, 1.0, preconditioned=True, iters=40, tol=1e-8)
   keys = jax.random.split(jax.random.PRNGKey(2), 800)
   Fp = np.array([np.asarray(sampler(k)).reshape(-1) for k in keys])
   Cp = np.cov(Fp.T, bias=True)
@@ -172,11 +168,8 @@ def test_neighborless_force_exactly_zero_preconditioned():
   # (force rows 0:3 AND torque rows 3:6, where a 4/3-in-the-projector bug leaks).
   init_fn, solve_fn, pos, _ = _build(_pair_and_isolated(), 30.0)
   state = init_fn(pos)
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
   sampler = sdb.make_nearfield_brownian_sampler(
-      solve_fn, state, pos, 1.0, 1.0, preconditioned=True, iters=40,
-      tol=1e-8, ic0=ic0)
+      solve_fn, state, pos, 1.0, 1.0, preconditioned=True, iters=40, tol=1e-8)
   for seed in range(8):
     F = sampler(jax.random.PRNGKey(seed))
     assert float(jnp.max(jnp.abs(F[2]))) == 0.0
@@ -208,20 +201,17 @@ def test_full_displacement_covariance_internal():
   state = init_fn(pos)
   kT, dt = 1.0, 1.0
   RFU_inv = _dense_RFU_inv(solve_fn, state, pos)
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
 
   slip_sampler = sdb.make_far_field_slip_sampler(solve_fn, state, pos, kT, dt)
   nf_sampler = sdb.make_nearfield_brownian_sampler(
-      solve_fn, state, pos, kT, dt, preconditioned=True, iters=40,
-      tol=1e-8, ic0=ic0)
+      solve_fn, state, pos, kT, dt, preconditioned=True, iters=40, tol=1e-8)
 
   def stochastic_velocity(key):
     k_slip, k_nf = jax.random.split(key)
     U_B_flat = slip_sampler(k_slip)
     F_B_nf = nf_sampler(k_nf)
     U, Om, _s5, _q, _info = solve_fn(
-        state, pos, slip_top=U_B_flat, extra_force=F_B_nf, ic0=ic0)
+        state, pos, slip_top=U_B_flat, extra_force=F_B_nf)
     return np.asarray(jnp.concatenate([U, Om], axis=-1)).reshape(-1)
 
   keys = jax.random.split(jax.random.PRNGKey(7), 800)
@@ -269,13 +259,11 @@ def test_dilute_stokes_einstein_external():
 def test_rfd_drift_eps_independence():
   init_fn, solve_fn, pos, shift_fn = _build(_pair_and_isolated(), 30.0)
   state = init_fn(pos)
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
   key = jax.random.PRNGKey(11)
   drifts = {}
   for eps in (1e-3, 1e-4, 1e-5):
     drifts[eps] = np.asarray(sdb.rfd_drift(
-        init_fn, solve_fn, pos, key, ic0=ic0, eps=eps, kT=1.0,
+        solve_fn, state, pos, key, eps=eps, kT=1.0,
         shift_fn=shift_fn, atol=1e-11))
   ref = drifts[1e-4]
   scale = np.linalg.norm(ref)
@@ -293,14 +281,12 @@ def test_rfd_warmstart_tolerance_matters():
   # speedup) is what makes the RFD estimate correct.
   init_fn, solve_fn, pos, shift_fn = _build(_pair_and_isolated(), 30.0)
   state = init_fn(pos)
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
   key = jax.random.PRNGKey(11)
   good = np.asarray(sdb.rfd_drift(
-      init_fn, solve_fn, pos, key, ic0=ic0, eps=1e-4, kT=1.0,
+      solve_fn, state, pos, key, eps=1e-4, kT=1.0,
       shift_fn=shift_fn, atol=1e-11))
   bad = np.asarray(sdb.rfd_drift(
-      init_fn, solve_fn, pos, key, ic0=ic0, eps=1e-4, kT=1.0,
+      solve_fn, state, pos, key, eps=1e-4, kT=1.0,
       shift_fn=shift_fn, atol=1e-11, atol2=1e-2))   # under-converged 2nd solve
   assert np.linalg.norm(good) > 1e-6                       # true drift nonzero
   assert np.linalg.norm(good - bad) / np.linalg.norm(good) > 0.1  # bad differs
@@ -312,15 +298,12 @@ def test_rfd_warmstart_tolerance_matters():
 def test_key_streams_independent():
   init_fn, solve_fn, pos, _ = _build(_pair_and_isolated(), 30.0)
   state = init_fn(pos)
-  ic0 = build_ic0_from_state(state, solve_fn.a, solve_fn.eta,
-                             r_p=solve_fn.r_p, zeta=solve_fn.zeta)
   N = pos.shape[0]
   kT, dt = 1.0, 1.0
 
   slip_sampler = sdb.make_far_field_slip_sampler(solve_fn, state, pos, kT, dt)
   nf_sampler = sdb.make_nearfield_brownian_sampler(
-      solve_fn, state, pos, kT, dt, preconditioned=True, iters=30,
-      tol=1e-8, ic0=ic0)
+      solve_fn, state, pos, kT, dt, preconditioned=True, iters=30, tol=1e-8)
   slips, nfs, dqs = [], [], []
   for seed in range(256):
     k_slip, k_nf, k_rfd = jax.random.split(jax.random.PRNGKey(1000 + seed), 3)

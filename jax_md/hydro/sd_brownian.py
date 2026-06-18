@@ -21,9 +21,13 @@ deterministic solve already inverts (Fiore & Swan 2019):
 * **RFD drift** -- two extra displaced saddle solves with a fixed RHS (Sec. 4).
 
 Everything is additive and gated behind the SD-Brownian path; the RPY and
-stresslet-RPY Brownian paths are untouched.  The step runs *eagerly* (host
-RCM/IC(0) factor + ``jax.pure_callback`` triangular solves), like the Phase-2
-``solve_fn``; production-fast jitting is deferred.
+stresslet-RPY Brownian paths are untouched.  The whole step is **device
+resident and jitted**: the deterministic/RFD saddle solves use the on-device
+Chebyshev-Schur preconditioner (the ``build_saddle_solve`` default) and the
+Brownian square roots use on-device
+samplers (real-space Lanczos + analytic wave-space + Jacobi-preconditioned
+near-field Lanczos), so there is no host IC(0) factor and no ``jax.pure_callback``
+anywhere in the timestep.
 
 Near-field preconditioner -- the covariance-correctness landmine
 ----------------------------------------------------------------
@@ -49,6 +53,7 @@ covariance corruption.  The separation prevents it by construction; check 1's
 torque-row assertion is the empirical gate.
 """
 
+from functools import partial
 from typing import Callable, Optional, Tuple
 
 import jax
@@ -57,8 +62,6 @@ import numpy as np
 
 from jax_md.hydro.rpy_saddle import (
     build_saddle_solve,
-    build_ic0_from_state,
-    nearfield_FU_diagonal,
     _gv_from_u6,
 )
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE
@@ -81,7 +84,8 @@ _SHIFT_PATTERN = np.array([1.0, 1.0, 1.0, 4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0])
 # Sec. 1 -- far-field Brownian slip (reuses the existing PSE grand sampler)
 # ---------------------------------------------------------------------------
 def make_far_field_slip_sampler(solve_fn, state, positions, kT, dt, *,
-                                mr_iters=50, lanczos_tol=1e-3):
+                                mr_iters=50, lanczos_tol=1e-3, precond=None,
+                                wave_sqrt=None):
   """Build a jitted far-field slip sampler ``sampler(key) -> U_B_flat (N,11)``.
 
   ``Cov(U_B_flat) = (2kT/dt) M_grand`` -- the slip *velocity* in the flat-11
@@ -89,13 +93,23 @@ def make_far_field_slip_sampler(solve_fn, state, positions, kT, dt, *,
   real-space grand Lanczos under ``jit`` (suppresses the eager non-convergence
   raise) and reuses the analytic wave-space square root.  ``state.rpy.wave``
   must carry the grand ``Pdip`` modes (the saddle's stresslet mobility does).
+
+  ``precond`` is the config-independent grand Jacobi preconditioner; pass a
+  prebuilt one (it calls the jitted ``Mr_self``, so building it *inside* an
+  outer ``jit`` would raise a ConcretizationTypeError on its ``float(...)``).
   """
   positions = jnp.asarray(positions, dtype=REAL_DTYPE)
-  precond = grand_jacobi_preconditioner(solve_fn.a, solve_fn.xi, solve_fn.eta)
+  if precond is None:
+    precond = grand_jacobi_preconditioner(
+        solve_fn.a, solve_fn.xi, solve_fn.eta)
   real_sampler = make_real_grand_slip_sampler(
       real_state=state.rpy.real, positions=positions,
       preconditioner=precond, iters=mr_iters, tol=lanczos_tol)
-  wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
+  # The wave sqrt sampler bakes in the (static-box) grid stencil support P /
+  # mode arrays, which must be concrete -- pass a prebuilt one when constructing
+  # this inside an outer jit (see ``build_sd_brownian_step``).
+  if wave_sqrt is None:
+    wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
   slip_sampler = make_grand_slip_sampler(
       real_sampler=real_sampler,
       wave_sampler=lambda k: wave_sqrt(k, positions, None),
@@ -122,8 +136,7 @@ def far_field_slip(solve_fn, state, positions, kT, dt, key, *,
 # Sec. 2 -- near-field Brownian force (the new preconditioned square root)
 # ---------------------------------------------------------------------------
 def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
-                                    preconditioned=True, iters=20, tol=1e-3,
-                                    ic0=None):
+                                    preconditioned=True, iters=20, tol=1e-3):
   """Build a jitted sampler ``F^B_nf ~ N(0, (2kT/dt) R^nf_FU)`` ``(N,6)``.
 
   Returns ``sampler(key) -> F (N,6)``.  The square root runs under ``jit`` so a
@@ -133,18 +146,23 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
 
   ``preconditioned=False`` is the bare square root of the matrix-free
   ``R^nf_FU`` (first-light covariance gate).  ``preconditioned=True`` adds the
-  ``D / L / Shift_nn / Proj`` conditioning and must give the *same* covariance.
+  on-device ``D / Shift_nn / Proj`` Jacobi conditioning and must give the *same*
+  covariance.
   """
   positions = jnp.asarray(positions, dtype=REAL_DTYPE)
   N = positions.shape[0]
-  a, eta = solve_fn.a, solve_fn.eta
-  zeta, r_p, r_lub = solve_fn.zeta, solve_fn.r_p, solve_fn.r_lub
+  zeta = solve_fn.zeta
   nf_apply = solve_fn.nf_apply
   scale = jnp.sqrt(jnp.asarray(2.0 * kT / dt, dtype=REAL_DTYPE))
 
   def rnf_FU(u6):
-    """Matrix-free ``R^nf_FU``: ``(N,6) [U|Omega] -> (N,6) [F|L]``."""
-    gf, _ = nf_apply(state.nf, positions, _gv_from_u6(u6))
+    """Matrix-free ``R^nf_FU``: ``(N,6) [U|Omega] -> (N,6) [F|L]``.
+
+    Uses ``apply_prepared`` (no per-Lanczos-iteration neighbor rebuild): the
+    sample is drawn at the fixed configuration ``positions`` for which
+    ``state.nf.neighbors`` was built.
+    """
+    gf = nf_apply.apply_prepared(state.nf, positions, _gv_from_u6(u6))
     return gf[..., :6]
 
   if not preconditioned:
@@ -156,98 +174,68 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
       return scale * half
     return sampler
 
-  # -- Host-side preconditioner pieces (built once at this configuration) ----
-  box = np.asarray(state.rpy.real.box_matrix, dtype=np.float64)
-  cart = np.asarray(positions, dtype=np.float64) @ box.T
-  if ic0 is None:
-    ic0 = build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta)
-  diag6, has_neighbor = nearfield_FU_diagonal(cart, box, a, eta, r_lub)
-
+  # -- On-device Jacobi (diagonal) preconditioner pieces (built once) --------
+  # The preconditioner only conditions the Lanczos square root; it does not
+  # change the sampled covariance (the Shift_nn / Proj separation below does
+  # that exactly).  The host RCM + IC(0) factor is replaced by the diagonal
+  # split ``D = sqrt(diag(R^nf_FU))`` -- fully jittable, no ``pure_callback``.
+  diag6, has_neighbor = nf_apply.diagonal_FU_mask_prepared(state.nf, positions)
   d = diag6.reshape(-1)                                    # (6N,) per-DOF diag
-  D = np.where((d > 0.0) & (d < zeta), np.sqrt(d), 1.0)    # diagonal scaling
+  D = jnp.where((d > 0.0) & (d < zeta), jnp.sqrt(d), 1.0)  # diagonal scaling
+  no_nbr = (~has_neighbor)[:, None]                        # (N,1)
   # Additive conditioning shift (operator only); zeta*(1,1,1,4/3,4/3,4/3) on
   # neighborless rows -- value irrelevant to the covariance, projected out below.
-  shift = np.zeros((N, 6), dtype=np.float64)
-  shift[~has_neighbor] = zeta * _SHIFT_PATTERN
-  shift = shift.reshape(-1)
+  shift = (no_nbr * (zeta * jnp.asarray(_SHIFT_PATTERN, dtype=REAL_DTYPE))
+           ).reshape(-1)                                   # (6N,)
   # Strict 0/1 output projector (unwind only); zeros the (exactly zero) rows of
   # neighborless particles.  NOT 1 - shift: carries no 4/3.
-  proj = np.ones((N, 6), dtype=np.float64)
-  proj[~has_neighbor] = 0.0
-  proj = proj.reshape(-1)
+  proj = jnp.where(no_nbr, jnp.asarray(0.0, REAL_DTYPE),
+                   jnp.asarray(1.0, REAL_DTYPE))
+  proj = jnp.broadcast_to(proj, (N, 6)).reshape(-1)        # (6N,)
 
-  perm = np.asarray(ic0.perm)
-  D_j = jnp.asarray(D, dtype=REAL_DTYPE)
-  Dp_j = jnp.asarray(D[perm], dtype=REAL_DTYPE)            # permuted diagonal
-  shift_j = jnp.asarray(shift, dtype=REAL_DTYPE)
-  proj_j = jnp.asarray(proj, dtype=REAL_DTYPE)
-  perm_j = jnp.asarray(perm)
-  inv_perm_j = jnp.asarray(ic0.inv_perm)
-
-  # Host triangular solves / forward apply bridged into JAX.
-  def _Linv(v):
-    return jax.pure_callback(
-        lambda x: ic0.apply_L_inv(x).astype(np.float64),
-        jax.ShapeDtypeStruct(v.shape, REAL_DTYPE), v)
-
-  def _LTinv(v):
-    return jax.pure_callback(
-        lambda x: ic0.apply_LT_inv(x).astype(np.float64),
-        jax.ShapeDtypeStruct(v.shape, REAL_DTYPE), v)
-
-  def _L(v):
-    return jax.pure_callback(
-        lambda x: ic0.apply_L(x).astype(np.float64),
-        jax.ShapeDtypeStruct(v.shape, REAL_DTYPE), v)
-
-  def rshift_perm(wp):
-    """``P (R^nf_FU + Shift_nn) Pᵀ`` on a permuted vector ``wp`` (6N,)."""
-    w_orig = wp[inv_perm_j]                                # Pᵀ wp -> original
-    Rw = rnf_FU(w_orig.reshape(N, 6)).reshape(-1) + shift_j * w_orig
-    return Rw[perm_j]                                      # P (...) -> permuted
-
-  def apc(_params, vp):
-    """Symmetric PSD preconditioned shifted operator (permuted ordering)."""
-    a1 = _LTinv(vp)
-    a2 = a1 / Dp_j
-    a3 = rshift_perm(a2)
-    a4 = a3 / Dp_j
-    return _Linv(a4)
+  def apc(_params, v):
+    """Symmetric PSD Jacobi-preconditioned shifted operator ``D^-1(R+Shift)D^-1``."""
+    a2 = v / D
+    Ra = rnf_FU(a2.reshape(N, 6)).reshape(-1) + shift * a2
+    return Ra / D
 
   @jax.jit
   def sampler(key):
     noise = jax.random.normal(key, (6 * N,), dtype=REAL_DTYPE)
     z = lanczos_sqrt_mv(apc, None, noise, iters=iters, tol=tol,
                         return_info=True)[0]
-    # Unwind: F = sqrt(c) * Proj * D * Pᵀ * L * z  (original ordering).
-    Lz_orig = _L(z)[inv_perm_j]                            # L z, then Pᵀ
-    return scale * (proj_j * D_j * Lz_orig).reshape(N, 6)
+    # Unwind: F = sqrt(c) * Proj * D * z.  Cov(F) = c * Proj (R+Shift) Proj
+    # = c * R^nf_FU exactly (Proj annihilates the Shift rows; R vanishes there).
+    return scale * (proj * D * z).reshape(N, 6)
 
   return sampler
 
 
 def nearfield_brownian_force(solve_fn, state, positions, kT, dt, key, *,
-                             preconditioned=True, iters=20, tol=1e-3, ic0=None):
+                             preconditioned=True, iters=20, tol=1e-3):
   """Convenience single draw of ``F^B_nf`` (builds and calls a jitted sampler)."""
   sampler = make_nearfield_brownian_sampler(
       solve_fn, state, positions, kT, dt,
-      preconditioned=preconditioned, iters=iters, tol=tol, ic0=ic0)
+      preconditioned=preconditioned, iters=iters, tol=tol)
   return sampler(key)
 
 
 # ---------------------------------------------------------------------------
 # Sec. 4 -- thermal drift via random finite differencing (Delong et al. 2014)
 # ---------------------------------------------------------------------------
-def rfd_drift(init_fn, solve_fn, positions, key, *, ic0, eps, kT, shift_fn,
-              atol=1e-8, atol2=None, step_kwargs=None):
+def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
+              atol=1e-8, atol2=None, step_kwargs=None,
+              gmres_restart=None, gmres_maxiter=None):
   """Random-finite-difference estimate of ``kT div R_FU^{-1}`` as a velocity.
 
   Two displaced saddle solves at ``q +/- (eps/2) dq`` with the fixed RHS
   ``(0; -dq)`` (over generalized force ``(N,6)``); drift ``= (kT/eps)(U_+ - U_-)``.
-  The IC(0) factor ``ic0`` (built at ``q``) is **reused** for both displaced
-  solves (it only affects convergence, never the solution).  Both solves use a
-  fixed *absolute* GMRES tolerance ``atol`` (with ``tol=0``) so the difference
-  is not corrupted by a warm-start residual asymmetry (amplified by ``1/eps``).
+  The displaced positions are within ``eps/2`` (``~1e-4``) of ``q`` -- far inside
+  the neighbor-list skin ``dr_threshold`` -- so the ``state`` (neighbor lists +
+  wave precompute) built at ``q`` is **reused** for both displaced solves: no
+  host ``init_fn`` rebuild, and the whole drift is jittable.  Both solves use a
+  fixed *absolute* GMRES tolerance ``atol`` (with ``tol=0``) so the difference is
+  not corrupted by a warm-start residual asymmetry (amplified by ``1/eps``).
 
   ``atol2`` overrides the absolute tolerance of the second (warm-started) solve;
   default ``atol``.  Used only by the validation negative control -- loosening it
@@ -262,14 +250,16 @@ def rfd_drift(init_fn, solve_fn, positions, key, *, ic0, eps, kT, shift_fn,
 
   q_plus = shift_fn(positions, 0.5 * eps * dq_pos, **step_kwargs)
   q_minus = shift_fn(positions, -0.5 * eps * dq_pos, **step_kwargs)
-  state_p = init_fn(q_plus)
-  state_m = init_fn(q_minus)
 
   Up, Op, _s5p, q11p, _ip = solve_fn(
-      state_p, q_plus, extra_force=dq6, ic0=ic0, tol=0.0, atol=atol)
+      state, q_plus, extra_force=dq6, tol=0.0, atol=atol,
+      gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
+      return_stresslet=False, return_residual=False)
   x0 = (q11p, jnp.concatenate([Up, Op], axis=-1))          # warm start
   Um, Om, _s5m, _q11m, _im = solve_fn(
-      state_m, q_minus, extra_force=dq6, ic0=ic0, x0=x0, tol=0.0, atol=atol2)
+      state, q_minus, extra_force=dq6, x0=x0, tol=0.0, atol=atol2,
+      gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
+      return_stresslet=False, return_residual=False)
 
   U_plus = jnp.concatenate([Up, Op], axis=-1)
   U_minus = jnp.concatenate([Um, Om], axis=-1)
@@ -297,6 +287,10 @@ def build_sd_brownian_step(
     nf_iters: int = 20,
     lanczos_tol: float = 1e-3,
     gmres_tol: float = 1e-3,
+    rfd_gmres_restart: Optional[int] = None,
+    rfd_gmres_maxiter: Optional[int] = None,
+    return_stresslet: bool = True,
+    return_residual: bool = True,
     **rpy_kwargs,
 ) -> Tuple[Callable, Callable]:
   """Build the overdamped FSD Brownian timestep (Euler--Maruyama + RFD drift).
@@ -307,10 +301,17 @@ def build_sd_brownian_step(
     dt, kT: timestep and thermal energy.
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
     rfd_epsilon: RFD finite-difference step (confirm drift is ``eps``-independent).
-    rfd_atol: absolute GMRES tolerance for the two RFD displaced solves.
+    rfd_atol: absolute GMRES tolerance for the two RFD displaced solves.  In
+      float32 this is clamped up to a reachable floor (~1e-5): with the f32
+      residual floor at ~1e-6, an unreachable ``atol`` (e.g. 1e-8) would make
+      every RFD GMRES burn its full ``gmres_restart*gmres_maxiter`` budget.
     r_lub, r_p: near-field and IC(0)-truncation cutoffs (defaults ``4a`` / ``2.1a``).
     mr_iters, nf_iters: Lanczos iteration caps for the far/near-field samplers.
     lanczos_tol, gmres_tol: square-root and saddle-solve tolerances.
+    rfd_gmres_restart, rfd_gmres_maxiter: GMRES budget for the two RFD displaced
+      solves (default = the main-solve budget; in float32 ``maxiter`` defaults to
+      2 so the RFD solves cannot burn the full budget once the clamped ``atol``
+      is reached).  RFD only needs a coarse drift, so a small budget is fine.
     **rpy_kwargs: forwarded to ``build_saddle_solve`` / ``build_rpy_mobility``.
 
   Returns:
@@ -324,49 +325,132 @@ def build_sd_brownian_step(
     ``U_main`` already superposes the deterministic and Brownian contributions
     from the single combined solve.  ``S5`` is the total stresslet ``(N,5)``.
   """
+  # The whole step is jitted end-to-end, so the saddle solve must use an
+  # on-device preconditioner.  ``'ic0'`` builds a host RCM + incomplete-Cholesky
+  # factor from the (traced) state arrays inside the jitted solve and would raise
+  # a TracerArrayConversionError on the first step -- reject it here rather than
+  # let it leak through ``**rpy_kwargs`` into ``build_saddle_solve``.
+  if rpy_kwargs.get('preconditioner') == 'ic0':
+    raise ValueError(
+        "build_sd_brownian_step is jitted end-to-end; the host 'ic0' "
+        "preconditioner needs a pure_callback and cannot run under jit. Use "
+        "'cheb' (default), 'diag', or 'jacobi'.")
+
+  # Precision-aware tolerance floors: float32 GMRES/Lanczos residuals bottom out
+  # around ~1e-6, so a tighter target is unreachable and only burns iterations.
+  _f32 = REAL_DTYPE == jnp.float32
+  _tol_floor = 1e-5 if _f32 else 0.0
+  rfd_atol = max(float(rfd_atol), _tol_floor)
+  lanczos_tol = max(float(lanczos_tol), _tol_floor)
+  gmres_tol = max(float(gmres_tol), _tol_floor)
+  # In f32 also cap the RFD GMRES budget hard: the RFD finite-difference drift
+  # only needs a coarse solve, and in f32 the required residual (<< eps) is at
+  # the precision floor so extra Krylov dimension / restarts cannot help -- they
+  # only burn time.  A small fixed Krylov basis bounds the per-RFD-solve cost.
+  if _f32:
+    if rfd_gmres_restart is None:
+      rfd_gmres_restart = 20
+    if rfd_gmres_maxiter is None:
+      rfd_gmres_maxiter = 1
+
   init_fn, solve_fn = build_saddle_solve(
       space_fns, a, eta,
       xi=xi, n_particles=n_particles, phi=phi,
       r_lub=r_lub, r_p=r_p, gmres_tol=gmres_tol,
       **rpy_kwargs)
   shift_fn = space_fns[1]
-  a_f, eta_f = float(a), float(eta)
-  zeta = solve_fn.zeta
+  # The RFD displaced solves reuse the neighbor lists built at ``q`` (no rebuild
+  # at q +/- (eps/2) dq) -- valid only while the displacement stays well inside
+  # the neighbor-list skin, otherwise a pair entering the cutoff at the displaced
+  # config would be silently omitted from the drift.  The realized displacement
+  # is ``~rfd_epsilon`` (dq is unit-Gaussian), and the default skin is a fixed
+  # fraction (~0.1) of the near-field cutoff ``r_lub``; guard against a gross
+  # misconfiguration where ``rfd_epsilon`` is not negligible against that scale.
+  if rfd_epsilon >= 0.01 * solve_fn.r_lub:
+    raise ValueError(
+        "rfd_epsilon=%g is too large relative to the near-field cutoff "
+        "r_lub=%g: the RFD displaced solves reuse the neighbor list built at q, "
+        "which is only valid for displacements far inside the skin. Use "
+        "rfd_epsilon << 0.01*r_lub (default 1e-4)." % (rfd_epsilon, solve_fn.r_lub))
+  # Config-independent grand Jacobi preconditioner -- built once here (eagerly):
+  # it calls the jitted ``Mr_self``, so constructing it inside ``_step_core``
+  # would raise a ConcretizationTypeError on its ``float(...)``.
+  slip_precond = grand_jacobi_preconditioner(
+      solve_fn.a, solve_fn.xi, solve_fn.eta)
+  # The wave-space sqrt sampler bakes in the (static-box) grid stencil support /
+  # mode arrays, which must be concrete inside the jitted step.  It depends only
+  # on the box + grid (not positions or N), so it is built once from the first
+  # state and reused for every step.
+  _wave_cache = {}
 
-  def step_fn(state, positions_frac, key, *,
-              force=None, torque=None, E_inf=None):
-    q = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+  @partial(jax.jit, static_argnums=(6,))
+  def _step_core(state, q, key, force, torque, E_inf, wave_sqrt):
     # Clean key tree: the three random inputs must be independent (FD theorem,
     # positive split).  far_field_slip splits k_slip -> (real, wave) internally.
     k_slip, k_nf, k_rfd = jax.random.split(key, 3)
 
-    # IC(0) factor built once at q, reused for the main and both RFD solves.
-    ic0 = build_ic0_from_state(state, a_f, eta_f, r_p=solve_fn.r_p, zeta=zeta)
-
-    # (1) far-field slip; (2) near-field Brownian force.
+    # (1) far-field slip; (2) near-field Brownian force.  Both samplers are
+    # fully on-device (real-space Lanczos + analytic wave-space square root;
+    # on-device Jacobi-preconditioned near-field Lanczos) -- no host IC(0), no
+    # pure_callback -- so the whole step compiles to one XLA program.
     slip_sampler = make_far_field_slip_sampler(
-        solve_fn, state, q, kT, dt, mr_iters=mr_iters, lanczos_tol=lanczos_tol)
+        solve_fn, state, q, kT, dt, mr_iters=mr_iters,
+        lanczos_tol=lanczos_tol, precond=slip_precond, wave_sqrt=wave_sqrt)
     nf_sampler = make_nearfield_brownian_sampler(
         solve_fn, state, q, kT, dt, preconditioned=True,
-        iters=nf_iters, tol=lanczos_tol, ic0=ic0)
+        iters=nf_iters, tol=lanczos_tol)
     U_B_flat = slip_sampler(k_slip)
     F_B_nf = nf_sampler(k_nf)
 
     # (3) one combined deterministic + Brownian saddle solve.
     U_main, Om_main, S5, _q11, info = solve_fn(
         state, q, force=force, torque=torque, E_inf=E_inf,
-        slip_top=U_B_flat, extra_force=F_B_nf, ic0=ic0)
+        slip_top=U_B_flat, extra_force=F_B_nf,
+        return_stresslet=return_stresslet, return_residual=return_residual)
 
-    # (4) RFD thermal drift (reuses ic0; absolute-tol displaced solves).
+    # (4) RFD thermal drift (reuses state at q; absolute-tol displaced solves).
     U_drift6 = rfd_drift(
-        init_fn, solve_fn, q, k_rfd,
-        ic0=ic0, eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol)
+        solve_fn, state, q, k_rfd,
+        eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+        gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
 
     U_total6 = jnp.concatenate([U_main, Om_main], axis=-1) + U_drift6
     q_new = shift_fn(q, dt * (U_total6[..., :3] + info['U_inf']))
 
+    # Refresh the neighbor lists to q_new *inside* the jitted step (fused,
+    # on-device, shape-preserving) and hand the next state back in ``info`` --
+    # threading this avoids an eager host ``refresh_state`` between steps, whose
+    # per-step neighbor-list rebuilds are catastrophically slow on GPU.
+    next_state = solve_fn.refresh_state(state, q_new)
+
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
+    out_info['next_state'] = next_state
     return q_new, S5, out_info
+
+  def step_fn(state, positions_frac, key, *,
+              force=None, torque=None, E_inf=None):
+    q = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    N = q.shape[0]
+    # Resolve optional inputs to concrete arrays eagerly (None is untraceable);
+    # a zero (3,3) E_inf is the no-imposed-strain case solve_fn expects.
+    force = (jnp.zeros((N, 3), dtype=REAL_DTYPE) if force is None
+             else jnp.asarray(force, dtype=REAL_DTYPE))
+    torque = (jnp.zeros((N, 3), dtype=REAL_DTYPE) if torque is None
+              else jnp.asarray(torque, dtype=REAL_DTYPE))
+    E_inf = (jnp.zeros((3, 3), dtype=REAL_DTYPE) if E_inf is None
+             else jnp.asarray(E_inf, dtype=REAL_DTYPE))
+    # Build the wave sqrt sampler once from the concrete wave state (static box)
+    # and reuse it as a static arg so the jitted step compiles a single program.
+    wave_sqrt = _wave_cache.get('wave_sqrt')
+    if wave_sqrt is None:
+      wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
+      _wave_cache['wave_sqrt'] = wave_sqrt
+    return _step_core(state, q, key, force, torque, E_inf, wave_sqrt)
+
+  # Cheap host neighbor-list rebuild that reuses the wave state -- thread this
+  # between steps instead of calling ``init_fn`` again (which rebuilds the wave
+  # ``PjitFunction``s and forces the jitted step to recompile every step).
+  step_fn.refresh_state = solve_fn.refresh_state
 
   return init_fn, step_fn

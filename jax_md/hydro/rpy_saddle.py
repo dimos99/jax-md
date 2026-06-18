@@ -62,6 +62,7 @@ from jax_md import space
 from jax_md.hydro.rpy import build_rpy_mobility, estimate_rpy_params, RpyState
 from jax_md.hydro.rpy_real_det_dipole import mr_grand_matvec
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE, current_box_matrix
+from jax_md.hydro.rpy_real_lattice_helpers import _neighbor_box_from_matrix
 from jax_md.hydro.rpy_moments import (
     couplet_to_orthonormal,
     couplet_to_stresslet_torque,
@@ -173,7 +174,10 @@ def build_saddle_solve(
     gmres_maxiter: int = 4,
     r_lub: Optional[float] = None,
     r_p: Optional[float] = None,
-    preconditioner: str = 'ic0',
+    preconditioner: str = 'cheb',
+    cheb_degree: int = 24,
+    cheb_power_iters: int = 12,
+    cheb_safety: float = 1.2,
     fractional_coordinates: bool = True,
     **rpy_kwargs,
 ):
@@ -190,22 +194,41 @@ def build_saddle_solve(
     gmres_restart, gmres_maxiter: Krylov basis size and number of restarts.
     r_lub: near-field cutoff (default ``4a``).
     r_p: near-field truncation for the IC(0) Schur factor (default ``2.1a``).
-    preconditioner: default GMRES preconditioner, ``'ic0'`` (RCM + zero-fill
-      incomplete Cholesky of the truncated Schur ``S~ = zeta I + R~^nf_FU``;
-      ~3-5x fewer iterations and near-N-independent) or ``'jacobi'`` (the
-      pure-JAX block-Jacobi ``S~ = zeta I``).  IC(0) is built host-side per
-      configuration and applied via ``jax.pure_callback``; it requires concrete
-      positions, so a ``jit``/``vmap``-wrapped ``solve_fn`` must pass
-      ``preconditioner='jacobi'``.  Overridable per call on ``solve_fn``.
+    preconditioner: default GMRES preconditioner.  ``'cheb'`` (the default) is
+      the fully on-device Jacobi-preconditioned **Chebyshev** semi-iteration on
+      the Schur block ``S~ = zeta I + R^nf_FU`` (matrix-free, no host work, no
+      ``jax.pure_callback``, jittable).  On disordered (physical) suspensions it
+      converges in fewer iterations than the host ``'ic0'`` factor; the
+      near-field couplings it captures matter exactly when neighbour gaps vary,
+      which is where ``'jacobi'`` collapses.  ``'jacobi'`` is the cruder pure
+      block-Jacobi ``S~ = zeta I`` (cheapest, but degrades badly on disordered
+      dense configs).  ``'diag'`` is the diagonal-Schur
+      ``S~ = zeta I + diag(R^nf_FU)``.  ``'ic0'`` (RCM + zero-fill incomplete
+      Cholesky of the truncated Schur ``S~ = zeta I + R~^nf_FU``) is built
+      host-side per configuration and applied via ``jax.pure_callback`` --
+      accurate but it forces a device->host round trip per GMRES iteration and
+      cannot run under ``jit``/``vmap``; keep it for validation/comparison only.
+      Overridable per call on ``solve_fn``.
+    cheb_degree: number of Chebyshev iterations (matrix-free ``S~`` applies) per
+      Schur solve for ``'cheb'`` (default 24).  Higher degree trades cheap
+      near-field matvecs for fewer (expensive FFT) GMRES iterations.
+    cheb_power_iters: power iterations used once per solve to bound the largest
+      eigenvalue of the Jacobi-scaled Schur for ``'cheb'`` (default 12).
+    cheb_safety: multiplicative safety factor (>=1) on the estimated largest
+      eigenvalue so Chebyshev stays stable (default 1.2).
     **rpy_kwargs: forwarded to ``build_rpy_mobility`` (e.g. ``P``, ``Mgrid``,
       ``rcut``).
 
   Returns:
     ``(init_fn, solve_fn)``.
   """
-  if preconditioner not in ('ic0', 'jacobi'):
-    raise ValueError("preconditioner must be 'ic0' or 'jacobi', got %r"
-                     % (preconditioner,))
+  if preconditioner not in ('cheb', 'diag', 'ic0', 'jacobi'):
+    raise ValueError(
+        "preconditioner must be 'cheb', 'diag', 'ic0', or 'jacobi', got %r"
+        % (preconditioner,))
+  cheb_degree = int(cheb_degree)
+  cheb_power_iters = int(cheb_power_iters)
+  cheb_safety = float(cheb_safety)
   default_preconditioner = preconditioner
   if len(space_fns) > 2 and space_fns[2] is not None:
     # A box_fn is allowed in the tuple but live shear is not supported here.
@@ -214,6 +237,10 @@ def build_saddle_solve(
   box_fn = space_fns[2] if len(space_fns) > 2 else None
 
   zeta = 6.0 * math.pi * float(eta) * float(a)
+  # Builder-level GMRES budget defaults (solve_fn shadows the names with its own
+  # per-call override params, so capture them here for resolution).
+  _default_gmres_restart = int(gmres_restart)
+  _default_gmres_maxiter = int(gmres_maxiter)
   r_p = 2.1 * float(a) if r_p is None else float(r_p)
   r_lub_resolved = (nf_table.R_LUB_OVER_A * float(a) if r_lub is None
                     else float(r_lub))
@@ -258,6 +285,36 @@ def build_saddle_solve(
     nf_state = nf_init(positions_frac)
     return SaddleState(rpy=rpy_state, nf=nf_state, positions=positions_frac)
 
+  def refresh_state(state: SaddleState, positions_frac) -> SaddleState:
+    """Advance the state to ``positions_frac`` for stepping a simulation.
+
+    Uses the **shape-preserving** neighbor-list ``.update()`` (NOT ``init`` /
+    ``allocate``): the capacity stays fixed, so the jitted ``solve_fn`` /
+    Brownian step compiles only **once**.  Re-allocating instead re-derives the
+    capacity from the current positions, so as particles move the array shapes
+    change and the whole (large) graph recompiles every step.  The wave state,
+    lattice indices, box and ``core_fn`` are position-independent (static box)
+    and reused as-is, keeping the pytree treedef identical.
+
+    The fixed capacity (allocated by ``init_fn`` with ``capacity_multiplier``
+    headroom) can in principle overflow under large displacements; the overflow
+    flag rides along in ``neighbors.did_buffer_overflow`` -- reallocate with
+    ``init_fn`` if it trips (accepting the one-off recompile)."""
+    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    real = state.rpy.real
+    rbox = _neighbor_box_from_matrix(
+        real.box_matrix, real.fractional_coordinates)
+    real_nbrs = (real.neighbors.update(positions_frac, box=rbox)
+                 if rbox is not None else real.neighbors.update(positions_frac))
+    real2 = dataclasses.replace(real, neighbors=real_nbrs)
+    rpy_state = dataclasses.replace(state.rpy, real=real2)  # reuse wave/precond
+    nf = state.nf
+    nbox = _neighbor_box_from_matrix(nf.box_matrix, nf.fractional_coordinates)
+    nf_nbrs = (nf.neighbors.update(positions_frac, box=nbox)
+               if nbox is not None else nf.neighbors.update(positions_frac))
+    nf2 = dataclasses.replace(nf, neighbors=nf_nbrs)
+    return SaddleState(rpy=rpy_state, nf=nf2, positions=positions_frac)
+
   # -- Operator factories (fixed state) -----------------------------------
   def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray):
     """Static-box far-field grand matvec on flat-11 (real + wave, fixed state)."""
@@ -269,12 +326,16 @@ def build_saddle_solve(
     return grand_mv_flat
 
   def _make_rnf(nf_state: NearFieldState, positions: jnp.ndarray, zero_nf: bool):
-    """Fixed-config near-field block applies; ``zero_nf`` forces R^nf=0."""
+    """Fixed-config near-field block applies; ``zero_nf`` forces R^nf=0.
+
+    Uses ``apply_prepared`` (no per-matvec neighbor rebuild): the saddle solve
+    holds ``positions`` fixed and ``nf_state.neighbors`` was built for them, so
+    the neighbor list is reused across all GMRES matvecs.
+    """
     def nf_full(gv11: jnp.ndarray) -> jnp.ndarray:
       if zero_nf:
         return jnp.zeros_like(gv11)
-      gf, _ = nf_apply(nf_state, positions, gv11)
-      return gf
+      return nf_apply.apply_prepared(nf_state, positions, gv11)
 
     def rnf_FU(u6):
       return nf_full(_gv_from_u6(u6))[..., :6]
@@ -305,6 +366,83 @@ def build_saddle_solve(
     z1 = zeta * y1                   # M^-1 y1
     return (z1 - zeta * b_apply(z2), z2)
 
+  # -- Diagonal-Schur preconditioner: identical block-LDL apply, but the Schur
+  # solve uses the on-device diagonal approximation S~ = zeta I + diag(R^nf_FU),
+  # so z2 = S^-1 t2 = -t2 / diag_S (pure elementwise, jittable -- no callback).
+  # ``diag_S`` is (N,6); neighborless rows have diag 0 -> S~ = zeta I there.
+  def _make_diag_pinv(diag_S):
+    def _apply_pinv_diag(x):
+      y1, y2 = x
+      t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
+      z2 = -t2 / diag_S                # S^-1 ~ -(zeta I + diag R^nf_FU)^-1
+      z1 = zeta * y1                   # M^-1 y1
+      return (z1 - zeta * b_apply(z2), z2)
+    return _apply_pinv_diag
+
+  # -- Chebyshev-Schur preconditioner: identical block-LDL apply, but z2 is the
+  # Jacobi-preconditioned degree-k Chebyshev approximation of S~^-1 t2 with
+  # S~ = zeta I + R^nf_FU (SPD), applied matrix-free as ``stil(v)``.  All applies
+  # are near-field (no FFTs) so the per-GMRES-iteration cost is small; the win is
+  # fewer (expensive) GMRES iterations.  The spectral bounds (lo, hi) of the
+  # Jacobi-scaled operator are computed ONCE per solve (independent of t2), so
+  # the map t2 -> z2 is a fixed LINEAR operator -- required for GMRES.
+  def _cheb_bounds(stil, diag_S):
+    """(lo, hi) eigenvalue bounds of D^{-1/2} S~ D^{-1/2}, D = diag_S.
+
+    lo: rigorous lower bound zeta/max(diag_S) (R^nf_FU >= 0).
+    hi: cheb_safety * Rayleigh-quotient power-iteration estimate of lambda_max,
+        seeded with a fixed RANDOM vector (NOT the RHS, and NOT a structured
+        vector -- on a symmetric lattice a structured seed lies in an invariant
+        subspace that misses the dominant eigenvector, so ``hi`` underestimates
+        lambda_max and the Chebyshev polynomial diverges with degree).
+    """
+    lo = zeta / jnp.max(diag_S)
+    dinv_sqrt = jax.lax.rsqrt(diag_S)               # D^{-1/2}, (N,6)
+    # Fixed random seed: deterministic (keeps the preconditioner linear) but
+    # breaks lattice symmetry so power iteration finds the true lambda_max.
+    v = jax.random.normal(jax.random.PRNGKey(0), diag_S.shape, dtype=diag_S.dtype)
+    v = v / jnp.sqrt(jnp.vdot(v, v).real)
+    hi = lo
+    for _ in range(cheb_power_iters):
+      w = dinv_sqrt * stil(dinv_sqrt * v)           # D^{-1/2} S~ D^{-1/2} v
+      hi = jnp.vdot(v, w).real                       # Rayleigh quotient
+      nrm = jnp.sqrt(jnp.vdot(w, w).real)
+      v = w / jnp.maximum(nrm, 1e-300)
+    hi = jnp.maximum(hi * cheb_safety, lo * (1.0 + 1e-6))
+    return lo, hi
+
+  def _make_cheb_pinv(diag_S, stil, lo, hi):
+    theta = 0.5 * (hi + lo)
+    delta = 0.5 * (hi - lo)
+
+    def _schur_solve(t2):
+      # Preconditioned Chebyshev iteration (Saad, Alg. 12.1) for S~ y = t2,
+      # D = diag_S as the inner Jacobi preconditioner.  Returns y ~ S~^-1 t2.
+      y = jnp.zeros_like(t2)
+      r = t2
+      p = jnp.zeros_like(t2)
+      alpha = 1.0 / theta
+      for i in range(cheb_degree):
+        z = r / diag_S
+        if i == 0:
+          p = z
+          alpha = 1.0 / theta
+        else:
+          beta = (delta * alpha * 0.5) ** 2
+          alpha = 1.0 / (theta - beta / alpha)
+          p = z + beta * p
+        y = y + alpha * p
+        r = r - alpha * stil(p)
+      return y
+
+    def _apply_pinv_cheb(x):
+      y1, y2 = x
+      t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
+      z2 = -_schur_solve(t2)           # S^-1 ~ -(S~)^-1 via Chebyshev
+      z1 = zeta * y1                   # M^-1 y1
+      return (z1 - zeta * b_apply(z2), z2)
+    return _apply_pinv_cheb
+
   # -- IC(0) preconditioner: identical block-LDL apply, but the Schur solve
   # uses the host-side RCM + incomplete-Cholesky factor of S~ = zeta I + R~^nf_FU
   # (positive definite), so z2 = S^-1 t2 = -S~^-1 t2 = -ic0.solve(t2).  The host
@@ -326,6 +464,99 @@ def build_saddle_solve(
 
     return _apply_pinv_ic0
 
+  # -- Numeric body (shared by the eager IC(0) path and the jitted device path).
+  # ``pc``/``zero_nf``/``ret_s``/``ret_r``/``tol_``/``atol_`` are static; for the
+  # on-device preconditioners (``'diag'``/``'jacobi'``) ``ic0_obj`` is None and
+  # the whole body is jittable, so a single XLA program covers the grand matvec
+  # (with wave FFTs), the near-field neighbor applies, and GMRES.
+  def _body_impl(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra, x0,
+                 pc, zero_nf, ret_s, ret_r, tol_, atol_, ic0_obj,
+                 restart_, maxiter_):
+    N = positions_frac.shape[0]
+    dtype = REAL_DTYPE
+    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac)
+    rnf_FU, rnf_FE, rnf_SU, rnf_SE = _make_rnf(
+        state.nf, positions_frac, zero_nf)
+
+    def apply_A(x):
+      q11, u6 = x
+      top = grand_mv_flat(q11) + b_apply(u6)
+      bot = bt_apply(q11) - rnf_FU(u6)
+      return (top, bot)
+
+    # b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots), plus
+    # the optional far-field Brownian slip U^B (Phase 3).
+    b1 = grand_to_flat(
+        jnp.zeros((N, 3), dtype=dtype), stresslet_to_couplet(e5)) + slip_top
+    # b2 = -(F^P + extra_force + R^nf_FE : E^inf) in FU force space.
+    b2 = -(fp6 + extra + rnf_FE(e5))
+
+    if pc == 'ic0' and not zero_nf:
+      M_op = _make_ic0_pinv(ic0_obj)
+    elif pc == 'cheb' and not zero_nf:
+      # Reuse the fixed neighbor list (no .update()); positions match state.nf.
+      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)  # (N,6)
+      diag_S = zeta + diag6
+      def stil(v):                       # S~ v = zeta v + R^nf_FU v (matrix-free)
+        return zeta * v + rnf_FU(v)
+      lo, hi = _cheb_bounds(stil, diag_S)
+      M_op = _make_cheb_pinv(diag_S, stil, lo, hi)
+    elif pc == 'diag' and not zero_nf:
+      # Reuse the fixed neighbor list (no .update()); positions match state.nf.
+      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)  # (N,6)
+      M_op = _make_diag_pinv(zeta + diag6)
+    else:
+      M_op = _apply_pinv
+
+    x, conv_info = sparse_linalg.gmres(
+        apply_A, (b1, b2), x0=x0, tol=tol_, atol=atol_,
+        restart=int(restart_), maxiter=int(maxiter_), M=M_op)
+
+    q11, u6 = x
+    U_rel, Omega_rel = u6[..., :3], u6[..., 3:]
+
+    # Total stresslet (Eq. 2.9): S = S^ff - R^nf_SU (U-U^inf) + R^nf_SE : E^inf.
+    # Skipped when ``ret_s`` is False (the SU/SE near-field applies are not
+    # free) -- ../FSD likewise computes the stresslet only on output.
+    if ret_s:
+      sff5 = stresslet_from_moment(q11)
+      S5 = sff5 - rnf_SU(u6) + rnf_SE(e5)
+    else:
+      S5 = jnp.zeros((N, 5), dtype=dtype)
+
+    # Background-flow add-back (convenience; relative frame is the pinned one).
+    box = state.rpy.real.box_matrix
+    cart = space.transform(box, positions_frac - jnp.asarray(0.5, dtype=dtype))
+    U_inf = jnp.einsum('ij,nj->ni', E_inf_mat, cart)
+
+    info = {'gmres_info': conv_info, 'U_inf': U_inf}
+    # Residual diagnostic, on-device (jnp, no host float) so the body stays
+    # jittable; costs one extra grand+near-field matvec -> gated by ``ret_r``.
+    if ret_r:
+      Ax = apply_A(x)
+      res = jnp.sqrt(_pytree_dot((Ax[0] - b1, Ax[1] - b2),
+                                 (Ax[0] - b1, Ax[1] - b2)))
+      bnorm = jnp.sqrt(_pytree_dot((b1, b2), (b1, b2)))
+      info['rel_residual'] = res / jnp.maximum(bnorm, 1e-300)
+    return U_rel, Omega_rel, S5, q11, info
+
+  # Cache jitted device-path bodies keyed by their static configuration so the
+  # XLA program is compiled once per (pc, flags, tol, gmres budget) combination,
+  # not per call.
+  _STATIC_ARGNUMS = tuple(range(8, 17))  # pc..ic0_obj, restart_, maxiter_
+  _body_jit_cache = {}
+
+  def _device_body(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra,
+                   x0, pc, zero_nf, ret_s, ret_r, tol_, atol_,
+                   restart_, maxiter_):
+    key = (pc, zero_nf, ret_s, ret_r, tol_, atol_, restart_, maxiter_)
+    fn = _body_jit_cache.get(key)
+    if fn is None:
+      fn = jax.jit(_body_impl, static_argnums=_STATIC_ARGNUMS)
+      _body_jit_cache[key] = fn
+    return fn(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra, x0,
+              pc, zero_nf, ret_s, ret_r, tol_, atol_, None, restart_, maxiter_)
+
   # -- solve_fn ------------------------------------------------------------
   def solve_fn(
       state: SaddleState,
@@ -342,6 +573,10 @@ def build_saddle_solve(
       ic0=None,
       tol: Optional[float] = None,
       atol: Optional[float] = None,
+      gmres_restart: Optional[int] = None,
+      gmres_maxiter: Optional[int] = None,
+      return_stresslet: bool = True,
+      return_residual: bool = True,
   ):
     """Solve the saddle system at a fixed configuration.
 
@@ -355,9 +590,10 @@ def build_saddle_solve(
         (default 0).
       x0: optional warm-start ``(moment_flat11, u_rel6)`` pytree.
       zero_nearfield: if True, force ``R^nf = 0`` (degenerate check 1).
-      preconditioner: override the builder default (``'ic0'`` or ``'jacobi'``).
-        ``'ic0'`` is built host-side from ``state`` and needs concrete positions;
-        use ``'jacobi'`` under ``jit``/``vmap``.
+      preconditioner: override the builder default (``'cheb'``, ``'diag'``,
+        ``'ic0'`` or ``'jacobi'``).  ``'ic0'`` is built host-side from ``state``
+        and needs concrete positions; the on-device ones run under
+        ``jit``/``vmap``.
       slip_top: optional far-field Brownian slip ``U^B`` ``(N,11)`` added to the
         RHS top block (Phase 3); default 0.  Covariance ``(2kT/dt) M_grand``.
       extra_force: optional generalized force ``(N,6)`` added inside the bottom
@@ -392,7 +628,8 @@ def build_saddle_solve(
       torque = jnp.asarray(torque, dtype=dtype)
     fp6 = jnp.concatenate([force, torque], axis=-1)
 
-    # Imposed strain in orthonormal (N,5).
+    # Imposed strain in orthonormal (N,5).  Resolved eagerly (Python branch on
+    # shape) so the jitted body receives plain (N,5) / (3,3) arrays.
     if E_inf is None:
       e5 = jnp.zeros((N, 5), dtype=dtype)
       E_inf_mat = jnp.zeros((3, 3), dtype=dtype)
@@ -406,84 +643,40 @@ def build_saddle_solve(
         e5 = jnp.broadcast_to(E_inf, (N, 5))
         E_inf_mat = stresslet_to_couplet(e5[0])  # for U_inf add-back only
 
-    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac)
-    rnf_FU, rnf_FE, rnf_SU, rnf_SE = _make_rnf(
-        state.nf, positions_frac, zero_nearfield)
-
-    # -- A x ---------------------------------------------------------------
-    def apply_A(x):
-      q11, u6 = x
-      top = grand_mv_flat(q11) + b_apply(u6)
-      bot = bt_apply(q11) - rnf_FU(u6)
-      return (top, bot)
-
-    # -- RHS ---------------------------------------------------------------
-    # b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots),
-    # plus the optional far-field Brownian slip U^B (Phase 3).
-    b1 = grand_to_flat(
-        jnp.zeros((N, 3), dtype=dtype), stresslet_to_couplet(e5))
-    if slip_top is not None:
-      b1 = b1 + jnp.asarray(slip_top, dtype=dtype)
-    # b2 = -(F^P + extra_force + R^nf_FE : E^inf) in FU force space.  The
-    # optional extra_force is the near-field Brownian force F^B_nf (main solve)
-    # or the RFD displacement Delta q (drift solves).
+    # Normalize the optional Phase-3 / warm-start inputs to concrete arrays so
+    # the jitted body never sees ``None`` (which is untraceable).
+    slip_arr = (jnp.zeros((N, 11), dtype=dtype) if slip_top is None
+                else jnp.asarray(slip_top, dtype=dtype))
     extra = (jnp.zeros((N, 6), dtype=dtype) if extra_force is None
              else jnp.asarray(extra_force, dtype=dtype))
-    b2 = -(fp6 + extra + rnf_FE(e5))
-
     if x0 is None:
       x0 = (jnp.zeros((N, 11), dtype=dtype), jnp.zeros((N, 6), dtype=dtype))
 
-    # -- Preconditioner selection -----------------------------------------
     pc = preconditioner if preconditioner is not None else default_preconditioner
-    if pc not in ('ic0', 'jacobi'):
-      raise ValueError("preconditioner must be 'ic0' or 'jacobi', got %r" % (pc,))
-    # With R^nf = 0 the Schur is exactly zeta I, so IC(0) degenerates to
-    # block-Jacobi -- skip the host factor in that case.  A prebuilt ic0
-    # (e.g. reused across RFD displaced solves) takes precedence over a rebuild.
+    if pc not in ('cheb', 'diag', 'ic0', 'jacobi'):
+      raise ValueError(
+          "preconditioner must be 'cheb', 'diag', 'ic0', or 'jacobi', got %r"
+          % (pc,))
+    _tol = gmres_tol if tol is None else float(tol)
+    _atol = 0.0 if atol is None else float(atol)
+    _restart = (_default_gmres_restart if gmres_restart is None
+                else int(gmres_restart))
+    _maxiter = (_default_gmres_maxiter if gmres_maxiter is None
+                else int(gmres_maxiter))
+
+    # IC(0) stays eager (host RCM + scipy factor + pure_callback triangular
+    # solves); the on-device preconditioners run the cached jitted body.
     if pc == 'ic0' and not zero_nearfield:
       ic0_obj = (ic0 if ic0 is not None
                  else build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta))
-      M_op = _make_ic0_pinv(ic0_obj)
-    else:
-      M_op = _apply_pinv
-
-    _tol = gmres_tol if tol is None else float(tol)
-    _atol = 0.0 if atol is None else float(atol)
-    x, conv_info = sparse_linalg.gmres(
-        apply_A, (b1, b2), x0=x0,
-        tol=_tol, atol=_atol,
-        restart=int(gmres_restart), maxiter=int(gmres_maxiter),
-        M=M_op,
-    )
-
-    q11, u6 = x
-    U_rel, Omega_rel = u6[..., :3], u6[..., 3:]
-
-    # Total stresslet (Eq. 2.9): S = S^ff - R^nf_SU (U-U^inf) + R^nf_SE : E^inf.
-    sff5 = stresslet_from_moment(q11)
-    S5 = sff5 - rnf_SU(u6) + rnf_SE(e5)
-
-    # Background-flow add-back (convenience; relative frame is the pinned one).
-    # Origin at the box centre: U^inf = E . (x - x_centre).  The choice of
-    # origin is the Lees-Edwards frame ambiguity (deferred to Phase 3); it
-    # cancels in the origin-independent relative velocity U_i - U_j.
-    box = state.rpy.real.box_matrix
-    cart = space.transform(
-        box, positions_frac - jnp.asarray(0.5, dtype=dtype))
-    U_inf = jnp.einsum('ij,nj->ni', E_inf_mat, cart)
-
-    # Residual diagnostic.
-    Ax = apply_A(x)
-    res = math.sqrt(
-        float(_pytree_dot((Ax[0] - b1, Ax[1] - b2), (Ax[0] - b1, Ax[1] - b2))))
-    bnorm = math.sqrt(float(_pytree_dot((b1, b2), (b1, b2))))
-    info = {
-        'rel_residual': res / max(bnorm, 1e-300),
-        'gmres_info': conv_info,
-        'U_inf': U_inf,
-    }
-    return U_rel, Omega_rel, S5, q11, info
+      return _body_impl(
+          state, positions_frac, fp6, e5, E_inf_mat, slip_arr, extra, x0,
+          pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
+          ic0_obj, _restart, _maxiter)
+    return _device_body(
+        state, positions_frac, fp6, e5, E_inf_mat, slip_arr, extra, x0,
+        pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
+        _restart, _maxiter)
 
   # -- Eager iteration-count harness (check 3; runs outside JIT) -----------
   def count_iterations(
@@ -503,7 +696,7 @@ def build_saddle_solve(
     its triangular solves are validated as a *property of the preconditioned
     operator* (Fiore & Swan Fig. 1) without forcing a host callback inside JIT.
 
-    ``preconditioner`` in ``{'none', 'jacobi', 'ic0'}``.  Returns
+    ``preconditioner`` in ``{'none', 'jacobi', 'cheb', 'ic0'}``.  Returns
     ``(n_iter, rel_residual, diag)``.
     """
     import scipy.sparse.linalg as spla
@@ -560,6 +753,20 @@ def build_saddle_solve(
         z1 = zeta * q11                  # M^-1 y1
         return join(z1 - zeta * b_apply(z2), z2)
       M_op = spla.LinearOperator((nm + nf6, nm + nf6), matvec=mjac)
+    elif preconditioner == 'cheb':
+      # Same on-device Chebyshev Schur operator the jitted solve uses, applied
+      # eagerly to a flat scipy vector.
+      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)
+      diag_S = zeta + diag6
+      def stil(vv):
+        return zeta * vv + rnf_FU(vv)
+      lo, hi = _cheb_bounds(stil, diag_S)
+      cheb_pinv = _make_cheb_pinv(diag_S, stil, lo, hi)
+      def mcheb(v):
+        q11, u6 = split(v)
+        z1, z2 = cheb_pinv((q11, u6))
+        return join(z1, z2)
+      M_op = spla.LinearOperator((nm + nf6, nm + nf6), matvec=mcheb)
     elif preconditioner == 'ic0':
       ic0 = build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta)
       diag['relaxed'] = ic0.relaxed
@@ -584,6 +791,7 @@ def build_saddle_solve(
     return count[0], rel, diag
 
   solve_fn.count_iterations = count_iterations
+  solve_fn.refresh_state = refresh_state
   solve_fn.zeta = zeta
   solve_fn.r_p = r_p
   # Exposed for the Phase-3 Brownian builder (sd_brownian.py): the resolved

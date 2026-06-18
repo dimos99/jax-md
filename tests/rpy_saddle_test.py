@@ -195,10 +195,14 @@ def test_ic0_preconditioner_inverts_stilde():
 
 
 # ---------------------------------------------------------------------------
-# Default preconditioner is IC(0): it must agree with block-Jacobi on the
-# solution but reach a tighter residual at an equal (small) iteration budget.
+# Default preconditioner is the on-device Jacobi-Chebyshev Schur semi-iteration
+# on S~ = zeta I + R^nf_FU: fully jittable (no host IC(0) pure_callback), it must
+# agree with the gold-standard IC(0) factor on the physical solution and
+# self-converge below the production tolerance.  Unlike pure 'diag' it captures
+# the near-neighbor lubrication coupling, so it converges in the dense regime SD
+# targets where 'diag' stalls.
 # ---------------------------------------------------------------------------
-def test_default_preconditioner_is_ic0():
+def test_default_preconditioner_is_cheb():
   a, eta, xi = 1.0, 1.0, 1.0
   N = 8
   L = (N * (4.0 / 3.0 * math.pi * a**3) / 0.3) ** (1.0 / 3.0)
@@ -213,10 +217,14 @@ def test_default_preconditioner_is_ic0():
   st = _init(pos)
   f = jax.random.normal(jax.random.PRNGKey(7), (N, 3))
   U_d, _, _, _, info_d = solve(st, pos, force=f)                      # default
-  U_j, _, _, _, info_j = solve(st, pos, force=f, preconditioner='jacobi')
-  # Same physical solution, IC(0) residual strictly tighter at equal budget.
-  assert _rel_err(U_d, U_j) < 1e-4
-  assert info_d['rel_residual'] < info_j['rel_residual']
+  U_cheb, *_ = solve(st, pos, force=f, preconditioner='cheb')
+  U_ic, *_ = solve(st, pos, force=f, preconditioner='ic0')
+  # The builder default is the on-device 'cheb' preconditioner (bit-identical).
+  assert _rel_err(U_d, U_cheb) <= 1e-12
+  # Same physical solution as the gold-standard host IC(0) factor.
+  assert _rel_err(U_d, U_ic) < 1e-3
+  # Default solve self-converges below the production tolerance, no host bounce.
+  assert info_d['rel_residual'] < 1e-3
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +253,7 @@ def test_preconditioner_iteration_count_ordering_and_scaling():
     st = _init(pos)
     f = jax.random.normal(jax.random.PRNGKey(n), (n**3, 3))
     res = {}
-    for pc in ('none', 'jacobi', 'ic0'):
+    for pc in ('none', 'jacobi', 'cheb', 'ic0'):
       it, rel, diag = solve.count_iterations(
           st, pos, force=f, preconditioner=pc, rtol=1e-6)
       assert rel <= 1e-5
@@ -254,6 +262,10 @@ def test_preconditioner_iteration_count_ordering_and_scaling():
         assert diag['relaxed'] == 0.0          # healthy IC(0), no relaxation
     # Ordering: IC(0) best, then Jacobi, then unpreconditioned.
     assert res['ic0'] <= res['jacobi'] <= res['none']
+    # The on-device Chebyshev Schur preconditioner converges and is at least as
+    # strong as block-Jacobi (it adds near-neighbor coupling on top), comparable
+    # to the host IC(0) factor.
+    assert res['cheb'] <= res['jacobi']
     # Absolute caps guard the block-LDL sign/scaling: dropping the zeta factors
     # or flipping the Schur sign makes sigma(P A) straddle zero and roughly
     # triples these counts (jacobi ~142/294, ic0 ~108/155 in that regime).

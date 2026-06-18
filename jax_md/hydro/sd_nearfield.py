@@ -372,10 +372,14 @@ def build_nearfield_resistance(
         fractional_coordinates=fractional_coordinates,
     )
 
-  @jax.jit
-  def _core(positions, gen_velocity, neighbor_idx, neighbor_mask, box_matrix):
+  def _edge_geometry(positions, neighbor_idx, neighbor_mask, box_matrix):
+    """Shared edge list + geometry + interpolated scalars (receiver i, sender j).
+
+    Returns ``(receivers, senders, rhat, scalars, edge_mask, N)`` with all
+    masked-off edges zeroed.  Used by both the full resistance apply and the
+    on-device FU-diagonal extraction so they stay in lock-step.
+    """
     positions = jnp.asarray(positions, dtype=REAL_DTYPE)
-    gen_velocity = jnp.asarray(gen_velocity, dtype=REAL_DTYPE)
     box_matrix = jnp.asarray(box_matrix, dtype=REAL_DTYPE)
     N = positions.shape[0]
 
@@ -408,6 +412,13 @@ def build_nearfield_resistance(
 
     scalars = nf_table.interpolate_scalars(safe_r, a, table)
     scalars = jnp.where(edge_mask[:, None], scalars, 0.0)
+    return receivers, senders, rhat, scalars, edge_mask, N
+
+  @jax.jit
+  def _core(positions, gen_velocity, neighbor_idx, neighbor_mask, box_matrix):
+    gen_velocity = jnp.asarray(gen_velocity, dtype=REAL_DTYPE)
+    receivers, senders, rhat, scalars, edge_mask, N = _edge_geometry(
+        positions, neighbor_idx, neighbor_mask, box_matrix)
 
     R_self, R_cross = _build_pair_operators(rhat, scalars, a, eta)
     g_recv = gen_velocity[receivers]
@@ -417,15 +428,54 @@ def build_nearfield_resistance(
     contrib = jnp.where(edge_mask[:, None], contrib, 0.0)
     return ops.segment_sum(contrib, receivers, N)
 
+  pref = _kim_karrila_prefactors(a, eta)
+  _c = nf_table.COLUMN_INDEX
+
+  @jax.jit
+  def _core_diag_FU(positions, neighbor_idx, neighbor_mask, box_matrix):
+    """On-device diagonal of the ``R^nf_FU`` (6N) block, packed ``(N, 6)``.
+
+    ``diag(sum_e R_self_e) = sum_e diag(R_self_e)``, so this is the segment-sum
+    of the per-edge FU self-block diagonal -- the on-device equivalent of the
+    host :func:`rpy_saddle.nearfield_FU_diagonal`.  Feeds the diagonal-Schur
+    preconditioner ``S~ = zeta I + diag(R^nf_FU)``.
+
+    Only the translational ``A`` and rotational ``C`` self-blocks have nonzero
+    FU diagonal (``A11 = XA*P + YA*Iperp`` etc.), so we evaluate just those four
+    scalar families rather than the full 11x11 pair operators -- the diagonal
+    entry along axis ``k`` is ``X*rhat_k^2 + Y*(1 - rhat_k^2)``.
+    """
+    receivers, _senders, rhat, scalars, edge_mask, N = _edge_geometry(
+        positions, neighbor_idx, neighbor_mask, box_matrix)
+    rh2 = rhat * rhat                                          # (E,3)
+    XA = pref['A'] * scalars[:, _c['XA11']]
+    YA = pref['A'] * scalars[:, _c['YA11']]
+    XC = pref['C'] * scalars[:, _c['XC11']]
+    YC = pref['C'] * scalars[:, _c['YC11']]
+    diag_A = XA[:, None] * rh2 + YA[:, None] * (1.0 - rh2)     # (E,3) translation
+    diag_C = XC[:, None] * rh2 + YC[:, None] * (1.0 - rh2)     # (E,3) rotation
+    diag_edge = jnp.concatenate([diag_A, diag_C], axis=-1)     # (E,6)
+    diag_edge = jnp.where(edge_mask[:, None], diag_edge, 0.0)
+    diag6 = ops.segment_sum(diag_edge, receivers, N)          # (N,6)
+    # A particle is "neighbored" iff it has >=1 live lubrication edge -- the
+    # exact mask the near-field Brownian Shift/Proj separation needs (matches
+    # the host ``nearfield_FU_diagonal`` ``has_neighbor``).
+    has_neighbor = ops.segment_sum(
+        edge_mask.astype(jnp.int32), receivers, N) > 0       # (N,)
+    return diag6, has_neighbor
+
+  def _update_neighbors(state, positions, box_matrix, **kwargs):
+    return state.neighbors.update(positions, **(
+        {'box': _neighbor_box_from_matrix(box_matrix, fractional_coordinates)}
+        if (fractional_coordinates and box_fn is None) else kwargs))
+
   def apply_fn(state, positions, gen_velocity, **kwargs):
     positions = jnp.asarray(positions, dtype=REAL_DTYPE)
     dim = int(positions.shape[1])
     box_matrix = current_box_matrix(
         displacement_fn, box_fn, dim,
         fractional_coordinates=fractional_coordinates, **kwargs)
-    neighbors = state.neighbors.update(positions, **(
-        {'box': _neighbor_box_from_matrix(box_matrix, fractional_coordinates)}
-        if (fractional_coordinates and box_fn is None) else kwargs))
+    neighbors = _update_neighbors(state, positions, box_matrix, **kwargs)
     gen_force = _core(positions, gen_velocity, neighbors.idx,
                       partition.neighbor_list_mask(neighbors), box_matrix)
     next_state = NearFieldState(
@@ -434,6 +484,55 @@ def build_nearfield_resistance(
         fractional_coordinates=fractional_coordinates,
     )
     return gen_force, next_state
+
+  def diagonal_FU_fn(state, positions, **kwargs):
+    """``(N, 6)`` diagonal of the near-field ``R^nf_FU`` block (on-device)."""
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    dim = int(positions.shape[1])
+    box_matrix = current_box_matrix(
+        displacement_fn, box_fn, dim,
+        fractional_coordinates=fractional_coordinates, **kwargs)
+    neighbors = _update_neighbors(state, positions, box_matrix, **kwargs)
+    diag6, _ = _core_diag_FU(positions, neighbors.idx,
+                             partition.neighbor_list_mask(neighbors), box_matrix)
+    return diag6
+
+  def apply_prepared_fn(state, positions, gen_velocity):
+    """Apply ``R^nf`` reusing ``state.neighbors`` as-is (no ``.update()``).
+
+    For repeated matvecs at a FIXED configuration (e.g. one GMRES solve): the
+    caller guarantees ``state.neighbors`` and ``state.box_matrix`` were built
+    for ``positions``, so the per-matvec neighbor rebuild -- otherwise paid on
+    every iteration -- is skipped.  Returns just the ``(N, 11)`` gen-force.
+    """
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    return _core(positions, gen_velocity, state.neighbors.idx,
+                 partition.neighbor_list_mask(state.neighbors),
+                 state.box_matrix)
+
+  def diagonal_FU_prepared_fn(state, positions):
+    """``diagonal_FU`` reusing ``state.neighbors`` as-is (no ``.update()``)."""
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    diag6, _ = _core_diag_FU(positions, state.neighbors.idx,
+                             partition.neighbor_list_mask(state.neighbors),
+                             state.box_matrix)
+    return diag6
+
+  def diagonal_FU_mask_prepared_fn(state, positions):
+    """``(diag6 (N,6), has_neighbor (N,))`` reusing ``state.neighbors`` as-is.
+
+    The near-field Brownian square root needs both the diagonal (for the Jacobi
+    split ``D``) and the exact neighbored mask (for the Shift/Proj separation).
+    """
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    return _core_diag_FU(positions, state.neighbors.idx,
+                         partition.neighbor_list_mask(state.neighbors),
+                         state.box_matrix)
+
+  apply_fn.diagonal_FU = diagonal_FU_fn
+  apply_fn.apply_prepared = apply_prepared_fn
+  apply_fn.diagonal_FU_prepared = diagonal_FU_prepared_fn
+  apply_fn.diagonal_FU_mask_prepared = diagonal_FU_mask_prepared_fn
 
   return init_fn, apply_fn
 
