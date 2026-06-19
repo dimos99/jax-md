@@ -40,9 +40,15 @@ Conventions (both gates resolved analytically -- see the project plan):
   directly; do NOT re-transcribe FSD ``Lubrication.cu`` signs (jax-md already
   corrected the FE flip in Phase 1).
 
-Phase-2 scope: static box only.  The imposed rate-of-strain ``E^inf`` enters via
-the RHS, so no Lees-Edwards box deformation is needed; the live-box/shear path
-belongs to the (deferred) Phase-3 integrator.
+Box deformation (Lees-Edwards shear): when the space carries a ``box_fn``, the
+solve accepts runtime shear kwargs (``gamma_xy``/``gamma_xz``/``gamma_yz`` or
+``shear=``).  The deformed box is threaded into the real-space kernel and the
+*exact* deformed-box grand wave operator (``_apply_wave_exact_grand`` rebuilds
+the screened k-modes for the deformed reciprocal lattice); the near-field
+already minimum-images via its stored ``box_matrix``.  The imposed rate-of-strain
+``E^inf`` enters the RHS (resistance problem); the full ambient velocity gradient
+``L_inf`` drives the background-flow add-back ``info['U_inf']``/``Omega_inf']``.
+With no ``box_fn`` (static box) the path is bit-for-bit the original behavior.
 """
 
 import math
@@ -59,7 +65,13 @@ from jax.scipy.sparse import linalg as sparse_linalg
 from jax_md import dataclasses
 from jax_md import space
 
-from jax_md.hydro.rpy import build_rpy_mobility, estimate_rpy_params, RpyState
+from jax_md.hydro.rpy import (
+    build_rpy_mobility,
+    estimate_rpy_params,
+    RpyState,
+    _apply_wave_exact_grand,
+    _sample_wave_grand_noise,
+)
 from jax_md.hydro.rpy_real_det_dipole import mr_grand_matvec
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE, current_box_matrix
 from jax_md.hydro.rpy_real_lattice_helpers import _neighbor_box_from_matrix
@@ -262,7 +274,7 @@ def build_saddle_solve(
     grid_kwargs.setdefault('rcut', float(est.rcut))
 
   # -- Far-field grand mobility (deterministic; no Brownian sampler) --------
-  rpy_init, _ = build_rpy_mobility(
+  rpy_init, rpy_apply = build_rpy_mobility(
       space_fns, a, xi, eta,
       use_stresslet=True,
       constrained=False,
@@ -270,6 +282,21 @@ def build_saddle_solve(
       fractional_coordinates=fractional_coordinates,
       **grid_kwargs,
   )
+  # Live-box (shear) support: the resolved wave-space static factors let the
+  # grand wave operator be re-evaluated *exactly* under a deformed box each
+  # step (vs the static cached modes).  ``box_fn is None`` => static box, the
+  # Phase-2 path, and ``_resolve_current_box`` returns None throughout.
+  wave_static = rpy_apply.wave_static
+  has_box_fn = box_fn is not None
+
+  def _resolve_current_box(positions, **shear_kwargs):
+    """Deformed box matrix from runtime shear kwargs, or None (static box)."""
+    if not has_box_fn:
+      return None
+    dim = int(jnp.asarray(positions).shape[-1])
+    return current_box_matrix(
+        displacement_fn, box_fn, dim,
+        fractional_coordinates=fractional_coordinates, **shear_kwargs)
 
   # -- Near-field resistance (Phase 1) -------------------------------------
   nf_init, nf_apply = build_nearfield_resistance(
@@ -279,13 +306,21 @@ def build_saddle_solve(
   )
 
   # -- init_fn -------------------------------------------------------------
-  def init_fn(positions_frac) -> SaddleState:
+  def init_fn(positions_frac, **shear_kwargs) -> SaddleState:
+    """Allocate the saddle state.
+
+    ``shear_kwargs`` (``gamma_xy``/``gamma_xz``/``gamma_yz`` or ``shear=``) set
+    the initial deformed box; the underlying real/near-field builders allocate
+    their neighbor lists at the *worst-case* shear box, so the fixed capacity
+    stays valid for every strain in ``[-0.5, 0.5)`` over the run.
+    """
     positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
-    rpy_state = rpy_init(positions_frac)
-    nf_state = nf_init(positions_frac)
+    rpy_state = rpy_init(positions_frac, **shear_kwargs)
+    nf_state = nf_init(positions_frac, **shear_kwargs)
     return SaddleState(rpy=rpy_state, nf=nf_state, positions=positions_frac)
 
-  def refresh_state(state: SaddleState, positions_frac) -> SaddleState:
+  def refresh_state(state: SaddleState, positions_frac,
+                    **shear_kwargs) -> SaddleState:
     """Advance the state to ``positions_frac`` for stepping a simulation.
 
     Uses the **shape-preserving** neighbor-list ``.update()`` (NOT ``init`` /
@@ -293,35 +328,61 @@ def build_saddle_solve(
     Brownian step compiles only **once**.  Re-allocating instead re-derives the
     capacity from the current positions, so as particles move the array shapes
     change and the whole (large) graph recompiles every step.  The wave state,
-    lattice indices, box and ``core_fn`` are position-independent (static box)
-    and reused as-is, keeping the pytree treedef identical.
+    lattice indices and ``core_fn`` are reused as-is, keeping the pytree
+    treedef identical.
+
+    Under live shear (``shear_kwargs`` supplied with a ``box_fn``) the deformed
+    ``box_matrix`` is recomputed and stored on both the real and near-field
+    states so the neighbor-list rebuild *and* the matrix-free minimum-image
+    matvecs (the near-field ``apply_prepared`` reads ``nf.box_matrix``) use the
+    live box.  With no ``box_fn`` this reduces to the static-box behavior.
 
     The fixed capacity (allocated by ``init_fn`` with ``capacity_multiplier``
     headroom) can in principle overflow under large displacements; the overflow
     flag rides along in ``neighbors.did_buffer_overflow`` -- reallocate with
     ``init_fn`` if it trips (accepting the one-off recompile)."""
     positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    current_box = _resolve_current_box(positions_frac, **shear_kwargs)
+
     real = state.rpy.real
-    rbox = _neighbor_box_from_matrix(
-        real.box_matrix, real.fractional_coordinates)
+    real_box = real.box_matrix if current_box is None else current_box
+    rbox = _neighbor_box_from_matrix(real_box, real.fractional_coordinates)
     real_nbrs = (real.neighbors.update(positions_frac, box=rbox)
                  if rbox is not None else real.neighbors.update(positions_frac))
-    real2 = dataclasses.replace(real, neighbors=real_nbrs)
+    real2 = dataclasses.replace(real, neighbors=real_nbrs, box_matrix=real_box)
     rpy_state = dataclasses.replace(state.rpy, real=real2)  # reuse wave/precond
     nf = state.nf
-    nbox = _neighbor_box_from_matrix(nf.box_matrix, nf.fractional_coordinates)
+    nf_box = nf.box_matrix if current_box is None else current_box
+    nbox = _neighbor_box_from_matrix(nf_box, nf.fractional_coordinates)
     nf_nbrs = (nf.neighbors.update(positions_frac, box=nbox)
                if nbox is not None else nf.neighbors.update(positions_frac))
-    nf2 = dataclasses.replace(nf, neighbors=nf_nbrs)
+    nf2 = dataclasses.replace(nf, neighbors=nf_nbrs, box_matrix=nf_box)
     return SaddleState(rpy=rpy_state, nf=nf2, positions=positions_frac)
 
   # -- Operator factories (fixed state) -----------------------------------
-  def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray):
-    """Static-box far-field grand matvec on flat-11 (real + wave, fixed state)."""
+  def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
+                     current_box=None):
+    """Far-field grand matvec on flat-11 (real + wave, fixed state).
+
+    With ``current_box`` (live shear) the real-space kernel runs under the
+    deformed box and the wave-space operator is re-evaluated *exactly*
+    (``_apply_wave_exact_grand`` rebuilds the screened k-modes for the deformed
+    reciprocal lattice -- the position-remap-only path in ``Mw_core`` keeps the
+    base-box modes and is wrong under shear).  ``current_box=None`` is the
+    static-box path (bit-for-bit the Phase-2 behavior).
+    """
     def grand_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
       F, C = flat_to_grand(q11)
-      Ur, Dr = mr_grand_matvec(rpy_state.real, positions, F, C)
-      Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
+      if current_box is None:
+        Ur, Dr = mr_grand_matvec(rpy_state.real, positions, F, C)
+        Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
+      else:
+        Ur, Dr = mr_grand_matvec(
+            rpy_state.real, positions, F, C, box_matrix=current_box)
+        Uw, Dw = _apply_wave_exact_grand(
+            static=wave_static, current_box=current_box,
+            positions_frac=positions, forces=F, couplets=C,
+            a=a, xi=xi, eta=eta)
       return grand_to_flat(Ur + Uw, traceless(Dr + Dw))
     return grand_mv_flat
 
@@ -469,12 +530,13 @@ def build_saddle_solve(
   # on-device preconditioners (``'diag'``/``'jacobi'``) ``ic0_obj`` is None and
   # the whole body is jittable, so a single XLA program covers the grand matvec
   # (with wave FFTs), the near-field neighbor applies, and GMRES.
-  def _body_impl(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra, x0,
+  def _body_impl(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
+                 current_box, slip_top, extra, x0,
                  pc, zero_nf, ret_s, ret_r, tol_, atol_, ic0_obj,
                  restart_, maxiter_):
     N = positions_frac.shape[0]
     dtype = REAL_DTYPE
-    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac)
+    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac, current_box)
     rnf_FU, rnf_FE, rnf_SU, rnf_SE = _make_rnf(
         state.nf, positions_frac, zero_nf)
 
@@ -525,11 +587,25 @@ def build_saddle_solve(
       S5 = jnp.zeros((N, 5), dtype=dtype)
 
     # Background-flow add-back (convenience; relative frame is the pinned one).
-    box = state.rpy.real.box_matrix
+    # The translational add-back uses the FULL velocity gradient ``L_inf_mat``
+    # (``u^inf = L . r``), not just the symmetric rate-of-strain, so the ambient
+    # vorticity is included; ``Omega_inf = 1/2 curl u^inf = 1/2 eps:L`` is the
+    # angular add-back (a torque-free sphere co-rotates with the ambient spin).
+    # With ``L_inf_mat == E_inf_mat`` (symmetric, the default when no spin is
+    # supplied) this reduces bit-for-bit to the Phase-2 behavior (Omega_inf = 0).
+    box = state.rpy.real.box_matrix if current_box is None else current_box
     cart = space.transform(box, positions_frac - jnp.asarray(0.5, dtype=dtype))
-    U_inf = jnp.einsum('ij,nj->ni', E_inf_mat, cart)
+    U_inf = jnp.einsum('ij,nj->ni', L_inf_mat, cart)
+    # Omega_inf_k = 1/2 eps_kij L_ij.  Simple-shear check: L[0,1]=gamma_dot
+    # (u_x = gamma_dot * y) => Omega_z = 1/2 (L[0,1]-L[1,0]) = +gamma_dot/2.
+    Omega_inf_vec = 0.5 * jnp.stack([
+        L_inf_mat[1, 2] - L_inf_mat[2, 1],
+        L_inf_mat[2, 0] - L_inf_mat[0, 2],
+        L_inf_mat[0, 1] - L_inf_mat[1, 0],
+    ])
+    Omega_inf = jnp.broadcast_to(Omega_inf_vec, (N, 3))
 
-    info = {'gmres_info': conv_info, 'U_inf': U_inf}
+    info = {'gmres_info': conv_info, 'U_inf': U_inf, 'Omega_inf': Omega_inf}
     # Residual diagnostic, on-device (jnp, no host float) so the body stays
     # jittable; costs one extra grand+near-field matvec -> gated by ``ret_r``.
     if ret_r:
@@ -543,10 +619,11 @@ def build_saddle_solve(
   # Cache jitted device-path bodies keyed by their static configuration so the
   # XLA program is compiled once per (pc, flags, tol, gmres budget) combination,
   # not per call.
-  _STATIC_ARGNUMS = tuple(range(8, 17))  # pc..ic0_obj, restart_, maxiter_
+  _STATIC_ARGNUMS = tuple(range(10, 19))  # pc..ic0_obj, restart_, maxiter_
   _body_jit_cache = {}
 
-  def _device_body(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra,
+  def _device_body(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
+                   current_box, slip_top, extra,
                    x0, pc, zero_nf, ret_s, ret_r, tol_, atol_,
                    restart_, maxiter_):
     key = (pc, zero_nf, ret_s, ret_r, tol_, atol_, restart_, maxiter_)
@@ -554,7 +631,8 @@ def build_saddle_solve(
     if fn is None:
       fn = jax.jit(_body_impl, static_argnums=_STATIC_ARGNUMS)
       _body_jit_cache[key] = fn
-    return fn(state, positions_frac, fp6, e5, E_inf_mat, slip_top, extra, x0,
+    return fn(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
+              slip_top, extra, x0,
               pc, zero_nf, ret_s, ret_r, tol_, atol_, None, restart_, maxiter_)
 
   # -- solve_fn ------------------------------------------------------------
@@ -565,6 +643,7 @@ def build_saddle_solve(
       torque: Optional[jnp.ndarray] = None,
       E_inf: Optional[jnp.ndarray] = None,
       *,
+      L_inf: Optional[jnp.ndarray] = None,
       x0=None,
       zero_nearfield: bool = False,
       preconditioner: Optional[str] = None,
@@ -577,6 +656,7 @@ def build_saddle_solve(
       gmres_maxiter: Optional[int] = None,
       return_stresslet: bool = True,
       return_residual: bool = True,
+      **shear_kwargs,
   ):
     """Solve the saddle system at a fixed configuration.
 
@@ -587,7 +667,16 @@ def build_saddle_solve(
       torque: applied torque ``(N,3)`` (default 0).
       E_inf: imposed rate-of-strain, either a single symmetric traceless
         ``(3,3)`` (broadcast to all particles) or orthonormal ``(N,5)``
-        (default 0).
+        (default 0).  Enters the RHS (resistance problem).
+      L_inf: optional full ambient velocity gradient ``(3,3)`` (``u^inf=L.r``)
+        used only for the background-flow add-back ``info['U_inf']`` /
+        ``info['Omega_inf']``.  Defaults to the symmetric part of ``E_inf`` (no
+        ambient vorticity), recovering the Phase-2 behavior bit-for-bit.  Pass
+        the full gradient (e.g. simple shear ``L[0,1]=gamma_dot``) so the
+        add-back carries the ambient spin.
+      shear_kwargs: ``gamma_xy``/``gamma_xz``/``gamma_yz`` (or ``shear=``) for a
+        live (Lees-Edwards) deformed box; ignored when the space has no
+        ``box_fn`` (static box).
       x0: optional warm-start ``(moment_flat11, u_rel6)`` pytree.
       zero_nearfield: if True, force ``R^nf = 0`` (degenerate check 1).
       preconditioner: override the builder default (``'cheb'``, ``'diag'``,
@@ -643,6 +732,16 @@ def build_saddle_solve(
         e5 = jnp.broadcast_to(E_inf, (N, 5))
         E_inf_mat = stresslet_to_couplet(e5[0])  # for U_inf add-back only
 
+    # Full ambient velocity gradient for the add-back: default to the symmetric
+    # rate-of-strain (no ambient vorticity -> Omega_inf = 0, Phase-2 behavior).
+    if L_inf is None:
+      L_inf_mat = E_inf_mat
+    else:
+      L_inf_mat = jnp.asarray(L_inf, dtype=dtype)
+
+    # Live deformed box from the shear kwargs (None for a static box).
+    current_box = _resolve_current_box(positions_frac, **shear_kwargs)
+
     # Normalize the optional Phase-3 / warm-start inputs to concrete arrays so
     # the jitted body never sees ``None`` (which is untraceable).
     slip_arr = (jnp.zeros((N, 11), dtype=dtype) if slip_top is None
@@ -670,11 +769,13 @@ def build_saddle_solve(
       ic0_obj = (ic0 if ic0 is not None
                  else build_ic0_from_state(state, a, eta, r_p=r_p, zeta=zeta))
       return _body_impl(
-          state, positions_frac, fp6, e5, E_inf_mat, slip_arr, extra, x0,
+          state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
+          slip_arr, extra, x0,
           pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
           ic0_obj, _restart, _maxiter)
     return _device_body(
-        state, positions_frac, fp6, e5, E_inf_mat, slip_arr, extra, x0,
+        state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
+        slip_arr, extra, x0,
         pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
         _restart, _maxiter)
 
@@ -801,6 +902,13 @@ def build_saddle_solve(
   solve_fn.a = float(a)
   solve_fn.eta = float(eta)
   solve_fn.r_lub = r_lub_resolved
+  # Live-box (shear) plumbing for the Phase-3 Brownian builder: the resolved
+  # wave static factors feed the exact deformed-box wave noise
+  # (``_sample_wave_grand_noise``) and ``resolve_current_box`` maps runtime
+  # shear kwargs -> deformed box (None for a static box).
+  solve_fn.wave_static = wave_static
+  solve_fn.resolve_current_box = _resolve_current_box
+  solve_fn.has_box_fn = has_box_fn
 
   return init_fn, solve_fn
 

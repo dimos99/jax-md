@@ -1580,6 +1580,14 @@ def build_rpy_mobility(space_fns,
     )
 
   apply_fn.with_brownian = apply_with_brownian
+  # Expose the resolved wave-space static factors and box helpers so downstream
+  # builders (the Fast Stokesian Dynamics saddle/Brownian path) can reuse the
+  # *exact* deformed-box grand wave operator/noise (`_apply_wave_exact_grand`,
+  # `_sample_wave_grand_noise`) rather than the static cached modes -- a single
+  # source of truth for the live-box wave physics under shear.
+  apply_fn.wave_static = wave_static
+  apply_fn.resolve_current_box = _resolve_current_box
+  apply_fn.has_box_fn = has_box_fn
 
   # -- Constrained Brownian midpoint stepper --------------------------------
   if constrained and include_brownian:

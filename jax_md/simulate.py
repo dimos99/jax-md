@@ -57,6 +57,7 @@ from jax_md import dataclasses
 from jax_md import partition
 from jax_md import smap
 from jax_md.hydro import rpy as hydro_rpy
+from jax_md.hydro import sd_brownian as hydro_sd
 
 static_cast = util.static_cast
 
@@ -2505,6 +2506,293 @@ def constrained_rpy_with_shear(
     return ShearedConstrainedRPYState(real_position=real_position,
                                       brownian_state=next_inner,
                                       time=time_next)
+
+  return init_fn, apply_fn
+
+
+# -----------------------------------------------------------------------------
+# Fast Stokesian Dynamics Brownian integrators (Fiore & Swan 2019)
+# -----------------------------------------------------------------------------
+@dataclasses.dataclass
+class StokesianDynamicsState:
+  """State for free Fast Stokesian Dynamics Brownian dynamics.
+
+  `sd_state` is the saddle solve's per-configuration state (neighbor lists +
+  wave-space precompute + preconditioner). `positions` are fractional, with the
+  Cartesian trajectory mirrored in `real_position`; `stresslet` is the last
+  hydrodynamic particle stresslet `(N, 5)` orthonormal (expand with
+  `hydro.stresslet_to_couplet`). `time = t0 + step * dt`.
+  """
+  real_position: Array
+  positions: Array
+  sd_state: Any
+  stresslet: Array
+  rng: Array
+  step: int
+  time: float
+
+
+@dataclasses.dataclass
+class ShearedSDState:
+  """State for Fast Stokesian Dynamics Brownian dynamics under shear.
+
+  Mirrors `StokesianDynamicsState`; the Lees-Edwards remap of the fractional
+  positions is applied each step before the Brownian stepper advances them, and
+  `omega_inf` carries the ambient angular velocity `1/2 curl u^inf` (the affine
+  spin) for downstream orientation tracking.
+  """
+  real_position: Array
+  positions: Array
+  sd_state: Any
+  stresslet: Array
+  omega_inf: Array
+  rng: Array
+  step: int
+  time: float
+
+
+def _sd_real_position(positions_frac, sd_state, fractional_coordinates,
+                      box_matrix=None):
+  """Cartesian positions from an SD saddle state."""
+  if not fractional_coordinates:
+    return positions_frac
+  box = sd_state.rpy.real.box_matrix if box_matrix is None else box_matrix
+  return space.transform(box, positions_frac)
+
+
+def _sd_ambient_gradient(box_of, sf_xy, sf_xz, sf_yz, dim, time, dt):
+  """Full ambient velocity gradient ``L = dH/dt . H^{-1}`` (Lees-Edwards).
+
+  Differentiates the *raw* (unreduced) shear schedule by central finite
+  difference so the rate is unaffected by the periodic Lees-Edwards remap (the
+  remap only shifts ``H`` by integer images, which cancel in ``dH/dt``).  For
+  cubic-base simple shear this reduces to ``L[i,j] = gamma_dot_ij``; the matrix
+  form stays exact for general triclinic bases / multi-plane shear.
+  """
+  def H_at(t):
+    return _current_box_from_reduced_shear(
+        box_of, dim, sf_xy(t), sf_xz(t), sf_yz(t))
+  H = H_at(time)
+  Hdot = (H_at(time + 0.5 * dt) - H_at(time - 0.5 * dt)) / dt
+  return Hdot @ jnp.linalg.inv(H)
+
+
+def sd(space_fns: Tuple[Callable, ...],
+       energy_or_force: Callable[..., Array],
+       dt: float,
+       kT: float,
+       *,
+       a: float,
+       eta: float,
+       xi: Optional[float] = None,
+       tol: Optional[float] = 1e-3,
+       n_particles: Optional[int] = None,
+       phi: Optional[float] = None,
+       t0: float = 0.0,
+       with_torque: bool = False,
+       torque_fn: Optional[Callable[..., Array]] = None,
+       fractional_coordinates: bool = True,
+       rcut: Optional[float] = None,
+       P: Optional[int] = None,
+       Mgrid: Optional[int] = None,
+       theta: Optional[float] = None,
+       lattice_extent: Optional[int] = None,
+       **sd_kwargs) -> Simulator:
+  """Free Fast Stokesian Dynamics Brownian dynamics (no shear).
+
+  Overdamped Euler--Maruyama with the full SD resistance
+  ``R_FU = Bᵀ M⁻¹ B + R^nf_FU`` (near-field lubrication + far-field grand
+  mobility), thermal noise from the positively-split fluctuation--dissipation
+  square root, and the RFD thermal drift (Fiore & Swan 2019).  Free-diffusion
+  counterpart of `sd_with_shear`.
+
+  `energy_or_force` supplies the conservative interactions.  As in
+  `constrained_rpy`, leaving `xi is None` triggers automatic Ewald-parameter
+  estimation at the requested `tol` (pass `n_particles`/`phi` for the
+  cost-optimal split).  Extra solver knobs (`gmres_tol`, `mr_iters`, `nf_iters`,
+  `rfd_epsilon`, `preconditioner`, ...) pass through `sd_kwargs` to
+  `hydro.build_sd_brownian_step`.
+
+  Returns `(init_fn, apply_fn)`; `apply_fn(state)` advances one step.  The
+  hydrodynamic stresslet is at `state.stresslet`.
+  """
+  if len(space_fns) < 2:
+    raise ValueError("space_fns must contain displacement and shift functions.")
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  _dt = f32(dt)
+  t0 = f32(t0)
+
+  xi, rcut, P, Mgrid, theta, lattice_extent = _resolve_constrained_ewald_params(
+      space_fns=space_fns, a=a, t0=float(t0), xi=xi, rcut=rcut, P=P,
+      Mgrid=Mgrid, theta=theta, lattice_extent=lattice_extent, tol=tol,
+      n_particles=n_particles, phi=phi)
+
+  sd_init, step_fn = hydro_sd.build_sd_brownian_step(
+      space_fns, a, eta, dt, kT, xi=xi, rcut=rcut, P=P, Mgrid=Mgrid,
+      theta=theta, lattice_extent=lattice_extent,
+      fractional_coordinates=fractional_coordinates, **sd_kwargs)
+
+  def init_fn(key, R, **kwargs):
+    q = jnp.asarray(R)
+    sd_state = sd_init(q, **kwargs)
+    real_position = _sd_real_position(q, sd_state, fractional_coordinates)
+    return StokesianDynamicsState(
+        real_position=real_position, positions=q, sd_state=sd_state,
+        stresslet=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        rng=key, step=jnp.array(0, dtype=jnp.int32), time=t0)
+
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    key, subkey = random.split(state.rng)
+    q = state.positions
+    next_step = jnp.asarray(state.step, dtype=jnp.int32) + jnp.int32(1)
+    time_next = t0 + _dt * next_step.astype(_dt.dtype)
+
+    force = force_fn(q, **step_kwargs)
+    torque = torque_fn(q, **step_kwargs) if (with_torque and torque_fn) else None
+    q_new, S5, info = step_fn(
+        state.sd_state, q, subkey, force=force, torque=torque)
+    next_sd = info['next_state']
+    real_position = _sd_real_position(q_new, next_sd, fractional_coordinates)
+    return StokesianDynamicsState(
+        real_position=real_position, positions=q_new, sd_state=next_sd,
+        stresslet=S5, rng=key, step=next_step, time=time_next)
+
+  return init_fn, apply_fn
+
+
+def sd_with_shear(
+    space_fns: Tuple[Callable, ...],
+    energy_or_force: Callable[..., Array],
+    dt: float,
+    kT: float,
+    *,
+    a: float,
+    eta: float,
+    shear_vector_schedule: Optional[Callable[[Array], Sequence[Array]]],
+    xi: Optional[float] = None,
+    tol: Optional[float] = 1e-3,
+    n_particles: Optional[int] = None,
+    phi: Optional[float] = None,
+    shear_t_bounds: Optional[Tuple[float, float]] = None,
+    t0: float = 0.0,
+    remap: bool = True,
+    with_torque: bool = False,
+    torque_fn: Optional[Callable[..., Array]] = None,
+    fractional_coordinates: bool = True,
+    rcut: Optional[float] = None,
+    P: Optional[int] = None,
+    Mgrid: Optional[int] = None,
+    theta: Optional[float] = None,
+    lattice_extent: Optional[int] = None,
+    **sd_kwargs) -> Simulator:
+  """Fast Stokesian Dynamics Brownian dynamics with the shearing utilities.
+
+  Couples the Fiore & Swan (2019) overdamped SD Brownian step to the
+  Lees-Edwards shear bookkeeping used by `rpy_with_shear` /
+  `constrained_rpy_with_shear`: each step the affine strain from
+  `shear_vector_schedule` is reduced into `[-0.5, 0.5)` and the fractional
+  positions are remapped, so the strain (and the neighbor-list cell size) stays
+  bounded over arbitrarily long runs.  The ambient flow is *driven by the
+  schedule*: the full velocity gradient `L = dH/dt . H^{-1}` is derived from the
+  strain rate and supplied to the solve (its symmetric part is the imposed
+  rate-of-strain `E^inf` in the resistance RHS; the full `L` drives the
+  background-flow add-back `u^inf = L . r`, with ambient spin in
+  `state.omega_inf`).
+
+  `space_fns` must be the 3-tuple `(displacement, shift, box_of)` from
+  `space.shearing`.  `shear_vector_schedule(t) -> (gamma_xy, gamma_xz,
+  gamma_yz)`; `None` is zero strain.  As in `constrained_rpy_with_shear`,
+  leaving `xi is None` triggers automatic Ewald-parameter estimation at `tol`
+  (the schedule is passed to the estimator so the quadrature support accounts
+  for the box deformation; with `remap=True`, `shear_t_bounds` may be omitted).
+  Extra solver knobs pass through `sd_kwargs` to `hydro.build_sd_brownian_step`.
+
+  Returns `(init_fn, apply_fn)`; `apply_fn(state)` advances one step.  The
+  hydrodynamic stresslet is at `state.stresslet`; neighbor-list overflow is
+  observable at `state.sd_state.rpy.real.neighbors.did_buffer_overflow`.
+  """
+  if len(space_fns) < 3:
+    raise ValueError(
+        "sd_with_shear expects (displacement, shift, box_of) from "
+        "space.shearing.")
+  _, _, box_of = space_fns[:3]
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  _dt = f32(dt)
+  t0 = f32(t0)
+
+  box = box_of(t=t0)
+  dim = box.shape[0]
+
+  sf_xy, sf_xz, sf_yz = _normalize_rpy_shear_vector_schedule(
+      shear_vector_schedule)
+
+  xi, rcut, P, Mgrid, theta, lattice_extent = _resolve_constrained_ewald_params(
+      space_fns=space_fns, a=a, t0=float(t0), xi=xi, rcut=rcut, P=P,
+      Mgrid=Mgrid, theta=theta, lattice_extent=lattice_extent, tol=tol,
+      n_particles=n_particles, phi=phi,
+      shear_vector_schedule=shear_vector_schedule,
+      shear_t_bounds=shear_t_bounds, shear_remap=remap)
+
+  sd_init, step_fn = hydro_sd.build_sd_brownian_step(
+      space_fns, a, eta, dt, kT, xi=xi, rcut=rcut, P=P, Mgrid=Mgrid,
+      theta=theta, lattice_extent=lattice_extent,
+      fractional_coordinates=fractional_coordinates, **sd_kwargs)
+
+  def init_fn(key, R, **kwargs):
+    shear_kwargs = dict(kwargs)
+    curr_xy, curr_xz, curr_yz = _init_reduced_shear(
+        sf_xy, sf_xz, sf_yz, t0, dim, remap)
+    shear_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
+
+    q = jnp.asarray(R)
+    sd_state = sd_init(q, **shear_kwargs)
+    box0 = _current_box_from_reduced_shear(box_of, dim, curr_xy, curr_xz,
+                                           curr_yz)
+    real_position = _sd_real_position(q, sd_state, fractional_coordinates, box0)
+    return ShearedSDState(
+        real_position=real_position, positions=q, sd_state=sd_state,
+        stresslet=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        omega_inf=jnp.zeros((3,), dtype=q.dtype),
+        rng=key, step=jnp.array(0, dtype=jnp.int32), time=t0)
+
+  def apply_fn(state, **kwargs):
+    step_kwargs = dict(kwargs)
+    key, subkey = random.split(state.rng)
+    prev_step = jnp.asarray(state.step, dtype=jnp.int32)
+    next_step = prev_step + jnp.int32(1)
+    time_prev = t0 + _dt * prev_step.astype(_dt.dtype)
+    time_next = t0 + _dt * next_step.astype(_dt.dtype)
+
+    q, curr_xy, curr_xz, curr_yz = _step_reduced_shear_and_remap(
+        state.positions,
+        sf_xy=sf_xy, sf_xz=sf_xz, sf_yz=sf_yz,
+        time_prev=time_prev, time_next=time_next,
+        dim=dim, remap=remap, fractional_coordinates=fractional_coordinates)
+    shear = _shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz)
+
+    force = force_fn(q, **{**step_kwargs, **shear})
+    torque = (torque_fn(q, **{**step_kwargs, **shear})
+              if (with_torque and torque_fn) else None)
+
+    # Ambient velocity gradient driven by the schedule strain rate at this step.
+    L_inf = _sd_ambient_gradient(box_of, sf_xy, sf_xz, sf_yz, dim,
+                                 time_next, _dt)
+    E_inf = 0.5 * (L_inf + L_inf.T)
+
+    q_new, S5, info = step_fn(
+        state.sd_state, q, subkey, force=force, torque=torque,
+        E_inf=E_inf, L_inf=L_inf, **shear)
+    next_sd = info['next_state']
+
+    box = _current_box_from_reduced_shear(box_of, dim, curr_xy, curr_xz,
+                                          curr_yz)
+    real_position = _sd_real_position(q_new, next_sd, fractional_coordinates,
+                                      box)
+    return ShearedSDState(
+        real_position=real_position, positions=q_new, sd_state=next_sd,
+        stresslet=S5, omega_inf=info['Omega_inf'][0],
+        rng=key, step=next_step, time=time_next)
 
   return init_fn, apply_fn
 

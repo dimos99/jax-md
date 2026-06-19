@@ -644,8 +644,14 @@ def mr_grand_matvec(state: RealSpaceState,
                     forces: jnp.ndarray,
                     couplets: Optional[jnp.ndarray] = None,
                     *,
-                    neighbor: Optional[partition.NeighborList] = None):
-  """Apply the real-space grand mobility using an existing state."""
+                    neighbor: Optional[partition.NeighborList] = None,
+                    box_matrix: Optional[jnp.ndarray] = None):
+  """Apply the real-space grand mobility using an existing state.
+
+  ``box_matrix`` overrides ``state.box_matrix`` for the live (sheared) deformed
+  box; the integer ``lattice_indices`` are box-independent (the core scales them
+  by the supplied box), so the worst-case-allocated neighbor list stays valid.
+  """
   if state.core_fn is None:
     raise ValueError("RealSpaceState is missing core_fn; build_Mr_grand_apply must be used.")
   positions = jnp.asarray(positions, dtype=REAL_DTYPE)
@@ -656,6 +662,8 @@ def mr_grand_matvec(state: RealSpaceState,
   neighbors = neighbor if neighbor is not None else state.neighbors
   if neighbors is None:
     raise ValueError("Real-space state is missing a neighbor list; provide one via the 'neighbor' argument.")
+  box = state.box_matrix if box_matrix is None else jnp.asarray(
+      box_matrix, dtype=REAL_DTYPE)
   mask = partition.neighbor_list_mask(neighbors)
   velocities, gradients = state.core_fn(
       positions,
@@ -663,7 +671,7 @@ def mr_grand_matvec(state: RealSpaceState,
       couplets,
       neighbors.idx,
       mask,
-      state.box_matrix,
+      box,
       state.lattice_indices,
       state.zero_image_index,
   )

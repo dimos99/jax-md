@@ -64,6 +64,7 @@ from jax_md.hydro.rpy_saddle import (
     build_saddle_solve,
     _gv_from_u6,
 )
+from jax_md.hydro.rpy import _sample_wave_grand_noise
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE
 from jax_md.hydro.rpy_real_stoch import lanczos_sqrt_mv
 from jax_md.hydro.rpy_brownian_constrained import (
@@ -85,7 +86,7 @@ _SHIFT_PATTERN = np.array([1.0, 1.0, 1.0, 4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0])
 # ---------------------------------------------------------------------------
 def make_far_field_slip_sampler(solve_fn, state, positions, kT, dt, *,
                                 mr_iters=50, lanczos_tol=1e-3, precond=None,
-                                wave_sqrt=None):
+                                wave_sqrt=None, current_box=None):
   """Build a jitted far-field slip sampler ``sampler(key) -> U_B_flat (N,11)``.
 
   ``Cov(U_B_flat) = (2kT/dt) M_grand`` -- the slip *velocity* in the flat-11
@@ -97,6 +98,13 @@ def make_far_field_slip_sampler(solve_fn, state, positions, kT, dt, *,
   ``precond`` is the config-independent grand Jacobi preconditioner; pass a
   prebuilt one (it calls the jitted ``Mr_self``, so building it *inside* an
   outer ``jit`` would raise a ConcretizationTypeError on its ``float(...)``).
+
+  ``current_box`` (live shear): the real-space Lanczos already follows the
+  deformed box via ``state.rpy.real.box_matrix`` (refreshed each step), so only
+  the wave-space sqrt needs the live box -- and it needs the *exact*
+  deformed-box noise (``_sample_wave_grand_noise`` rebuilds the screened k-modes)
+  rather than the cached static sampler's position-remap-only path, which keeps
+  the base-box modes and is wrong under shear.  ``None`` -> static box.
   """
   positions = jnp.asarray(positions, dtype=REAL_DTYPE)
   if precond is None:
@@ -105,14 +113,22 @@ def make_far_field_slip_sampler(solve_fn, state, positions, kT, dt, *,
   real_sampler = make_real_grand_slip_sampler(
       real_state=state.rpy.real, positions=positions,
       preconditioner=precond, iters=mr_iters, tol=lanczos_tol)
-  # The wave sqrt sampler bakes in the (static-box) grid stencil support P /
-  # mode arrays, which must be concrete -- pass a prebuilt one when constructing
-  # this inside an outer jit (see ``build_sd_brownian_step``).
-  if wave_sqrt is None:
-    wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
+  if current_box is None:
+    # The wave sqrt sampler bakes in the (static-box) grid stencil support P /
+    # mode arrays, which must be concrete -- pass a prebuilt one when constructing
+    # this inside an outer jit (see ``build_sd_brownian_step``).
+    if wave_sqrt is None:
+      wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
+    wave_sampler = lambda k: wave_sqrt(k, positions, None)
+  else:
+    # Exact deformed-box wave noise (covariance M^(w)_grand at the live box).
+    wave_sampler = lambda k: _sample_wave_grand_noise(
+        static=solve_fn.wave_static, current_box=current_box,
+        positions_frac=positions, key_wave=k,
+        a=solve_fn.a, xi=solve_fn.xi, eta=solve_fn.eta)
   slip_sampler = make_grand_slip_sampler(
       real_sampler=real_sampler,
-      wave_sampler=lambda k: wave_sqrt(k, positions, None),
+      wave_sampler=wave_sampler,
       kT=kT, dt=dt)
 
   @jax.jit
@@ -251,15 +267,19 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   q_plus = shift_fn(positions, 0.5 * eps * dq_pos, **step_kwargs)
   q_minus = shift_fn(positions, -0.5 * eps * dq_pos, **step_kwargs)
 
+  # ``step_kwargs`` carries the live shear gammas; forward them to the displaced
+  # solves so the wave/real/near-field matvecs use the deformed box (the
+  # neighbor lists built at ``q`` are reused -- the eps-displacement is far
+  # inside the skin, and the box is essentially unchanged over eps).
   Up, Op, _s5p, q11p, _ip = solve_fn(
       state, q_plus, extra_force=dq6, tol=0.0, atol=atol,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
-      return_stresslet=False, return_residual=False)
+      return_stresslet=False, return_residual=False, **step_kwargs)
   x0 = (q11p, jnp.concatenate([Up, Op], axis=-1))          # warm start
   Um, Om, _s5m, _q11m, _im = solve_fn(
       state, q_minus, extra_force=dq6, x0=x0, tol=0.0, atol=atol2,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
-      return_stresslet=False, return_residual=False)
+      return_stresslet=False, return_residual=False, **step_kwargs)
 
   U_plus = jnp.concatenate([Up, Op], axis=-1)
   U_minus = jnp.concatenate([Um, Om], axis=-1)
@@ -296,7 +316,12 @@ def build_sd_brownian_step(
   """Build the overdamped FSD Brownian timestep (Euler--Maruyama + RFD drift).
 
   Args:
-    space_fns: ``(displacement_fn, shift_fn)`` (static box; Phase 3 scope).
+    space_fns: ``(displacement_fn, shift_fn)`` or ``+(box_fn)`` for live
+      Lees-Edwards shear.  Under shear, ``step_fn`` accepts the runtime gammas
+      (``gamma_xy``/``gamma_xz``/``gamma_yz`` or ``shear=``) and an ambient
+      velocity gradient ``L_inf`` for the affine-flow add-back; the deformed box
+      threads through the deterministic solve, the exact wave-space slip noise,
+      the near-field, and the RFD drift.
     a, eta: sphere radius and solvent viscosity.
     dt, kT: timestep and thermal energy.
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
@@ -383,8 +408,20 @@ def build_sd_brownian_step(
   # state and reused for every step.
   _wave_cache = {}
 
-  @partial(jax.jit, static_argnums=(6,))
-  def _step_core(state, q, key, force, torque, E_inf, wave_sqrt):
+  has_box_fn = bool(getattr(solve_fn, 'has_box_fn', False))
+
+  @partial(jax.jit, static_argnums=(8,))
+  def _step_core(state, q, key, force, torque, E_inf, L_inf, shear_kwargs,
+                 wave_sqrt):
+    # Live deformed box from the shear gammas (None for a static box).  Under
+    # shear, re-bind the incoming state's neighbor lists + box_matrix to THIS
+    # step's box so the real-space Lanczos (reads ``rpy.real.box_matrix``) and
+    # near-field samplers (read ``nf.box_matrix``) are box-consistent with the
+    # wave-space exact path and the solve; cheap shape-preserving ``.update()``.
+    current_box = solve_fn.resolve_current_box(q, **shear_kwargs)
+    if current_box is not None:
+      state = solve_fn.refresh_state(state, q, **shear_kwargs)
+
     # Clean key tree: the three random inputs must be independent (FD theorem,
     # positive split).  far_field_slip splits k_slip -> (real, wave) internally.
     k_slip, k_nf, k_rfd = jax.random.split(key, 3)
@@ -395,7 +432,8 @@ def build_sd_brownian_step(
     # pure_callback -- so the whole step compiles to one XLA program.
     slip_sampler = make_far_field_slip_sampler(
         solve_fn, state, q, kT, dt, mr_iters=mr_iters,
-        lanczos_tol=lanczos_tol, precond=slip_precond, wave_sqrt=wave_sqrt)
+        lanczos_tol=lanczos_tol, precond=slip_precond, wave_sqrt=wave_sqrt,
+        current_box=current_box)
     nf_sampler = make_nearfield_brownian_sampler(
         solve_fn, state, q, kT, dt, preconditioned=True,
         iters=nf_iters, tol=lanczos_tol)
@@ -404,24 +442,30 @@ def build_sd_brownian_step(
 
     # (3) one combined deterministic + Brownian saddle solve.
     U_main, Om_main, S5, _q11, info = solve_fn(
-        state, q, force=force, torque=torque, E_inf=E_inf,
+        state, q, force=force, torque=torque, E_inf=E_inf, L_inf=L_inf,
         slip_top=U_B_flat, extra_force=F_B_nf,
-        return_stresslet=return_stresslet, return_residual=return_residual)
+        return_stresslet=return_stresslet, return_residual=return_residual,
+        **shear_kwargs)
 
     # (4) RFD thermal drift (reuses state at q; absolute-tol displaced solves).
     U_drift6 = rfd_drift(
         solve_fn, state, q, k_rfd,
         eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+        step_kwargs=shear_kwargs,
         gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
 
+    # Advance with the deterministic+Brownian velocity plus the ambient
+    # translational add-back ``U_inf = L^inf . r`` (carries the affine shear
+    # flow).  ``info['Omega_inf']`` (ambient spin) is surfaced for orientation
+    # tracking by the integrator.
     U_total6 = jnp.concatenate([U_main, Om_main], axis=-1) + U_drift6
-    q_new = shift_fn(q, dt * (U_total6[..., :3] + info['U_inf']))
+    q_new = shift_fn(q, dt * (U_total6[..., :3] + info['U_inf']), **shear_kwargs)
 
     # Refresh the neighbor lists to q_new *inside* the jitted step (fused,
     # on-device, shape-preserving) and hand the next state back in ``info`` --
     # threading this avoids an eager host ``refresh_state`` between steps, whose
     # per-step neighbor-list rebuilds are catastrophically slow on GPU.
-    next_state = solve_fn.refresh_state(state, q_new)
+    next_state = solve_fn.refresh_state(state, q_new, **shear_kwargs)
 
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
@@ -429,7 +473,7 @@ def build_sd_brownian_step(
     return q_new, S5, out_info
 
   def step_fn(state, positions_frac, key, *,
-              force=None, torque=None, E_inf=None):
+              force=None, torque=None, E_inf=None, L_inf=None, **shear_kwargs):
     q = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
     N = q.shape[0]
     # Resolve optional inputs to concrete arrays eagerly (None is untraceable);
@@ -440,13 +484,19 @@ def build_sd_brownian_step(
               else jnp.asarray(torque, dtype=REAL_DTYPE))
     E_inf = (jnp.zeros((3, 3), dtype=REAL_DTYPE) if E_inf is None
              else jnp.asarray(E_inf, dtype=REAL_DTYPE))
+    # L_inf (full ambient gradient for the add-back) stays None unless supplied
+    # -> solve_fn defaults it to the symmetric part of E_inf (no ambient spin).
+    L_inf = None if L_inf is None else jnp.asarray(L_inf, dtype=REAL_DTYPE)
     # Build the wave sqrt sampler once from the concrete wave state (static box)
     # and reuse it as a static arg so the jitted step compiles a single program.
+    # Unused on the live-shear path (the exact deformed-box noise is rebuilt per
+    # step) but always passed so the jitted signature is stable.
     wave_sqrt = _wave_cache.get('wave_sqrt')
     if wave_sqrt is None:
       wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
       _wave_cache['wave_sqrt'] = wave_sqrt
-    return _step_core(state, q, key, force, torque, E_inf, wave_sqrt)
+    return _step_core(state, q, key, force, torque, E_inf, L_inf,
+                      shear_kwargs, wave_sqrt)
 
   # Cheap host neighbor-list rebuild that reuses the wave state -- thread this
   # between steps instead of calling ``init_fn`` again (which rebuilds the wave
