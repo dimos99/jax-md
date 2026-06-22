@@ -38,7 +38,7 @@ import pytest  # noqa: E402
 
 from jax_md import space  # noqa: E402
 from jax_md.hydro import sd_brownian as sdb  # noqa: E402
-from jax_md.hydro.rpy_saddle import (  # noqa: E402
+from jax_md.hydro.sd_saddle import (  # noqa: E402
     build_saddle_solve,
     _gv_from_u6,
 )

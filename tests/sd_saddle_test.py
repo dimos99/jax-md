@@ -35,7 +35,7 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from jax_md import space  # noqa: E402
-from jax_md.hydro import rpy_saddle as sad  # noqa: E402
+from jax_md.hydro import sd_saddle as sad  # noqa: E402
 from jax_md.hydro.rpy import build_rpy_mobility  # noqa: E402
 from jax_md.hydro.rpy_moments import decompose_gradient  # noqa: E402
 

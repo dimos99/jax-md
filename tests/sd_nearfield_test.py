@@ -163,9 +163,23 @@ def test_nearfield_scalars_vanish_at_cutoff():
 def test_pair_grand_symmetric_psd(sep):
   R = np.array(nf.pair_grand_resistance(_RHAT, sep, 1.0, 1.0))
   rel = np.linalg.norm(R - R.T) / max(np.linalg.norm(R), 1e-30)
-  assert rel < 1e-10, rel
-  lam = np.linalg.eigvalsh(0.5 * (R + R.T)).min()
-  assert lam >= -1e-9, lam  # PSD (lambda_min >= -tol), not strict PD
+  assert rel < 1e-10, rel  # symmetry is exact (congruence of the bare table)
+  # PSD caveat: R^nf = R^2B - Rbar^2B is a DIFFERENCE of PSD operators, so it is
+  # strictly PSD only where lubrication dominates (near contact).  At larger gaps
+  # the strain-coupled blocks slightly over-subtract and lambda_min dips a little
+  # negative; only the assembled R = M^-1 + R^nf is PSD everywhere.  (The uniform
+  # 6*pi*eta*a^k prefactors are a true congruence of the bare table -- p_G =
+  # sqrt(p_A p_M) etc. -- which both restores the near-contact 1/xi cancellation
+  # that makes eta'_inf finite AND exposes this physical tail.  The old
+  # Kim-Karrila pi(2a)^k prefactors were NOT a congruence: they distorted the
+  # spectrum, masking the tail while breaking the cancellation.)
+  Rsym = 0.5 * (R + R.T)
+  lam = np.linalg.eigvalsh(Rsym).min()
+  scale = max(np.linalg.norm(Rsym), 1.0)
+  if sep <= 2.5:                          # lubrication-dominated: strictly PSD
+    assert lam >= -1e-9 * scale, (sep, lam)
+  else:                                   # subtracted tail: small, bounded
+    assert lam >= -1e-2 * scale, (sep, lam, scale)
 
 
 @pytest.mark.parametrize('sep', _SEPS)

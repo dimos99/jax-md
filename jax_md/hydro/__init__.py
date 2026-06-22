@@ -63,7 +63,7 @@ from jax_md.hydro.sd_nearfield import (
     NearFieldState,
 )
 
-from jax_md.hydro.rpy_saddle import (
+from jax_md.hydro.sd_saddle import (
     build_saddle_solve,
     SaddleState,
     Ic0Preconditioner,

@@ -67,28 +67,49 @@ for _i, _j, _k in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
 
 
 def _kim_karrila_prefactors(a, eta):
-  """Dimensional prefactors per Jeffrey-Onishi / Kim-Karrila convention.
+  """Dimensional prefactors re-dimensionalizing the bare FSD resistance table.
 
-  For equal spheres ``a_i + a_j = 2a``:
+  The resistance table (``resistance_table.npz``, ported from FSD) is in
+  **Stokesian-Dynamics normalization** (``a = 1``, drag-scaled) and FSD applies
+  it *bare* in every kernel -- no ``pi``, no ``(2a)^k``, no per-block numeric
+  factor (Lubrication.cu RFU:280, RSU/G:583, RSE/M:1160).  The bare functions
+  therefore already satisfy the near-contact rank-1 squeeze relation
+  ``R_SE . R_FU = R_SU . R_FE``, which is what makes the force-free squeeze
+  stresslet (hence eta'_inf) FINITE at contact.
 
-    A (FU)        : 3 pi eta (a_i + a_j)   = 6 pi eta a   (verified analytically)
-    B (F-Omega)   :   pi eta (a_i + a_j)^2 = 4 pi eta a^2
-    C (L-Omega)   :   pi eta (a_i + a_j)^3 = 8 pi eta a^3
-    G (S-U / F-E) :   pi eta (a_i + a_j)^2 = 4 pi eta a^2   (confirm near r=4a)
-    H (S-Omega)   :   pi eta (a_i + a_j)^3 = 8 pi eta a^3   (confirm near r=4a)
-    M (S-E)       :   pi eta (a_i + a_j)^3 = 8 pi eta a^3   (confirm near r=4a)
+  Re-dimensionalizing to physical ``(a, eta)`` must preserve that relation, so it
+  uses the **uniform Brady-Bossis scaling** ``6 pi eta a^k`` on every block
+  (``k`` = 1 + number of length factors), NOT the textbook Kim-Karrila per-block
+  ``pi (a_i + a_j)^k`` numerics:
+
+    A (FU)        : 6 pi eta a     (verified analytically; self-mobility)
+    B (F-Omega)   : 6 pi eta a^2
+    C (L-Omega)   : 6 pi eta a^3
+    G (S-U / F-E) : 6 pi eta a^2
+    H (S-Omega)   : 6 pi eta a^3
+    M (S-E)       : 6 pi eta a^3
+
+  Rank-1 check: ``p_A p_M / p_G^2 = (6)(6)/6^2 = 1`` -> the leading ``1/xi``
+  cancels exactly (two-sphere squeeze probe: ``a*m/(g_su*g_fe) -> 1.0000``).
+
+  PREVIOUS (BUGGY) prefactors -- textbook Kim-Karrila ``pi eta (a_i + a_j)^k``,
+  kept here for retrieval.  These gave ``p_A p_M / p_G^2 = 6*8/4^2 = 3``, which
+  broke the cancellation and left a spurious ``1/xi`` in eta'_inf (inflated and
+  falsely cutoff-sensitive; only ``A`` happened to be correct):
+      s = 2.0 * a  # a_i + a_j for equal spheres
+      {'A': 3*pi*eta*s,   'B': pi*eta*s**2, 'C': pi*eta*s**3,
+       'G': pi*eta*s**2,  'H': pi*eta*s**3, 'M': pi*eta*s**3}
 
   Returns a dict keyed by tensor family.
   """
   pi = np.pi
-  s = 2.0 * a  # a_i + a_j for equal spheres
   return {
-      'A': 3.0 * pi * eta * s,
-      'B': pi * eta * s ** 2,
-      'C': pi * eta * s ** 3,
-      'G': pi * eta * s ** 2,
-      'H': pi * eta * s ** 3,
-      'M': pi * eta * s ** 3,
+      'A': 6.0 * pi * eta * a,
+      'B': 6.0 * pi * eta * a ** 2,
+      'C': 6.0 * pi * eta * a ** 3,
+      'G': 6.0 * pi * eta * a ** 2,
+      'H': 6.0 * pi * eta * a ** 3,
+      'M': 6.0 * pi * eta * a ** 3,
   }
 
 
@@ -437,7 +458,7 @@ def build_nearfield_resistance(
 
     ``diag(sum_e R_self_e) = sum_e diag(R_self_e)``, so this is the segment-sum
     of the per-edge FU self-block diagonal -- the on-device equivalent of the
-    host :func:`rpy_saddle.nearfield_FU_diagonal`.  Feeds the diagonal-Schur
+    host :func:`sd_saddle.nearfield_FU_diagonal`.  Feeds the diagonal-Schur
     preconditioner ``S~ = zeta I + diag(R^nf_FU)``.
 
     Only the translational ``A`` and rotational ``C`` self-blocks have nonzero

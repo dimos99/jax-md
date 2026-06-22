@@ -1,7 +1,7 @@
 """Brownian motion for Fast Stokesian Dynamics (Phase 3).
 
 Adds thermal fluctuations to the deterministic Phase-2 saddle solve
-(:mod:`jax_md.hydro.rpy_saddle`).  One overdamped Euler--Maruyama timestep
+(:mod:`jax_md.hydro.sd_saddle`).  One overdamped Euler--Maruyama timestep
 samples the stochastic displacement from the fluctuation--dissipation
 distribution ``N(0, 2kT dt R_FU^{-1})`` *without* forming ``R_FU^{-1/2}``,
 plus the thermal drift ``kT div R_FU^{-1}`` by random finite differencing.
@@ -60,7 +60,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jax_md.hydro.rpy_saddle import (
+from jax_md.hydro.sd_saddle import (
     build_saddle_solve,
     _gv_from_u6,
 )

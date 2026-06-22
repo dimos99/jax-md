@@ -1,6 +1,6 @@
 """Validation for live Lees-Edwards shear in the Fast Stokesian Dynamics path.
 
-The deterministic saddle solve (:mod:`jax_md.hydro.rpy_saddle`), the Brownian
+The deterministic saddle solve (:mod:`jax_md.hydro.sd_saddle`), the Brownian
 step (:mod:`jax_md.hydro.sd_brownian`) and the ``simulate.sd_with_shear``
 integrator gain a live deformed box.  The checks, in increasing stringency:
 
@@ -29,7 +29,7 @@ import pytest  # noqa: E402
 
 from jax_md import space  # noqa: E402
 from jax_md import simulate  # noqa: E402
-from jax_md.hydro.rpy_saddle import build_saddle_solve  # noqa: E402
+from jax_md.hydro.sd_saddle import build_saddle_solve  # noqa: E402
 from jax_md.hydro.sd_brownian import (  # noqa: E402
     build_sd_brownian_step,
     make_far_field_slip_sampler,
