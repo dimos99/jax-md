@@ -52,6 +52,8 @@ setuptools.setup(
     extras_require=EXTRAS_REQUIRE,
     url='https://github.com/google/jax-md',
     packages=setuptools.find_packages(),
+    package_data={'jax_md.hydro': ['data/*.npz']},
+    include_package_data=True,
     download_url = "https://pypi.org/project/jax-md/",
     project_urls={
         "Source Code": "https://github.com/google/jax-md",
