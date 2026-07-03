@@ -20,18 +20,19 @@ Interpolation contract (must match FSD bit-for-bit; the transcription test
 cannot catch an error here, so it is pinned to the source):
 
   * ``s = r / a`` and ``xi = s - 2``.
-  * Lower row index in log-space, floored:
-    ``ind = floor(log10(xi / XI_MIN) / DR)``  (C++ truncates the float cast;
+  * Lower row index in log-space, floored using the table's ``xi_min`` and
+    ``dr`` metadata:
+    ``ind = floor(log10(xi / xi_min) / dr)``  (C++ truncates the float cast;
     ``floor`` matches for the positive argument), then clipped to
     ``[REGULARIZATION_INDEX, N_DIST - 2]`` so ``ind`` and ``ind + 1`` are valid.
   * Lerp weight in *raw distance* using the stored tabulated distances:
     ``fac = (s - dist[ind]) / (dist[ind + 1] - dist[ind])``, clipped to [0, 1].
   * Result: ``vals[ind] + fac * (vals[ind + 1] - vals[ind])``.
 
-This reproduces the two FSD regimes without host branching: for ``xi <= ~1e-3``
-the clip pins ``ind = REGULARIZATION_INDEX`` and ``s < dist[ind]`` drives
-``fac -> 0``, returning the regularization row verbatim; approaching ``s = 4``
-the weight ``fac -> 1`` lerps toward the all-zero final row.
+Unlike FSD's roughness-regularized production path, jax-md uses the full
+committed table: ``REGULARIZATION_INDEX = 0``.  For gaps at or below the
+tabulated ``xi_min``, the clip pins the lookup to the first row, and approaching
+``s = 4`` the weight ``fac -> 1`` lerps toward the all-zero final row.
 
 The lubrication cutoff itself (``r < r_lub = 4a``) is enforced by the caller's
 neighbor mask, never by this table.
@@ -55,13 +56,9 @@ COLUMN_INDEX = {name: i for i, name in enumerate(COLUMN_NAMES)}
 
 N_FUNC = 22
 
-# FSD tabulation metadata (named constants; see module docstring).
-XI_MIN = 1.0e-4           # smallest tabulated surface gap (s - 2)
-DR = 0.004305             # log-space discretization step
-# Near-contact "roughness" regularization clamp.  This is a *choice* inherited
-# from FSD, not a converged value: it caps the maximum lubrication resistance
-# and therefore sets near-contact stiffness / timestep stability.  Tunable knob.
-REGULARIZATION_INDEX = 232
+# Use the full tabulated near-contact range.  FSD's production roughness clamp
+# uses row 232 (surface gap h/a ~= 1e-3); row 0 reaches h/a = 1e-4.
+REGULARIZATION_INDEX = 0
 R_LUB_OVER_A = 4.0        # lubrication cutoff in units of the radius a
 
 _DATA_PATH = os.path.join(
@@ -72,6 +69,8 @@ class ResistanceTable(NamedTuple):
   """Immutable container for the loaded table arrays."""
   dist: jnp.ndarray   # (N_DIST,)  tabulated center-to-center distances s = r/a
   vals: jnp.ndarray   # (N_DIST, 22) near-field scalar functions
+  xi_min: jnp.ndarray  # scalar, smallest tabulated surface gap (s - 2)
+  dr: jnp.ndarray     # scalar, log-space discretization step
 
 
 _CACHE = {}
@@ -87,11 +86,14 @@ def load_resistance_table() -> ResistanceTable:
     npz = np.load(_DATA_PATH, allow_pickle=True)
     dist = jnp.asarray(npz['dist'], dtype=REAL_DTYPE)
     vals = jnp.asarray(npz['vals'], dtype=REAL_DTYPE)
+    xi_min = jnp.asarray(npz['xi_min'], dtype=REAL_DTYPE)
+    dr = jnp.asarray(npz['dr'], dtype=REAL_DTYPE)
     # Sanity: column ordering in the file matches our expectation.
     file_cols = tuple(str(c) for c in npz['column_names'])
     if file_cols != COLUMN_NAMES:
       raise ValueError('Table column order mismatch: %s' % (file_cols,))
-    _CACHE['table'] = ResistanceTable(dist=dist, vals=vals)
+    _CACHE['table'] = ResistanceTable(
+        dist=dist, vals=vals, xi_min=xi_min, dr=dr)
   return _CACHE['table']
 
 
@@ -112,6 +114,8 @@ def interpolate_scalars(r: jnp.ndarray, a, table: ResistanceTable = None):
     table = load_resistance_table()
   dist = table.dist
   vals = table.vals
+  xi_min = table.xi_min
+  dr = table.dr
   n_dist = dist.shape[0]
 
   r = jnp.asarray(r, dtype=REAL_DTYPE)
@@ -122,8 +126,8 @@ def interpolate_scalars(r: jnp.ndarray, a, table: ResistanceTable = None):
   # Lower row index in log-space, floored (matches the C++ int cast for xi > 0).
   # Guard the log against non-positive gaps (overlaps): they clip to the
   # regularization row anyway.
-  xi_safe = jnp.maximum(xi, jnp.asarray(XI_MIN, dtype=REAL_DTYPE))
-  ind_f = jnp.floor(jnp.log10(xi_safe / XI_MIN) / DR)
+  xi_safe = jnp.maximum(xi, xi_min)
+  ind_f = jnp.floor(jnp.log10(xi_safe / xi_min) / dr)
   ind = jnp.clip(ind_f.astype(jnp.int32), REGULARIZATION_INDEX, n_dist - 2)
 
   d_lo = dist[ind]

@@ -41,9 +41,6 @@ COLUMN_NAMES = (
 # FSD tabulation metadata (Stokes_ResistanceTable.cc:37-40).
 XI_MIN = 1.0e-4          # smallest tabulated surface gap (s - 2)
 DR = 0.004305            # log-space discretization: ind*dr = log10(xi/xi_min)
-# Near-contact "roughness" regularization clamp (Lubrication.cu:172-186):
-# distances with xi <= ~1e-3 use this row verbatim.
-REGULARIZATION_INDEX = 232
 
 _DEFAULT_SOURCE = os.path.normpath(
     os.path.join(os.path.dirname(__file__),
@@ -113,7 +110,6 @@ def main():
       column_names=np.array(COLUMN_NAMES),
       xi_min=np.float64(XI_MIN),
       dr=np.float64(DR),
-      regularization_index=np.int64(REGULARIZATION_INDEX),
   )
   print('Wrote %s  (dist %s, vals %s)' % (args.out, dist.shape, vals.shape))
 
