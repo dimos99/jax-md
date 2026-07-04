@@ -486,9 +486,19 @@ def build_nearfield_resistance(
     return diag6, has_neighbor
 
   def _update_neighbors(state, positions, box_matrix, **kwargs):
-    return state.neighbors.update(positions, **(
-        {'box': _neighbor_box_from_matrix(box_matrix, fractional_coordinates)}
-        if (fractional_coordinates and box_fn is None) else kwargs))
+    # Always pass the resolved box explicitly in fractional coordinates: the
+    # stored neighbor list was allocated with a matrix ``box`` (worst-case
+    # shear under a live ``box_fn``), so an update without one would fall back
+    # to the builder's scalar default and the two ``lax.cond`` branches inside
+    # ``partition.neighbor_list`` would carry mismatched box pytree leaves
+    # (scalar vs (3,3)).  Mirrors the real-space update in ``rpy_real_det``.
+    neighbor_kwargs = dict(kwargs)
+    neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
+    if neighbor_box is not None:
+      neighbor_kwargs.setdefault('box', neighbor_box)
+    else:
+      neighbor_kwargs.pop('box', None)
+    return state.neighbors.update(positions, **neighbor_kwargs)
 
   def apply_fn(state, positions, gen_velocity, **kwargs):
     positions = jnp.asarray(positions, dtype=REAL_DTYPE)

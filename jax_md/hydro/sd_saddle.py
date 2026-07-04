@@ -537,8 +537,16 @@ def build_saddle_solve(
     N = positions_frac.shape[0]
     dtype = REAL_DTYPE
     grand_mv_flat = _make_grand_mv(state.rpy, positions_frac, current_box)
+    # Live-box consistency: the far field above takes ``current_box`` as an
+    # explicit override, so the near-field minimum-image geometry must follow
+    # the same box -- re-bind it here (the stored candidate neighbor list is
+    # reused, exactly like the real-space ``box_matrix=`` override).  With a
+    # refreshed state this is a no-op; on a stale state it prevents a silent
+    # far-field/near-field box mix.
+    nf_state = (state.nf if current_box is None else
+                dataclasses.replace(state.nf, box_matrix=current_box))
     rnf_FU, rnf_FE, rnf_SU, rnf_SE = _make_rnf(
-        state.nf, positions_frac, zero_nf)
+        nf_state, positions_frac, zero_nf)
 
     def apply_A(x):
       q11, u6 = x
@@ -557,7 +565,7 @@ def build_saddle_solve(
       M_op = _make_ic0_pinv(ic0_obj)
     elif pc == 'cheb' and not zero_nf:
       # Reuse the fixed neighbor list (no .update()); positions match state.nf.
-      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)  # (N,6)
+      diag6 = nf_apply.diagonal_FU_prepared(nf_state, positions_frac)  # (N,6)
       diag_S = zeta + diag6
       def stil(v):                       # S~ v = zeta v + R^nf_FU v (matrix-free)
         return zeta * v + rnf_FU(v)
@@ -565,7 +573,7 @@ def build_saddle_solve(
       M_op = _make_cheb_pinv(diag_S, stil, lo, hi)
     elif pc == 'diag' and not zero_nf:
       # Reuse the fixed neighbor list (no .update()); positions match state.nf.
-      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)  # (N,6)
+      diag6 = nf_apply.diagonal_FU_prepared(nf_state, positions_frac)  # (N,6)
       M_op = _make_diag_pinv(zeta + diag6)
     else:
       M_op = _apply_pinv
@@ -589,19 +597,22 @@ def build_saddle_solve(
     # Background-flow add-back (convenience; relative frame is the pinned one).
     # The translational add-back uses the FULL velocity gradient ``L_inf_mat``
     # (``u^inf = L . r``), not just the symmetric rate-of-strain, so the ambient
-    # vorticity is included; ``Omega_inf = 1/2 curl u^inf = 1/2 eps:L`` is the
-    # angular add-back (a torque-free sphere co-rotates with the ambient spin).
+    # vorticity is included; ``Omega_inf = 1/2 curl u^inf`` is the angular
+    # add-back (a torque-free sphere co-rotates with the ambient spin).
     # With ``L_inf_mat == E_inf_mat`` (symmetric, the default when no spin is
     # supplied) this reduces bit-for-bit to the Phase-2 behavior (Omega_inf = 0).
     box = state.rpy.real.box_matrix if current_box is None else current_box
     cart = space.transform(box, positions_frac - jnp.asarray(0.5, dtype=dtype))
     U_inf = jnp.einsum('ij,nj->ni', L_inf_mat, cart)
-    # Omega_inf_k = 1/2 eps_kij L_ij.  Simple-shear check: L[0,1]=gamma_dot
-    # (u_x = gamma_dot * y) => Omega_z = 1/2 (L[0,1]-L[1,0]) = +gamma_dot/2.
+    # Omega_inf_k = 1/2 (curl u^inf)_k = 1/2 eps_kij d_i u^inf_j with
+    # d_i u^inf_j = L_ji.  Simple-shear check: L[0,1]=gamma_dot
+    # (u_x = gamma_dot * y) => Omega_z = 1/2 (L[1,0]-L[0,1]) = -gamma_dot/2
+    # (fluid above moves +x, below -x: the sphere rolls clockwise in the xy
+    # plane).  Same convention as ``rpy_moments.decompose_gradient``.
     Omega_inf_vec = 0.5 * jnp.stack([
-        L_inf_mat[1, 2] - L_inf_mat[2, 1],
-        L_inf_mat[2, 0] - L_inf_mat[0, 2],
-        L_inf_mat[0, 1] - L_inf_mat[1, 0],
+        L_inf_mat[2, 1] - L_inf_mat[1, 2],
+        L_inf_mat[0, 2] - L_inf_mat[2, 0],
+        L_inf_mat[1, 0] - L_inf_mat[0, 1],
     ])
     Omega_inf = jnp.broadcast_to(Omega_inf_vec, (N, 3))
 
@@ -909,6 +920,7 @@ def build_saddle_solve(
   solve_fn.wave_static = wave_static
   solve_fn.resolve_current_box = _resolve_current_box
   solve_fn.has_box_fn = has_box_fn
+  solve_fn.fractional_coordinates = fractional_coordinates
 
   return init_fn, solve_fn
 

@@ -286,6 +286,14 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   return (kT / eps) * (U_plus - U_minus)
 
 
+def _sd_coordinate_velocity(U_main, U_drift6, U_inf, advect_ambient: bool):
+  """Translational velocity used to shift SD coordinates."""
+  U_advect = U_main + U_drift6[..., :3]
+  if advect_ambient:
+    U_advect = U_advect + U_inf
+  return U_advect
+
+
 # ---------------------------------------------------------------------------
 # Sec. 5 -- one Brownian timestep
 # ---------------------------------------------------------------------------
@@ -345,10 +353,14 @@ def build_sd_brownian_step(
     ``init_fn(positions_frac) -> SaddleState`` (the Phase-2 state).
 
     ``step_fn(state, positions_frac, key, *, force=None, torque=None,
-    E_inf=None) -> (positions_new, S5, info)``.  Euler--Maruyama:
-    ``q' = q + dt (U_total + U^inf)`` with ``U_total = U_main + U_drift``;
-    ``U_main`` already superposes the deterministic and Brownian contributions
-    from the single combined solve.  ``S5`` is the total stresslet ``(N,5)``.
+    E_inf=None) -> (positions_new, S5, info)``.  Euler--Maruyama advances by
+    ``U_total = U_main + U_drift``; ``U_main`` already superposes the
+    deterministic and Brownian contributions from the single combined solve.
+    For static boxes with a manually supplied ``L_inf``, the ambient
+    translational add-back ``U^inf`` is also applied.  For live sheared boxes in
+    fractional coordinates, the changing box basis already carries the affine
+    motion, so applying ``U^inf`` to the coordinates would double-count the
+    relative affine shear.  ``S5`` is the total stresslet ``(N,5)``.
   """
   # The whole step is jitted end-to-end, so the saddle solve must use an
   # on-device preconditioner.  ``'ic0'`` builds a host RCM + incomplete-Cholesky
@@ -409,6 +421,9 @@ def build_sd_brownian_step(
   _wave_cache = {}
 
   has_box_fn = bool(getattr(solve_fn, 'has_box_fn', False))
+  fractional_coordinates = bool(
+      getattr(solve_fn, 'fractional_coordinates', True))
+  advect_ambient = (not has_box_fn) or (not fractional_coordinates)
 
   @partial(jax.jit, static_argnums=(8,))
   def _step_core(state, q, key, force, torque, E_inf, L_inf, shear_kwargs,
@@ -454,12 +469,14 @@ def build_sd_brownian_step(
         step_kwargs=shear_kwargs,
         gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
 
-    # Advance with the deterministic+Brownian velocity plus the ambient
-    # translational add-back ``U_inf = L^inf . r`` (carries the affine shear
-    # flow).  ``info['Omega_inf']`` (ambient spin) is surfaced for orientation
-    # tracking by the integrator.
+    # Advance with the deterministic+Brownian relative velocity.  In a live
+    # fractional sheared box, H(t) already carries the affine translational
+    # motion; adding ``U_inf = L^inf . r`` here would double the relative shear.
+    # Static-box/manual-flow callers still need the ambient add-back.
     U_total6 = jnp.concatenate([U_main, Om_main], axis=-1) + U_drift6
-    q_new = shift_fn(q, dt * (U_total6[..., :3] + info['U_inf']), **shear_kwargs)
+    U_advect = _sd_coordinate_velocity(
+        U_main, U_drift6, info['U_inf'], advect_ambient)
+    q_new = shift_fn(q, dt * U_advect, **shear_kwargs)
 
     # Refresh the neighbor lists to q_new *inside* the jitted step (fused,
     # on-device, shape-preserving) and hand the next state back in ``info`` --

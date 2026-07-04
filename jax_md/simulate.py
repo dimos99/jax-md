@@ -2563,17 +2563,27 @@ def _sd_real_position(positions_frac, sd_state, fractional_coordinates,
 def _sd_ambient_gradient(box_of, sf_xy, sf_xz, sf_yz, dim, time, dt):
   """Full ambient velocity gradient ``L = dH/dt . H^{-1}`` (Lees-Edwards).
 
-  Differentiates the *raw* (unreduced) shear schedule by central finite
-  difference so the rate is unaffected by the periodic Lees-Edwards remap (the
-  remap only shifts ``H`` by integer images, which cancel in ``dH/dt``).  For
-  cubic-base simple shear this reduces to ``L[i,j] = gamma_dot_ij``; the matrix
-  form stays exact for general triclinic bases / multi-plane shear.
+  The strain *rates* are central finite differences of the raw schedule
+  scalars, which are smooth across a Lees-Edwards remap; ``Hdot`` is then
+  assembled analytically from the shear construction ``H[i,j] = base[i,j] +
+  gamma_ij(t) * H[j,j]`` (the base box is constant, so ``Hdot[i,j] =
+  gamma_dot_ij * H[j,j]``).  Never finite-difference the *boxes*: a ``box_of``
+  built with ``remap=True`` reduces the strain into [-0.5, 0.5) internally, so
+  a box difference straddling the wrap sees the O(1) branch jump and produces
+  a catastrophic one-step ``L ~ -gamma_wrap / dt``.  ``L`` itself is
+  branch-invariant (the reduced box is ``H . U`` with ``U`` a constant integer
+  shear of the images, which cancels in ``Hdot . H^{-1}``), so inverting the
+  reduced ``H`` is correct.
   """
-  def H_at(t):
-    return _current_box_from_reduced_shear(
-        box_of, dim, sf_xy(t), sf_xz(t), sf_yz(t))
-  H = H_at(time)
-  Hdot = (H_at(time + 0.5 * dt) - H_at(time - 0.5 * dt)) / dt
+  H = _current_box_from_reduced_shear(
+      box_of, dim, sf_xy(time), sf_xz(time), sf_yz(time))
+  def rate(sf):
+    return (sf(time + 0.5 * dt) - sf(time - 0.5 * dt)) / dt
+  Hdot = jnp.zeros_like(H)
+  Hdot = Hdot.at[0, 1].set(rate(sf_xy) * H[1, 1])
+  if dim >= 3:
+    Hdot = Hdot.at[0, 2].set(rate(sf_xz) * H[2, 2])
+    Hdot = Hdot.at[1, 2].set(rate(sf_yz) * H[2, 2])
   return Hdot @ jnp.linalg.inv(H)
 
 
