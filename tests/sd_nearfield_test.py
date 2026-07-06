@@ -159,6 +159,27 @@ def test_nearfield_scalars_vanish_at_cutoff():
   assert np.max(np.abs(s)) < 1e-4, np.max(np.abs(s))
 
 
+def test_resistance_table_metadata_loaded_from_archive():
+  """Table spacing metadata lives in the artifact; runtime clamp policy does not."""
+  table = nf_table.load_resistance_table()
+  with np.load(nf_table._DATA_PATH, allow_pickle=True) as npz:
+    assert 'regularization_index' not in npz.files
+    np.testing.assert_allclose(np.asarray(table.xi_min), npz['xi_min'])
+    np.testing.assert_allclose(np.asarray(table.dr), npz['dr'])
+
+
+def test_nearfield_interpolation_uses_full_table():
+  """Gaps below FSD's roughness row should use the committed table."""
+  table = nf_table.load_resistance_table()
+  r = jnp.asarray([table.dist[0]])
+  scal = np.asarray(nf_table.interpolate_scalars(r, 1.0, table))[0]
+  np.testing.assert_allclose(scal, np.asarray(table.vals[0]), rtol=0.0,
+                             atol=1e-12)
+  xa11 = nf_table.COLUMN_INDEX['XA11']
+  old_cap = np.asarray(table.vals[232])
+  assert scal[xa11] > 5.0 * old_cap[xa11]
+
+
 @pytest.mark.parametrize('sep', _SEPS)
 def test_pair_grand_symmetric_psd(sep):
   R = np.array(nf.pair_grand_resistance(_RHAT, sep, 1.0, 1.0))
@@ -276,6 +297,99 @@ def test_apply_matches_explicit_dense_triclinic():
                    [0.0, 20.0, 3.0],
                    [0.0, 0.0, 20.0]])
   _apply_path_check(box)
+
+
+@pytest.mark.parametrize('box_matrix', [
+    jnp.eye(3) * 20.0,
+    jnp.array([[20.0, 6.0, 2.0],
+               [0.0, 20.0, 3.0],
+               [0.0, 0.0, 20.0]]),
+], ids=['periodic', 'triclinic'])
+def test_prepared_blocks_match_core(box_matrix):
+  """prepare + apply_blocks == the matrix-free reference apply (fixed config).
+
+  The prepared-blocks path amortizes geometry/table/block assembly once per
+  solve; ``_core`` stays the reference implementation, so equality here (f64,
+  near-contact + regularized-overlap pairs, periodic and triclinic) is the
+  regression gate for the fast path.
+  """
+  a, eta = 1.0, 1.0
+  # Mix of regularized-overlap, lubrication-gap, and isolated particles; the
+  # last pair sits at a proper near-contact separation (2.05a).
+  R = jnp.array([[0.10, 0.10, 0.10],
+                 [0.18, 0.13, 0.11],
+                 [0.55, 0.52, 0.50],
+                 [0.60, 0.55, 0.52],
+                 [0.30, 0.80, 0.30],
+                 [0.30, 0.80, 0.30 + 2.05 / 20.0],
+                 [0.85, 0.20, 0.85]])
+  space_fns = space.periodic_general(box_matrix, fractional_coordinates=True)
+  init_fn, apply_fn = nf.build_nearfield_resistance(space_fns, a, eta)
+  state = init_fn(R)
+  n = R.shape[0]
+  key = jax.random.PRNGKey(7)
+  gv = jax.random.normal(key, (n, 11), dtype=jnp.float64)
+
+  prepared = apply_fn.prepare(state, R)
+
+  # Full 11-dof apply equals the matrix-free reference.
+  ref = np.array(apply_fn.apply_prepared(state, R, gv))
+  fast = np.array(apply_fn.apply_blocks(prepared, gv))
+  np.testing.assert_allclose(fast, ref, atol=1e-12, rtol=0.0)
+
+  # FU sub-apply equals the full apply on a zero-strain embedding.
+  u6 = gv[:, :6]
+  gv_embed = jnp.concatenate([u6, jnp.zeros((n, 5), dtype=gv.dtype)], axis=-1)
+  fu = np.array(apply_fn.apply_blocks_FU(prepared, u6))
+  np.testing.assert_allclose(
+      fu, np.array(apply_fn.apply_blocks(prepared, gv_embed))[:, :6],
+      atol=1e-12, rtol=0.0)
+
+  # Diagonal and neighbored-mask agree with the dedicated extraction.
+  diag_ref = np.array(apply_fn.diagonal_FU_prepared(state, R))
+  np.testing.assert_allclose(
+      np.array(nf.prepared_diag_FU(prepared)), diag_ref, atol=1e-12, rtol=0.0)
+  _, has_neighbor_ref = apply_fn.diagonal_FU_mask_prepared(state, R)
+  np.testing.assert_array_equal(np.array(prepared.has_neighbor),
+                                np.array(has_neighbor_ref))
+
+
+def test_apply_live_shear_matches_static_deformed_box():
+  """Raw ``apply_fn``/``diagonal_FU`` under a live ``space.shearing`` box.
+
+  Regression: the neighbor update used to drop the ``box`` kwarg on the live
+  shear path, falling back to the builder's scalar default -- a ``lax.cond``
+  pytree mismatch against the (3,3) allocation box.  The pin: the live-box
+  apply at strain ``gamma`` must equal the static ``periodic_general`` build
+  at the literal deformed box.
+  """
+  a, eta = 1.0, 1.0
+  L, gamma = 20.0, 0.25
+  R = jnp.array([[0.10, 0.10, 0.10],
+                 [0.18, 0.13, 0.11],
+                 [0.55, 0.52, 0.50],
+                 [0.60, 0.55, 0.52]])
+  gv = jax.random.normal(jax.random.PRNGKey(2), (4, 11), dtype=jnp.float64)
+  shear = dict(gamma_xy=gamma, gamma_xz=0.0, gamma_yz=0.0)
+
+  disp, shift, box_of = space.shearing(L * jnp.eye(3))
+  init_s, apply_s = nf.build_nearfield_resistance((disp, shift, box_of), a, eta)
+  st = init_s(R, **shear)
+  gf_live, _ = apply_s(st, R, gv, **shear)
+  diag_live = apply_s.diagonal_FU(st, R, **shear)
+
+  Hdef = (L * jnp.eye(3)).at[0, 1].set(gamma * L)  # space.shearing convention
+  init_d, apply_d = nf.build_nearfield_resistance(
+      space.periodic_general(Hdef, fractional_coordinates=True), a, eta)
+  st_d = init_d(R)
+  gf_static, _ = apply_d(st_d, R, gv)
+  diag_static = apply_d.diagonal_FU(st_d, R)
+
+  assert float(jnp.linalg.norm(gf_static)) > 0.0  # pairs inside r_lub
+  np.testing.assert_allclose(np.asarray(gf_live), np.asarray(gf_static),
+                             rtol=0.0, atol=1e-11)
+  np.testing.assert_allclose(np.asarray(diag_live), np.asarray(diag_static),
+                             rtol=0.0, atol=1e-11)
 
 
 # ===========================================================================

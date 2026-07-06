@@ -30,7 +30,7 @@ is verified analytically against the squeeze-flow lubrication limit; the
 test (the analytic Jeffrey-Onishi gate is the deferred external pin).
 """
 
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -304,6 +304,70 @@ class NearFieldState:
   fractional_coordinates: bool = dataclasses.static_field()
 
 
+class PreparedNearField(NamedTuple):
+  """Per-pair ``R^nf`` blocks precomputed at a FIXED configuration.
+
+  During one saddle solve / Lanczos run the positions (and hence all pair
+  geometry, table lookups, and 11x11 blocks) are constant, yet the matrix-free
+  ``_core`` re-derives them on every matvec -- and the Chebyshev-Schur
+  preconditioner alone does ``cheb_degree`` matvecs per GMRES iteration.  The
+  reference CUDA FSD amortizes this setup once per step.  ``prepare`` runs the
+  geometry + table + block assembly once; :func:`apply_prepared_blocks` then
+  reduces each matvec to gather -> batched block multiply -> ``segment_sum``.
+
+  Fields (a plain ``NamedTuple`` pytree -- deliberately NOT stored on
+  ``NearFieldState``, so state treedefs and jit caches are unaffected):
+    self_blocks: ``(N, 11, 11)`` -- the masked ``R_self`` edge blocks already
+      segment-summed per receiver (the self half of the matvec collapses to a
+      single dense per-particle block multiply).
+    cross_blocks: ``(E, 11, 11)`` -- masked per-directed-edge ``R_cross``
+      blocks (edge mask pre-applied; masked edges are exactly zero).  Memory:
+      ``E*121`` floats, ~150 MB at N=4000 / max_k~80 in float32.
+    receivers, senders: ``(E,)`` int32 directed-edge endpoints.
+    has_neighbor: ``(N,)`` bool -- >=1 live lubrication edge (same mask as
+      ``diagonal_FU_mask_prepared``).
+  """
+  self_blocks: jnp.ndarray
+  cross_blocks: jnp.ndarray
+  receivers: jnp.ndarray
+  senders: jnp.ndarray
+  has_neighbor: jnp.ndarray
+
+
+def apply_prepared_blocks(prepared: PreparedNearField, gen_velocity):
+  """``R^nf @ gen_velocity`` from precomputed blocks; ``(N, 11) -> (N, 11)``.
+
+  Numerically equivalent to ``apply_prepared`` at the configuration
+  ``prepared`` was built for (pinned by ``test_prepared_blocks_match_core``).
+  """
+  gv = jnp.asarray(gen_velocity, dtype=REAL_DTYPE)
+  n = prepared.self_blocks.shape[0]
+  out = jnp.einsum('nab,nb->na', prepared.self_blocks, gv)
+  cross = jnp.einsum('eab,eb->ea', prepared.cross_blocks,
+                     gv[prepared.senders])
+  return out + ops.segment_sum(cross, prepared.receivers, n)
+
+
+def apply_prepared_blocks_FU(prepared: PreparedNearField, u6):
+  """``R^nf_FU @ u6`` from precomputed blocks; ``(N, 6) -> (N, 6)``.
+
+  Exact FU sub-block of :func:`apply_prepared_blocks` (the discarded strain
+  columns would multiply zeros), at ~(6/11)^2 of the flops -- this is the
+  Chebyshev-Schur ``S~`` inner matvec.
+  """
+  u6 = jnp.asarray(u6, dtype=REAL_DTYPE)
+  n = prepared.self_blocks.shape[0]
+  out = jnp.einsum('nab,nb->na', prepared.self_blocks[:, :6, :6], u6)
+  cross = jnp.einsum('eab,eb->ea', prepared.cross_blocks[:, :6, :6],
+                     u6[prepared.senders])
+  return out + ops.segment_sum(cross, prepared.receivers, n)
+
+
+def prepared_diag_FU(prepared: PreparedNearField):
+  """``(N, 6)`` diagonal of ``R^nf_FU`` read off the summed self blocks."""
+  return jnp.diagonal(prepared.self_blocks[:, :6, :6], axis1=-2, axis2=-1)
+
+
 def build_nearfield_resistance(
     space_fns,
     a,
@@ -485,6 +549,39 @@ def build_nearfield_resistance(
         edge_mask.astype(jnp.int32), receivers, N) > 0       # (N,)
     return diag6, has_neighbor
 
+  @jax.jit
+  def _prepare_core(positions, neighbor_idx, neighbor_mask, box_matrix):
+    """One-time geometry + table + block assembly for a fixed configuration."""
+    receivers, senders, rhat, scalars, edge_mask, N = _edge_geometry(
+        positions, neighbor_idx, neighbor_mask, box_matrix)
+    R_self, R_cross = _build_pair_operators(rhat, scalars, a, eta)
+    m = edge_mask[:, None, None]
+    R_self = jnp.where(m, R_self, 0.0)
+    R_cross = jnp.where(m, R_cross, 0.0)
+    self_blocks = ops.segment_sum(R_self, receivers, N)
+    has_neighbor = ops.segment_sum(
+        edge_mask.astype(jnp.int32), receivers, N) > 0
+    return PreparedNearField(
+        self_blocks=self_blocks,
+        cross_blocks=R_cross,
+        receivers=receivers,
+        senders=senders,
+        has_neighbor=has_neighbor,
+    )
+
+  def prepare_fn(state, positions):
+    """Precompute :class:`PreparedNearField` reusing ``state.neighbors`` as-is.
+
+    Same fixed-configuration contract as ``apply_prepared``: the caller
+    guarantees ``state.neighbors`` / ``state.box_matrix`` were built for
+    ``positions``.  Amortize over repeated matvecs via
+    :func:`apply_prepared_blocks` / :func:`apply_prepared_blocks_FU`.
+    """
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    return _prepare_core(positions, state.neighbors.idx,
+                         partition.neighbor_list_mask(state.neighbors),
+                         state.box_matrix)
+
   def _update_neighbors(state, positions, box_matrix, **kwargs):
     # Always pass the resolved box explicitly in fractional coordinates: the
     # stored neighbor list was allocated with a matrix ``box`` (worst-case
@@ -564,6 +661,10 @@ def build_nearfield_resistance(
   apply_fn.apply_prepared = apply_prepared_fn
   apply_fn.diagonal_FU_prepared = diagonal_FU_prepared_fn
   apply_fn.diagonal_FU_mask_prepared = diagonal_FU_mask_prepared_fn
+  apply_fn.prepare = prepare_fn
+  apply_fn.apply_blocks = apply_prepared_blocks
+  apply_fn.apply_blocks_FU = apply_prepared_blocks_FU
+  apply_fn.prepared_diag_FU = prepared_diag_FU
 
   return init_fn, apply_fn
 

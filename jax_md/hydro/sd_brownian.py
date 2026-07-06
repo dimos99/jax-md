@@ -171,15 +171,15 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
   nf_apply = solve_fn.nf_apply
   scale = jnp.sqrt(jnp.asarray(2.0 * kT / dt, dtype=REAL_DTYPE))
 
-  def rnf_FU(u6):
-    """Matrix-free ``R^nf_FU``: ``(N,6) [U|Omega] -> (N,6) [F|L]``.
+  # Per-pair blocks precomputed ONCE for the fixed configuration ``positions``
+  # (for which ``state.nf.neighbors`` was built): every one of the ``iters``
+  # Lanczos matvecs is then gather -> block multiply -> segment_sum instead of
+  # re-deriving geometry + table + block assembly (the FSD amortization).
+  prepared = nf_apply.prepare(state.nf, positions)
 
-    Uses ``apply_prepared`` (no per-Lanczos-iteration neighbor rebuild): the
-    sample is drawn at the fixed configuration ``positions`` for which
-    ``state.nf.neighbors`` was built.
-    """
-    gf = nf_apply.apply_prepared(state.nf, positions, _gv_from_u6(u6))
-    return gf[..., :6]
+  def rnf_FU(u6):
+    """``R^nf_FU`` from prepared blocks: ``(N,6) [U|Omega] -> (N,6) [F|L]``."""
+    return nf_apply.apply_blocks_FU(prepared, u6)
 
   if not preconditioned:
     @jax.jit
@@ -195,7 +195,10 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
   # change the sampled covariance (the Shift_nn / Proj separation below does
   # that exactly).  The host RCM + IC(0) factor is replaced by the diagonal
   # split ``D = sqrt(diag(R^nf_FU))`` -- fully jittable, no ``pure_callback``.
-  diag6, has_neighbor = nf_apply.diagonal_FU_mask_prepared(state.nf, positions)
+  # Diagonal and neighbored mask read off the same prepared blocks (equality
+  # with ``diagonal_FU_mask_prepared`` pinned by test_prepared_blocks_match_core).
+  diag6 = nf_apply.prepared_diag_FU(prepared)
+  has_neighbor = prepared.has_neighbor
   d = diag6.reshape(-1)                                    # (6N,) per-DOF diag
   D = jnp.where((d > 0.0) & (d < zeta), jnp.sqrt(d), 1.0)  # diagonal scaling
   no_nbr = (~has_neighbor)[:, None]                        # (N,1)
@@ -307,7 +310,7 @@ def build_sd_brownian_step(
     xi: Optional[float] = None,
     n_particles: Optional[int] = None,
     phi: Optional[float] = None,
-    rfd_epsilon: float = 1e-4,
+    rfd_epsilon: Optional[float] = None,
     rfd_atol: float = 1e-8,
     r_lub: Optional[float] = None,
     r_p: Optional[float] = None,
@@ -333,7 +336,13 @@ def build_sd_brownian_step(
     a, eta: sphere radius and solvent viscosity.
     dt, kT: timestep and thermal energy.
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
-    rfd_epsilon: RFD finite-difference step (confirm drift is ``eps``-independent).
+    rfd_epsilon: RFD finite-difference step.  Default ``None`` resolves to
+      ``max(gmres_tol, 1e-4)`` (= 1e-3 at default settings), matching the
+      reference FSD convention ``rfd_epsilon = solver tolerance``
+      (``Stokes.cc:125``): the drift divides ``U_+ - U_-`` by ``eps``, so a
+      larger ``eps`` relaxes the residual accuracy the displaced solves must
+      reach by the same factor, while the centered-difference bias is only
+      ``O(eps^2)``.  (Confirm drift is ``eps``-independent when overriding.)
     rfd_atol: absolute GMRES tolerance for the two RFD displaced solves.  In
       float32 this is clamped up to a reachable floor (~1e-5): with the f32
       residual floor at ~1e-6, an unreachable ``atol`` (e.g. 1e-8) would make
@@ -342,9 +351,11 @@ def build_sd_brownian_step(
     mr_iters, nf_iters: Lanczos iteration caps for the far/near-field samplers.
     lanczos_tol, gmres_tol: square-root and saddle-solve tolerances.
     rfd_gmres_restart, rfd_gmres_maxiter: GMRES budget for the two RFD displaced
-      solves (default = the main-solve budget; in float32 ``maxiter`` defaults to
-      2 so the RFD solves cannot burn the full budget once the clamped ``atol``
-      is reached).  RFD only needs a coarse drift, so a small budget is fine.
+      solves (default = the main-solve budget; in float32 they default to
+      ``restart=50, maxiter=2`` -- FSD's restart length, sized so a
+      cheb-preconditioned solve actually reaches the clamped ``atol`` instead
+      of being truncated).  Benchmarked 2026-07: a hard 20-iteration cap left
+      the drift ~20x wrong on near-contact configs.
     **rpy_kwargs: forwarded to ``build_saddle_solve`` / ``build_rpy_mobility``.
 
   Returns:
@@ -353,14 +364,19 @@ def build_sd_brownian_step(
     ``init_fn(positions_frac) -> SaddleState`` (the Phase-2 state).
 
     ``step_fn(state, positions_frac, key, *, force=None, torque=None,
-    E_inf=None) -> (positions_new, S5, info)``.  Euler--Maruyama advances by
+    E_inf=None, x0=None) -> (positions_new, S5, info)``.  ``x0`` warm-starts
+    the main saddle solve with the previous step's solution (thread
+    ``info['x0']`` between steps, as the FSD reference does; ``None`` = cold
+    start -- convergence-only, never changes the converged solution).
+    Euler--Maruyama advances by
     ``U_total = U_main + U_drift``; ``U_main`` already superposes the
     deterministic and Brownian contributions from the single combined solve.
     For static boxes with a manually supplied ``L_inf``, the ambient
     translational add-back ``U^inf`` is also applied.  For live sheared boxes in
     fractional coordinates, the changing box basis already carries the affine
     motion, so applying ``U^inf`` to the coordinates would double-count the
-    relative affine shear.  ``S5`` is the total stresslet ``(N,5)``.
+    relative affine shear.  ``S5`` is the total stresslet ``(N,5)``, including
+    the near-field drift stresslet ``-R^nf_SU U_drift`` (FSD convention).
   """
   # The whole step is jitted end-to-end, so the saddle solve must use an
   # on-device preconditioner.  ``'ic0'`` builds a host RCM + incomplete-Cholesky
@@ -380,15 +396,22 @@ def build_sd_brownian_step(
   rfd_atol = max(float(rfd_atol), _tol_floor)
   lanczos_tol = max(float(lanczos_tol), _tol_floor)
   gmres_tol = max(float(gmres_tol), _tol_floor)
-  # In f32 also cap the RFD GMRES budget hard: the RFD finite-difference drift
-  # only needs a coarse solve, and in f32 the required residual (<< eps) is at
-  # the precision floor so extra Krylov dimension / restarts cannot help -- they
-  # only burn time.  A small fixed Krylov basis bounds the per-RFD-solve cost.
+  # FSD convention: rfd_epsilon = solver tolerance (Stokes.cc:125).  The 1/eps
+  # amplification of solve residuals then matches what the tolerance delivers.
+  if rfd_epsilon is None:
+    rfd_epsilon = max(gmres_tol, 1e-4)
+  rfd_epsilon = float(rfd_epsilon)
+  # In f32, bound the RFD GMRES budget to keep the per-step cost predictable,
+  # but size it so the displaced solves actually CONVERGE to the clamped atol:
+  # restart=50 is FSD's restart length (Solvers.cu), and benchmarking
+  # (2026-07, N=4000 phi=0.45 near contact) showed a hard 20-iteration cap
+  # truncates the solves and leaves the drift ~20x wrong -- the error was
+  # budget-limited, not at the f32 precision floor.
   if _f32:
     if rfd_gmres_restart is None:
-      rfd_gmres_restart = 20
+      rfd_gmres_restart = 50
     if rfd_gmres_maxiter is None:
-      rfd_gmres_maxiter = 1
+      rfd_gmres_maxiter = 2
 
   init_fn, solve_fn = build_saddle_solve(
       space_fns, a, eta,
@@ -408,7 +431,8 @@ def build_sd_brownian_step(
         "rfd_epsilon=%g is too large relative to the near-field cutoff "
         "r_lub=%g: the RFD displaced solves reuse the neighbor list built at q, "
         "which is only valid for displacements far inside the skin. Use "
-        "rfd_epsilon << 0.01*r_lub (default 1e-4)." % (rfd_epsilon, solve_fn.r_lub))
+        "rfd_epsilon << 0.01*r_lub (default max(gmres_tol, 1e-4))."
+        % (rfd_epsilon, solve_fn.r_lub))
   # Config-independent grand Jacobi preconditioner -- built once here (eagerly):
   # it calls the jitted ``Mr_self``, so constructing it inside ``_step_core``
   # would raise a ConcretizationTypeError on its ``float(...)``.
@@ -425,8 +449,8 @@ def build_sd_brownian_step(
       getattr(solve_fn, 'fractional_coordinates', True))
   advect_ambient = (not has_box_fn) or (not fractional_coordinates)
 
-  @partial(jax.jit, static_argnums=(8,))
-  def _step_core(state, q, key, force, torque, E_inf, L_inf, shear_kwargs,
+  @partial(jax.jit, static_argnums=(9,))
+  def _step_core(state, q, key, force, torque, E_inf, L_inf, x0, shear_kwargs,
                  wave_sqrt):
     # Live deformed box from the shear gammas (None for a static box).  Under
     # shear, re-bind the incoming state's neighbor lists + box_matrix to THIS
@@ -455,10 +479,15 @@ def build_sd_brownian_step(
     U_B_flat = slip_sampler(k_slip)
     F_B_nf = nf_sampler(k_nf)
 
-    # (3) one combined deterministic + Brownian saddle solve.
-    U_main, Om_main, S5, _q11, info = solve_fn(
+    # (3) one combined deterministic + Brownian saddle solve.  ``x0`` is the
+    # previous step's solution (the FSD warm start, ../FSD Integrator.cu:777):
+    # positions move O(U dt) per step, so the smooth (deterministic) part of
+    # the solution is an excellent initial guess; the fresh Brownian part of
+    # the RHS is independent each step, so at worst the initial residual is
+    # ~sqrt(2) of the cold start's -- a fraction of one GMRES iteration.
+    U_main, Om_main, S5, q11_sol, info = solve_fn(
         state, q, force=force, torque=torque, E_inf=E_inf, L_inf=L_inf,
-        slip_top=U_B_flat, extra_force=F_B_nf,
+        slip_top=U_B_flat, extra_force=F_B_nf, x0=x0,
         return_stresslet=return_stresslet, return_residual=return_residual,
         **shear_kwargs)
 
@@ -468,6 +497,19 @@ def build_sd_brownian_step(
         eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
         step_kwargs=shear_kwargs,
         gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
+
+    # Near-field drift stresslet: the reference FSD feeds the total velocity
+    # (solve + RFD drift) into the near-field stresslet term, so the reported
+    # stresslet is S = S^ff - R^nf_SU (U_rel + U_drift) + R^nf_SE : E^inf
+    # (../FSD Integrator.cu:899, "use d_Velocity directly because it contains
+    # U_drift").  The solve's S5 carries only the main-solve velocity, so add
+    # the drift piece here (linear in U, exactly zero at kT=0).  Like FSD, the
+    # far-field drift stresslet (the 5N tail of the RFD divergence) is not
+    # sampled.
+    if return_stresslet:
+      prepared_nf = solve_fn.nf_apply.prepare(state.nf, q)
+      S5 = S5 - solve_fn.nf_apply.apply_blocks(
+          prepared_nf, _gv_from_u6(U_drift6))[..., 6:11]
 
     # Advance with the deterministic+Brownian relative velocity.  In a live
     # fractional sheared box, H(t) already carries the affine translational
@@ -487,10 +529,14 @@ def build_sd_brownian_step(
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
     out_info['next_state'] = next_state
+    # Warm start for the NEXT step's main solve (moments + relative velocity;
+    # the drift is excluded -- it is not part of the saddle solution).
+    out_info['x0'] = (q11_sol, jnp.concatenate([U_main, Om_main], axis=-1))
     return q_new, S5, out_info
 
   def step_fn(state, positions_frac, key, *,
-              force=None, torque=None, E_inf=None, L_inf=None, **shear_kwargs):
+              force=None, torque=None, E_inf=None, L_inf=None, x0=None,
+              **shear_kwargs):
     q = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
     N = q.shape[0]
     # Resolve optional inputs to concrete arrays eagerly (None is untraceable);
@@ -504,6 +550,13 @@ def build_sd_brownian_step(
     # L_inf (full ambient gradient for the add-back) stays None unless supplied
     # -> solve_fn defaults it to the symmetric part of E_inf (no ambient spin).
     L_inf = None if L_inf is None else jnp.asarray(L_inf, dtype=REAL_DTYPE)
+    # Warm start (previous step's ``info['x0']``); None -> cold (zero) start.
+    if x0 is None:
+      x0 = (jnp.zeros((N, 11), dtype=REAL_DTYPE),
+            jnp.zeros((N, 6), dtype=REAL_DTYPE))
+    else:
+      x0 = (jnp.asarray(x0[0], dtype=REAL_DTYPE),
+            jnp.asarray(x0[1], dtype=REAL_DTYPE))
     # Build the wave sqrt sampler once from the concrete wave state (static box)
     # and reuse it as a static arg so the jitted step compiles a single program.
     # Unused on the live-shear path (the exact deformed-box noise is rebuilt per
@@ -512,7 +565,7 @@ def build_sd_brownian_step(
     if wave_sqrt is None:
       wave_sqrt = build_Mw_grand_sqrt_sampler(state.rpy.wave)
       _wave_cache['wave_sqrt'] = wave_sqrt
-    return _step_core(state, q, key, force, torque, E_inf, L_inf,
+    return _step_core(state, q, key, force, torque, E_inf, L_inf, x0,
                       shear_kwargs, wave_sqrt)
 
   # Cheap host neighbor-list rebuild that reuses the wave state -- thread this
