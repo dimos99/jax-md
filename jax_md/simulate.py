@@ -2521,12 +2521,15 @@ class StokesianDynamicsState:
   wave-space precompute + preconditioner). `positions` are fractional, with the
   Cartesian trajectory mirrored in `real_position`; `stresslet` is the last
   hydrodynamic particle stresslet `(N, 5)` orthonormal (expand with
-  `hydro.stresslet_to_couplet`). `time = t0 + step * dt`.
+  `hydro.stresslet_to_couplet`). `saddle_x0` is the previous step's saddle
+  solution `(moments (N, 11), velocities (N, 6))`, threaded as the next
+  solve's GMRES warm start (convergence-only). `time = t0 + step * dt`.
   """
   real_position: Array
   positions: Array
   sd_state: Any
   stresslet: Array
+  saddle_x0: Any
   rng: Array
   step: int
   time: float
@@ -2545,6 +2548,7 @@ class ShearedSDState:
   positions: Array
   sd_state: Any
   stresslet: Array
+  saddle_x0: Any
   omega_inf: Array
   rng: Array
   step: int
@@ -2649,6 +2653,8 @@ def sd(space_fns: Tuple[Callable, ...],
     return StokesianDynamicsState(
         real_position=real_position, positions=q, sd_state=sd_state,
         stresslet=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        saddle_x0=(jnp.zeros((q.shape[0], 11), dtype=q.dtype),
+                   jnp.zeros((q.shape[0], 6), dtype=q.dtype)),
         rng=key, step=jnp.array(0, dtype=jnp.int32), time=t0)
 
   def apply_fn(state, **kwargs):
@@ -2661,12 +2667,14 @@ def sd(space_fns: Tuple[Callable, ...],
     force = force_fn(q, **step_kwargs)
     torque = torque_fn(q, **step_kwargs) if (with_torque and torque_fn) else None
     q_new, S5, info = step_fn(
-        state.sd_state, q, subkey, force=force, torque=torque)
+        state.sd_state, q, subkey, force=force, torque=torque,
+        x0=state.saddle_x0)
     next_sd = info['next_state']
     real_position = _sd_real_position(q_new, next_sd, fractional_coordinates)
     return StokesianDynamicsState(
         real_position=real_position, positions=q_new, sd_state=next_sd,
-        stresslet=S5, rng=key, step=next_step, time=time_next)
+        stresslet=S5, saddle_x0=info['x0'], rng=key, step=next_step,
+        time=time_next)
 
   return init_fn, apply_fn
 
@@ -2763,6 +2771,8 @@ def sd_with_shear(
     return ShearedSDState(
         real_position=real_position, positions=q, sd_state=sd_state,
         stresslet=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        saddle_x0=(jnp.zeros((q.shape[0], 11), dtype=q.dtype),
+                   jnp.zeros((q.shape[0], 6), dtype=q.dtype)),
         omega_inf=jnp.zeros((3,), dtype=q.dtype),
         rng=key, step=jnp.array(0, dtype=jnp.int32), time=t0)
 
@@ -2792,7 +2802,7 @@ def sd_with_shear(
 
     q_new, S5, info = step_fn(
         state.sd_state, q, subkey, force=force, torque=torque,
-        E_inf=E_inf, L_inf=L_inf, **shear)
+        E_inf=E_inf, L_inf=L_inf, x0=state.saddle_x0, **shear)
     next_sd = info['next_state']
 
     box = _current_box_from_reduced_shear(box_of, dim, curr_xy, curr_xz,
@@ -2801,7 +2811,7 @@ def sd_with_shear(
                                       box)
     return ShearedSDState(
         real_position=real_position, positions=q_new, sd_state=next_sd,
-        stresslet=S5, omega_inf=info['Omega_inf'][0],
+        stresslet=S5, saddle_x0=info['x0'], omega_inf=info['Omega_inf'][0],
         rng=key, step=next_step, time=time_next)
 
   return init_fn, apply_fn
