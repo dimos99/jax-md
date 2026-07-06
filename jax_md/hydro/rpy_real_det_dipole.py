@@ -22,7 +22,7 @@ Conventions (shared with ``rpy_moments`` / the wave-space side):
     ``rpy_real_det._resolve_apply_bookkeeping``.
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +30,7 @@ import numpy as np
 
 from jax import ops
 from jax_md import partition, space
-from jax_md.hydro.rpy_moments import traceless
+from jax_md.hydro.rpy_moments import flat_to_grand, grand_to_flat, traceless
 from jax_md.hydro.rpy_real_det import (
     RealSpaceState,
     _positions_to_real,
@@ -68,6 +68,154 @@ I3 = jnp.eye(3, dtype=REAL_DTYPE)
 # pair-tensor test and the FSD physical-map comparison, and confirmed
 # internally by grand-mobility symmetry.
 DF_ADJOINT_SIGN = -1.0
+
+# Flat generalized-moment width: [F (3, Cartesian), C (8, orthonormal
+# traceless couplet)] -- the ``rpy_moments.grand_to_flat`` layout.
+N_FLAT = 11
+
+
+class PreparedGrandReal(NamedTuple):
+  """Per-pair real-space grand-mobility blocks at a FIXED configuration.
+
+  During one saddle solve the positions and box are constant, yet the
+  matrix-free cores re-evaluate ~36 transcendentals (F1F2/G1G2/K1K2K3) per
+  edge PER lattice image on every matvec.  ``mr_grand_prepare`` runs that work
+  once, storing image-summed flat-11 blocks; :func:`mr_grand_apply_blocks`
+  then reduces each matvec to gather -> batched block multiply ->
+  ``segment_sum``.  Mirrors ``sd_nearfield.PreparedNearField`` (and, in
+  spirit, the pre-tabulated ``d_ewaldC1`` real-space Ewald table of the
+  reference FSD ``Mobility.cu``).
+
+  The blocks are built by PROBING the existing ``pair_contrib`` closure with
+  the 11 flat unit basis moments (it is linear in the sender moments per
+  edge x image), not by re-transcribing the UF/UC/DF/DC tensor algebra --
+  equality with ``mr_grand_matvec`` is pinned by
+  ``test_mr_grand_prepared_blocks_match_matvec``.
+
+  Fields (plain NamedTuple pytree; deliberately NOT stored on
+  ``RealSpaceState``):
+    self_block: ``(11, 11)`` constant static-self operator (self mobility +
+      self dipole coupling; position-independent).
+    self_blocks: ``(N, 11, 11)`` per-particle corrections -- the OrderedSparse
+      explicit self-image contributions (zeros otherwise; Dense self-image
+      ``(i, i)`` edges flow through ``cross_blocks`` naturally).
+    cross_blocks: ``(E2, 11, 11)`` image-summed masked directed-edge blocks.
+      For OrderedSparse ``E2 = 2E`` (forward + explicit backflow reverse
+      edges); otherwise ``E2 = E``.
+    receivers, senders: ``(E2,)`` int32 directed-edge endpoints.
+  """
+  self_block: jnp.ndarray
+  self_blocks: jnp.ndarray
+  cross_blocks: jnp.ndarray
+  receivers: jnp.ndarray
+  senders: jnp.ndarray
+
+
+def _flat_basis_moments(dtype):
+  """The 11 unit probe moments ``(F_b (11,3), C_b (11,3,3))``."""
+  return flat_to_grand(jnp.eye(N_FLAT, dtype=dtype))
+
+
+def _probe_edge_blocks(pair_contrib, rij, r2, mask, *, image_axis=None,
+                       **contrib_kwargs):
+  """Flat-11 blocks for a batch of edges by unit-basis probes.
+
+  ``rij`` has shape ``(..., 3)``; the returned blocks have shape
+  ``(..., 11, 11)`` with ``image_axis`` (if given) summed out.  The scalar
+  layer inside ``pair_contrib`` is loop-invariant across the 11 probes, so
+  XLA hoists it out of the vmap.
+  """
+  F_basis, C_basis = _flat_basis_moments(rij.dtype)
+
+  def one_column(Fb, Cb):
+    fu = jnp.broadcast_to(Fb, rij.shape)
+    cu = jnp.broadcast_to(Cb, rij.shape[:-1] + (3, 3))
+    dU, dD = pair_contrib(rij, r2, mask, fu, cu, **contrib_kwargs)
+    if image_axis is not None:
+      dU = dU.sum(axis=image_axis)
+      dD = dD.sum(axis=image_axis)
+    return grand_to_flat(dU, dD)
+
+  columns = jax.vmap(one_column)(F_basis, C_basis)   # (11_in, ..., 11_out)
+  return jnp.moveaxis(columns, 0, -1)                # (..., 11_out, 11_in)
+
+
+def _probe_self_block(self_term, prefactor_dc, self_dipole, dtype):
+  """Constant (11, 11) static-self operator (probe of the ``*_init`` terms)."""
+  F_basis, C_basis = _flat_basis_moments(dtype)
+
+  def one_column(Fb, Cb):
+    u = self_term * Fb
+    d = prefactor_dc * self_dipole * (jnp.swapaxes(Cb, -1, -2) - 4.0 * Cb)
+    return grand_to_flat(u, d)
+
+  return jnp.moveaxis(jax.vmap(one_column)(F_basis, C_basis), 0, -1)
+
+
+def _empty_prepared(n_particles, self_block, dtype):
+  return PreparedGrandReal(
+      self_block=self_block,
+      self_blocks=jnp.zeros((n_particles, N_FLAT, N_FLAT), dtype=dtype),
+      cross_blocks=jnp.zeros((0, N_FLAT, N_FLAT), dtype=dtype),
+      receivers=jnp.zeros((0,), dtype=jnp.int32),
+      senders=jnp.zeros((0,), dtype=jnp.int32),
+  )
+
+
+def mr_grand_prepare(state: RealSpaceState,
+                     positions: jnp.ndarray,
+                     *,
+                     neighbor: Optional[partition.NeighborList] = None,
+                     box_matrix: Optional[jnp.ndarray] = None
+                     ) -> PreparedGrandReal:
+  """Precompute :class:`PreparedGrandReal` for a fixed configuration.
+
+  Same resolution semantics as :func:`mr_grand_matvec` (``box_matrix``
+  overrides the stored box for the live sheared case; the integer
+  ``lattice_indices`` are box-independent).  The caller guarantees the
+  neighbor list matches ``positions``.
+  """
+  prepare = getattr(state.core_fn, 'prepare', None)
+  if prepare is None:
+    raise ValueError(
+        'RealSpaceState.core_fn has no prepare attribute; '
+        'build_Mr_grand_apply must be used to construct the state.')
+  positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+  neighbors = neighbor if neighbor is not None else state.neighbors
+  if neighbors is None:
+    raise ValueError(
+        "Real-space state is missing a neighbor list; provide one via the "
+        "'neighbor' argument.")
+  box = state.box_matrix if box_matrix is None else jnp.asarray(
+      box_matrix, dtype=REAL_DTYPE)
+  mask = partition.neighbor_list_mask(neighbors)
+  return prepare(positions, neighbors.idx, mask, box,
+                 state.lattice_indices, state.zero_image_index)
+
+
+def mr_grand_apply_blocks(prepared: PreparedGrandReal,
+                          forces: jnp.ndarray,
+                          couplets: Optional[jnp.ndarray] = None):
+  """Apply the prepared real-space grand mobility: ``(F, C) -> (U, D)``.
+
+  Drop-in signature twin of :func:`mr_grand_matvec` at the configuration
+  ``prepared`` was built for.  The flat-11 representation is exact on the
+  traceless couplet space (8 orthonormal components carry all traceless dof),
+  so equality with the matrix-free path holds to roundoff.
+  """
+  forces = jnp.asarray(forces, dtype=REAL_DTYPE)
+  if couplets is None:
+    couplets = jnp.zeros(forces.shape[:-1] + (3, 3), dtype=REAL_DTYPE)
+  couplets = traceless(jnp.asarray(couplets, dtype=REAL_DTYPE))
+  q11 = grand_to_flat(forces, couplets)
+  n = q11.shape[0]
+  out = jnp.einsum('ab,nb->na', prepared.self_block, q11)
+  out = out + jnp.einsum('nab,nb->na', prepared.self_blocks, q11)
+  cross = jnp.einsum('eab,eb->ea', prepared.cross_blocks,
+                     q11[prepared.senders])
+  out = out + ops.segment_sum(cross, prepared.receivers, n)
+  U, D = flat_to_grand(out)
+  return U, traceless(D)
 
 
 def _build_pair_contrib_grand_fn(a: float, xi: float, eta: float):
@@ -344,6 +492,121 @@ def _build_mr_core_lattice_grand(
     )
     return velocities, gradients
 
+  @jax.jit
+  def prepare(positions, neighbor_idx, neighbor_mask, box_matrix,
+              lattice_indices, zero_image_index):
+    """Per-edge flat-11 blocks (image-summed) for the lattice core.
+
+    Mirrors ``core``'s edge/image/mask bookkeeping exactly; the blocks are
+    unit-basis probes of the same ``pair_contrib`` closure, so no tensor
+    algebra is re-derived.
+    """
+    positions = jnp.asarray(positions)
+    neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
+    neighbor_mask = jnp.asarray(neighbor_mask, dtype=bool)
+    box_matrix = jnp.asarray(box_matrix)
+    lattice_indices = jnp.asarray(lattice_indices, dtype=jnp.int32)
+    zero_image_index = jnp.int32(zero_image_index)
+
+    x_real = _positions_to_real(positions, box_matrix, fractional_coordinates)
+    lattice_vecs = lattice_indices @ box_matrix.T
+    n_particles = x_real.shape[0]
+    n_images = lattice_vecs.shape[0]
+    dtype = x_real.dtype
+    prefactor_uf = jnp.asarray(prefactor_scalars[0], dtype=dtype)
+    prefactor_uc = jnp.asarray(prefactor_scalars[1], dtype=dtype)
+    prefactor_dc = jnp.asarray(prefactor_scalars[2], dtype=dtype)
+    self_term = prefactor_uf * jnp.asarray(self_factor, dtype=dtype)
+    self_dipole = jnp.asarray(self_dipole_factor, dtype=dtype)
+    pair_eps2 = jnp.asarray(pair_eps2_scalar, dtype=dtype)
+    contrib_kwargs = dict(prefactor_uf=prefactor_uf, prefactor_uc=prefactor_uc,
+                          prefactor_dc=prefactor_dc, pair_eps2=pair_eps2,
+                          self_dipole=self_dipole)
+
+    self_block = _probe_self_block(self_term, prefactor_dc, self_dipole, dtype)
+    self_blocks = jnp.zeros((n_particles, N_FLAT, N_FLAT), dtype=dtype)
+
+    if n_images == 0:
+      return _empty_prepared(n_particles, self_block, dtype)
+
+    receivers, senders, flat_mask = _normalize_edges(
+        neighbor_idx, neighbor_mask, neighbor_format, n_particles)
+    capacity = flat_mask.shape[0]
+    if capacity == 0:
+      return _empty_prepared(n_particles, self_block, dtype)
+
+    zero_mask = (jnp.arange(n_images, dtype=jnp.int32) == zero_image_index)[None, :]
+    lattice = lattice_vecs[None, :, :]
+
+    if include_ordered_backflow:
+      # Explicit self-image contributions (same mask logic as ``core``); these
+      # map g_i -> out_i, so they fold into per-particle self blocks.
+      rij_self = jnp.broadcast_to(lattice, (n_particles, n_images, 3))
+      r2_self = jnp.sum(rij_self * rij_self, axis=-1)
+      mask_self_img = (~zero_mask) & (r2_self < rcut2)
+      self_blocks = self_blocks + _probe_edge_blocks(
+          pair_contrib, rij_self, r2_self, mask_self_img, image_axis=1,
+          **contrib_kwargs)
+
+    def _blocks_batch(receivers_batch, senders_batch, edge_mask_batch):
+      xi_vec = x_real[receivers_batch][:, None, :]
+      xj = x_real[senders_batch][:, None, :]
+      rij = xj - xi_vec + lattice
+      r2 = jnp.sum(rij * rij, axis=-1)
+      within_rcut = r2 < rcut2
+      is_self_edge = (receivers_batch == senders_batch)[:, None]
+      primary_self = is_self_edge & zero_mask
+      mask_pairs = edge_mask_batch[:, None] & (~primary_self) & within_rcut
+      fwd = _probe_edge_blocks(pair_contrib, rij, r2, mask_pairs,
+                               image_axis=1, **contrib_kwargs)
+      if include_ordered_backflow:
+        rev = _probe_edge_blocks(pair_contrib, -rij, r2, mask_pairs,
+                                 image_axis=1, **contrib_kwargs)
+      else:
+        rev = fwd[:0]
+      return fwd, rev
+
+    # Probe work is 11x the matvec's (edges x images); reuse the same memory
+    # cap with the probe multiplicity folded in.  Results are identical
+    # chunked or not.
+    pair_image_limit = 8_000_000
+    probe_work = capacity * n_images * (N_FLAT + 1)
+    if probe_work <= pair_image_limit:
+      fwd, rev = _blocks_batch(receivers, senders, flat_mask)
+    else:
+      chunk_size = max(1, pair_image_limit // max(n_images * (N_FLAT + 1), 1))
+      n_chunks = (capacity + chunk_size - 1) // chunk_size
+      pad = n_chunks * chunk_size - capacity
+      receivers_chunks = jnp.pad(receivers, (0, pad)).reshape((n_chunks, -1))
+      senders_chunks = jnp.pad(senders, (0, pad)).reshape((n_chunks, -1))
+      mask_chunks = jnp.pad(flat_mask, (0, pad),
+                            constant_values=False).reshape((n_chunks, -1))
+
+      def _scan_blocks(_, chunk):
+        return None, _blocks_batch(*chunk)
+
+      _, (fwd_c, rev_c) = jax.lax.scan(
+          _scan_blocks, None,
+          (receivers_chunks, senders_chunks, mask_chunks))
+      fwd = fwd_c.reshape((-1, N_FLAT, N_FLAT))[:capacity]
+      rev = (rev_c.reshape((-1, N_FLAT, N_FLAT))[:capacity]
+             if include_ordered_backflow else fwd[:0])
+
+    if include_ordered_backflow:
+      cross_blocks = jnp.concatenate([fwd, rev], axis=0)
+      receivers2 = jnp.concatenate([receivers, senders])
+      senders2 = jnp.concatenate([senders, receivers])
+    else:
+      cross_blocks, receivers2, senders2 = fwd, receivers, senders
+    return PreparedGrandReal(
+        self_block=self_block,
+        self_blocks=self_blocks,
+        cross_blocks=cross_blocks,
+        receivers=receivers2.astype(jnp.int32),
+        senders=senders2.astype(jnp.int32),
+    )
+
+  core.prepare = prepare
   return core
 
 
@@ -428,6 +691,69 @@ def _build_mr_core_min_image_grand(
 
     return velocities, gradients
 
+  @jax.jit
+  def prepare(positions, neighbor_idx, neighbor_mask, box_matrix,
+              lattice_indices, zero_image_index):
+    """Per-edge flat-11 blocks for the minimum-image core (single image)."""
+    del lattice_indices, zero_image_index
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
+    neighbor_mask = jnp.asarray(neighbor_mask, dtype=bool)
+    box_matrix = jnp.asarray(box_matrix, dtype=REAL_DTYPE)
+    dtype = positions.dtype
+
+    prefactor_uf = jnp.asarray(prefactor_scalars[0], dtype=dtype)
+    prefactor_uc = jnp.asarray(prefactor_scalars[1], dtype=dtype)
+    prefactor_dc = jnp.asarray(prefactor_scalars[2], dtype=dtype)
+    self_term = prefactor_uf * jnp.asarray(self_factor, dtype=dtype)
+    self_dipole = jnp.asarray(self_dipole_factor, dtype=dtype)
+    pair_eps2 = jnp.asarray(pair_eps2_scalar, dtype=dtype)
+    contrib_kwargs = dict(prefactor_uf=prefactor_uf, prefactor_uc=prefactor_uc,
+                          prefactor_dc=prefactor_dc, pair_eps2=pair_eps2,
+                          self_dipole=self_dipole)
+
+    if fractional_coordinates:
+      positions_frac = positions
+    else:
+      inv_box = jnp.linalg.inv(box_matrix)
+      positions_frac = space.transform(inv_box, positions)
+
+    n_particles = positions_frac.shape[0]
+    self_block = _probe_self_block(self_term, prefactor_dc, self_dipole, dtype)
+
+    receivers, senders, flat_mask = _normalize_edges(
+        neighbor_idx, neighbor_mask, neighbor_format, n_particles)
+    capacity = flat_mask.shape[0]
+    if capacity == 0:
+      return _empty_prepared(n_particles, self_block, dtype)
+
+    delta_frac = jnp.mod(
+        positions_frac[senders] - positions_frac[receivers] + 0.5, 1.0) - 0.5
+    rij = space.transform(box_matrix, delta_frac)
+    r2 = jnp.sum(rij * rij, axis=-1)
+    within_rcut = r2 < rcut2
+    is_self_edge = receivers == senders
+    mask_pairs = flat_mask & (~is_self_edge) & within_rcut
+
+    fwd = _probe_edge_blocks(pair_contrib, rij, r2, mask_pairs,
+                             **contrib_kwargs)
+    if include_ordered_backflow:
+      rev = _probe_edge_blocks(pair_contrib, -rij, r2, mask_pairs,
+                               **contrib_kwargs)
+      cross_blocks = jnp.concatenate([fwd, rev], axis=0)
+      receivers2 = jnp.concatenate([receivers, senders])
+      senders2 = jnp.concatenate([senders, receivers])
+    else:
+      cross_blocks, receivers2, senders2 = fwd, receivers, senders
+    return PreparedGrandReal(
+        self_block=self_block,
+        self_blocks=jnp.zeros((n_particles, N_FLAT, N_FLAT), dtype=dtype),
+        cross_blocks=cross_blocks,
+        receivers=receivers2.astype(jnp.int32),
+        senders=senders2.astype(jnp.int32),
+    )
+
+  core.prepare = prepare
   return core
 
 

@@ -650,3 +650,71 @@ def test_antisymmetric_couplet_reproduces_rotlet():
   U_rotlet = np.cross(torque, r_vec) / (8.0 * math.pi * eta * r ** 3)
   # Finite-size corrections to the point rotlet are O((a/r)^2) = 2.5e-3.
   np.testing.assert_allclose(U, U_rotlet, rtol=1e-2, atol=1e-12)
+
+
+# ===========================================================================
+# Prepared-blocks fast path vs the matrix-free reference (fixed config)
+# ===========================================================================
+@pytest.mark.parametrize('neighbor_format', [
+    partition.NeighborListFormat.Dense,
+    partition.NeighborListFormat.OrderedSparse,
+], ids=['dense', 'ordered_sparse'])
+@pytest.mark.parametrize('mode', ['lattice', 'min_image'])
+def test_mr_grand_prepared_blocks_match_matvec(neighbor_format, mode):
+  """prepare + apply_blocks == mr_grand_matvec at a fixed configuration.
+
+  The prepared path amortizes the per-edge-per-image scalar work once per
+  solve; ``mr_grand_matvec`` stays the reference implementation.  Covers both
+  neighbor formats (OrderedSparse exercises the explicit backflow and, in the
+  lattice case with rcut > L, the self-image pass), both cores, the tiny-pair
+  regularized fallback (a near-coincident pair), the couplets=None path, and
+  a triclinic live-box override.
+  """
+  positions = jnp.asarray([[0.10, 0.10, 0.10],
+                           [0.1001, 0.10, 0.10],   # tiny-pair fallback
+                           [0.30, 0.15, 0.12],     # overlapping with 0 (r < 2a)
+                           [0.15, 0.55, 0.60],
+                           [0.60, 0.62, 0.55]], dtype=_dtype())
+  a, xi, eta = 1.0, 0.75, 1.0
+  L = 6.0
+  rcut = 10.0 if mode == 'lattice' else 2.8
+  box = _box(L)
+  space_fns = space.periodic_general(box, fractional_coordinates=True)
+  init_fn, _ = rpy_real.build_Mr_grand_apply(
+      space_fns, a, xi, eta, rcut,
+      neighbor_format=neighbor_format, real_space_mode=mode)
+  state = init_fn(positions)
+
+  n = int(positions.shape[0])
+  kF, kC = jax.random.split(jax.random.PRNGKey(3))
+  F = jax.random.normal(kF, (n, 3), dtype=_dtype())
+  C = jax.random.normal(kC, (n, 3, 3), dtype=_dtype())
+  atol = 1e-12 if jax.config.jax_enable_x64 else 1e-4
+
+  prepared = rpy_real.mr_grand_prepare(state, positions)
+  U_ref, D_ref = rpy_real.mr_grand_matvec(state, positions, F, C)
+  U, D = rpy_real.mr_grand_apply_blocks(prepared, F, C)
+  np.testing.assert_allclose(np.array(U), np.array(U_ref), atol=atol, rtol=0.0)
+  np.testing.assert_allclose(np.array(D), np.array(D_ref), atol=atol, rtol=0.0)
+
+  # couplets=None (force-only) path.
+  U0_ref, D0_ref = rpy_real.mr_grand_matvec(state, positions, F)
+  U0, D0 = rpy_real.mr_grand_apply_blocks(prepared, F)
+  np.testing.assert_allclose(np.array(U0), np.array(U0_ref),
+                             atol=atol, rtol=0.0)
+  np.testing.assert_allclose(np.array(D0), np.array(D0_ref),
+                             atol=atol, rtol=0.0)
+
+  # Live-box override (triclinic deformation of the same base box): prepare
+  # must follow the override exactly like the matrix-free path does.
+  box_tric = jnp.asarray([[L, 0.2 * L, 0.0],
+                          [0.0, L, 0.1 * L],
+                          [0.0, 0.0, L]], dtype=_dtype())
+  prepared_t = rpy_real.mr_grand_prepare(state, positions, box_matrix=box_tric)
+  Ut_ref, Dt_ref = rpy_real.mr_grand_matvec(
+      state, positions, F, C, box_matrix=box_tric)
+  Ut, Dt = rpy_real.mr_grand_apply_blocks(prepared_t, F, C)
+  np.testing.assert_allclose(np.array(Ut), np.array(Ut_ref),
+                             atol=atol, rtol=0.0)
+  np.testing.assert_allclose(np.array(Dt), np.array(Dt_ref),
+                             atol=atol, rtol=0.0)

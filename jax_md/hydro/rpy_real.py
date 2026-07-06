@@ -16,8 +16,11 @@ from jax_md.hydro.rpy_real_det_dipole_helpers import (
     Mr_self_dipole,
 )
 from jax_md.hydro.rpy_real_det_dipole import (
+    PreparedGrandReal,
     build_Mr_grand_apply,
+    mr_grand_apply_blocks,
     mr_grand_matvec,
+    mr_grand_prepare,
 )
 from jax_md.hydro.rpy_real_stoch import (
     Preconditioner,
@@ -45,6 +48,9 @@ __all__ = [
     'mr_matvec',
     'build_Mr_grand_apply',
     'mr_grand_matvec',
+    'PreparedGrandReal',
+    'mr_grand_prepare',
+    'mr_grand_apply_blocks',
     # Stochastic utilities
     'Preconditioner',
     'identity_preconditioner',

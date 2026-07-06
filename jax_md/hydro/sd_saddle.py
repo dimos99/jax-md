@@ -72,7 +72,10 @@ from jax_md.hydro.rpy import (
     _apply_wave_exact_grand,
     _sample_wave_grand_noise,
 )
-from jax_md.hydro.rpy_real_det_dipole import mr_grand_matvec
+from jax_md.hydro.rpy_real_det_dipole import (
+    mr_grand_apply_blocks,
+    mr_grand_prepare,
+)
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE, current_box_matrix
 from jax_md.hydro.rpy_real_lattice_helpers import _neighbor_box_from_matrix
 from jax_md.hydro.rpy_moments import (
@@ -371,14 +374,21 @@ def build_saddle_solve(
     base-box modes and is wrong under shear).  ``current_box=None`` is the
     static-box path (bit-for-bit the Phase-2 behavior).
     """
+    # Per-pair real-space blocks precomputed ONCE per solve (positions and
+    # box fixed): every GMRES matvec's M^r apply is then gather -> block
+    # multiply -> segment_sum instead of re-evaluating ~36 transcendentals
+    # per edge per lattice image (equality with the matrix-free path pinned
+    # by test_mr_grand_prepared_blocks_match_matvec).  ``box_matrix=None``
+    # resolves to the stored box, so one call covers both branches.
+    prepared_real = mr_grand_prepare(
+        rpy_state.real, positions, box_matrix=current_box)
+
     def grand_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
       F, C = flat_to_grand(q11)
+      Ur, Dr = mr_grand_apply_blocks(prepared_real, F, C)
       if current_box is None:
-        Ur, Dr = mr_grand_matvec(rpy_state.real, positions, F, C)
         Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
       else:
-        Ur, Dr = mr_grand_matvec(
-            rpy_state.real, positions, F, C, box_matrix=current_box)
         Uw, Dw = _apply_wave_exact_grand(
             static=wave_static, current_box=current_box,
             positions_frac=positions, forces=F, couplets=C,
@@ -389,17 +399,47 @@ def build_saddle_solve(
   def _make_rnf(nf_state: NearFieldState, positions: jnp.ndarray, zero_nf: bool):
     """Fixed-config near-field block applies; ``zero_nf`` forces R^nf=0.
 
-    Uses ``apply_prepared`` (no per-matvec neighbor rebuild): the saddle solve
-    holds ``positions`` fixed and ``nf_state.neighbors`` was built for them, so
-    the neighbor list is reused across all GMRES matvecs.
+    Precomputes the per-pair resistance blocks ONCE per solve
+    (``nf_apply.prepare``: geometry + table interpolation + 11x11 assembly at
+    the fixed ``positions``), so every subsequent matvec -- the GMRES operator,
+    the Chebyshev-Schur inner loop (``cheb_degree`` applies per iteration), the
+    power-iteration bounds, the RHS and the output stresslet -- reduces to
+    gather -> batched block multiply -> segment_sum.  This is the FSD
+    amortize-per-step pattern; equivalence to the matrix-free reference apply
+    is pinned by ``test_prepared_blocks_match_core``.
+
+    Returns ``(rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU)`` where ``diag_FU()``
+    reads the FU diagonal off the same prepared blocks (no extra geometry
+    pass).
     """
+    if zero_nf:
+      n = positions.shape[0]
+
+      def rnf_FU(u6):
+        return jnp.zeros_like(u6)
+
+      def rnf_FE(e5):
+        return jnp.zeros(e5.shape[:-1] + (6,), dtype=e5.dtype)
+
+      def rnf_SU(u6):
+        return jnp.zeros(u6.shape[:-1] + (5,), dtype=u6.dtype)
+
+      def rnf_SE(e5):
+        return jnp.zeros_like(e5)
+
+      def diag_FU():
+        return jnp.zeros((n, 6), dtype=REAL_DTYPE)
+
+      return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
+
+    prepared = nf_apply.prepare(nf_state, positions)
+
     def nf_full(gv11: jnp.ndarray) -> jnp.ndarray:
-      if zero_nf:
-        return jnp.zeros_like(gv11)
-      return nf_apply.apply_prepared(nf_state, positions, gv11)
+      return nf_apply.apply_blocks(prepared, gv11)
 
     def rnf_FU(u6):
-      return nf_full(_gv_from_u6(u6))[..., :6]
+      # FU sub-blocks directly: the cheb/GMRES hot path at ~(6/11)^2 the flops.
+      return nf_apply.apply_blocks_FU(prepared, u6)
 
     def rnf_FE(e5):
       return nf_full(_gv_from_e5(e5))[..., :6]
@@ -410,7 +450,10 @@ def build_saddle_solve(
     def rnf_SE(e5):
       return nf_full(_gv_from_e5(e5))[..., 6:11]
 
-    return rnf_FU, rnf_FE, rnf_SU, rnf_SE
+    def diag_FU():
+      return nf_apply.prepared_diag_FU(prepared)
+
+    return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
 
   # -- Block-Jacobi preconditioner (Stage 1; Schur approx S~ = zeta I) ------
   # Exact block-LDL inverse of A = [[M, B], [Bᵀ, -R^nf_FU]] with M^-1 ~ zeta I
@@ -545,7 +588,7 @@ def build_saddle_solve(
     # far-field/near-field box mix.
     nf_state = (state.nf if current_box is None else
                 dataclasses.replace(state.nf, box_matrix=current_box))
-    rnf_FU, rnf_FE, rnf_SU, rnf_SE = _make_rnf(
+    rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU = _make_rnf(
         nf_state, positions_frac, zero_nf)
 
     def apply_A(x):
@@ -564,16 +607,16 @@ def build_saddle_solve(
     if pc == 'ic0' and not zero_nf:
       M_op = _make_ic0_pinv(ic0_obj)
     elif pc == 'cheb' and not zero_nf:
-      # Reuse the fixed neighbor list (no .update()); positions match state.nf.
-      diag6 = nf_apply.diagonal_FU_prepared(nf_state, positions_frac)  # (N,6)
+      # Diagonal read off the same prepared blocks (no extra geometry pass).
+      diag6 = diag_FU()                                              # (N,6)
       diag_S = zeta + diag6
-      def stil(v):                       # S~ v = zeta v + R^nf_FU v (matrix-free)
+      def stil(v):                # S~ v = zeta v + R^nf_FU v (prepared blocks)
         return zeta * v + rnf_FU(v)
       lo, hi = _cheb_bounds(stil, diag_S)
       M_op = _make_cheb_pinv(diag_S, stil, lo, hi)
     elif pc == 'diag' and not zero_nf:
-      # Reuse the fixed neighbor list (no .update()); positions match state.nf.
-      diag6 = nf_apply.diagonal_FU_prepared(nf_state, positions_frac)  # (N,6)
+      # Diagonal read off the same prepared blocks (no extra geometry pass).
+      diag6 = diag_FU()                                              # (N,6)
       M_op = _make_diag_pinv(zeta + diag6)
     else:
       M_op = _apply_pinv
@@ -832,7 +875,8 @@ def build_saddle_solve(
         e5 = jnp.broadcast_to(E_inf, (N, 5))
 
     grand_mv_flat = _make_grand_mv(state.rpy, positions_frac)
-    rnf_FU, rnf_FE, _su, _se = _make_rnf(state.nf, positions_frac, False)
+    rnf_FU, rnf_FE, _su, _se, diag_FU = _make_rnf(
+        state.nf, positions_frac, False)
 
     nm, nf6 = 11 * N, 6 * N
 
@@ -868,7 +912,7 @@ def build_saddle_solve(
     elif preconditioner == 'cheb':
       # Same on-device Chebyshev Schur operator the jitted solve uses, applied
       # eagerly to a flat scipy vector.
-      diag6 = nf_apply.diagonal_FU_prepared(state.nf, positions_frac)
+      diag6 = diag_FU()
       diag_S = zeta + diag6
       def stil(vv):
         return zeta * vv + rnf_FU(vv)
