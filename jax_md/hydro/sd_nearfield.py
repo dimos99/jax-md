@@ -30,7 +30,7 @@ is verified analytically against the squeeze-flow lubrication limit; the
 test (the analytic Jeffrey-Onishi gate is the deferred external pin).
 """
 
-from typing import Callable, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -118,6 +118,109 @@ def _outer(u, v):
   return u[..., :, None] * v[..., None, :]
 
 
+def _dim_scalars(scalars, a, eta):
+  """Dimensionalize the 22 bare table columns (FSD ``a = eta = 1`` units).
+
+  Returns ``{name: (E,) array}`` for every column in
+  :data:`sd_nearfield_table.COLUMN_NAMES`.  The prefactor family is the second
+  letter of the column name (``'XA11' -> 'A'``, ..., ``'ZM12' -> 'M'``);
+  self = "11", cross = "12".
+  """
+  pref = _kim_karrila_prefactors(a, eta)
+  cidx = nf_table.COLUMN_INDEX
+  return {name: pref[name[1]] * scalars[:, cidx[name]]
+          for name in nf_table.COLUMN_NAMES}
+
+
+def _a_block(X, Y, P, Iperp):
+  """A-form 3x3 block ``X r r + Y (I - r r)`` (serves the A and C families)."""
+  return X[:, None, None] * P + Y[:, None, None] * Iperp
+
+
+def _g_tensor(XG, YG, rhat, P, Pt, eye):
+  """Rank-3 G coupling: ``(E,3,3,3)`` stresslet ``S_ij`` from velocity ``U_k``.
+
+  G_ijk = XG (r_i r_j - d_ij/3) r_k + YG (d_ik r_j + r_i d_jk - 2 r_i r_j r_k)
+  """
+  t1 = XG[:, None, None, None] * Pt[..., None] * rhat[:, None, None, :]
+  dik_rj = eye[None, :, None, :] * rhat[:, None, :, None]  # d_ik r_j
+  ri_djk = rhat[:, :, None, None] * eye[None, None, :, :]  # r_i d_jk
+  rrr = P[..., None] * rhat[:, None, None, :]              # r_i r_j r_k
+  t2 = YG[:, None, None, None] * (dik_rj + ri_djk - 2.0 * rrr)
+  return t1 + t2
+
+
+def _h_tensor(YH, rhat, epsr):
+  """Rank-3 H coupling: ``(E,3,3,3)`` stresslet ``S_ij`` from rotation ``Omega_p``.
+
+  H_ijp = YH (r_i eps_jpq r_q + r_j eps_ipq r_q); ``epsr_jp = eps_jpq r_q``
+  (the ``eps . r`` acts on the last index).
+  """
+  ri_epsr = rhat[:, :, None, None] * epsr[:, None, :, :]   # r_i eps_jpq r_q
+  rj_epsr = rhat[:, None, :, None] * epsr[:, :, None, :]   # r_j eps_ipq r_q
+  return YH[:, None, None, None] * (ri_epsr + rj_epsr)
+
+
+def _m_tensor(XM, YM, ZM, rhat, Pt, eye):
+  """Rank-4 M coupling: ``(E,3,3,3,3)`` stresslet ``S_ij`` from strain ``E_kl``.
+
+  See Lubrication.cu:1151-1198 (and the comment block reproduced there).
+  """
+  d = eye
+  # XM term: 3/2 (r_i r_j - d_ij/3)(r_k r_l - d_kl/3)
+  tX = 1.5 * XM[:, None, None, None, None] * (Pt[:, :, :, None, None]
+                                              * Pt[:, None, None, :, :])
+  # YM term: 1/2 (r_i d_jl r_k + r_j d_il r_k + r_i d_jk r_l + r_j d_ik r_l
+  #               - 4 r_i r_j r_k r_l)
+  ri = rhat[:, :, None, None, None]
+  rj = rhat[:, None, :, None, None]
+  rk = rhat[:, None, None, :, None]
+  rl = rhat[:, None, None, None, :]
+  d_jl = d[None, None, :, None, :]
+  d_il = d[None, :, None, None, :]
+  d_jk = d[None, None, :, :, None]
+  d_ik = d[None, :, None, :, None]
+  d_ij = d[None, :, :, None, None]
+  d_kl = d[None, None, None, :, :]
+  tY = 0.5 * YM[:, None, None, None, None] * (
+      ri * d_jl * rk + rj * d_il * rk + ri * d_jk * rl + rj * d_ik * rl
+      - 4.0 * ri * rj * rk * rl)
+  # ZM term: 1/2 ( d_ik d_jl + d_jk d_il - d_ij d_kl + r_i r_j d_kl
+  #               + d_ij r_k r_l + r_i r_j r_k r_l
+  #               - r_i d_jl r_k - r_j d_il r_k - r_i d_jk r_l - r_j d_ik r_l )
+  tZ = 0.5 * ZM[:, None, None, None, None] * (
+      d_ik * d_jl + d_jk * d_il - d_ij * d_kl
+      + ri * rj * d_kl + d_ij * rk * rl + ri * rj * rk * rl
+      - ri * d_jl * rk - rj * d_il * rk - ri * d_jk * rl - rj * d_ik * rl)
+  return tX + tY + tZ
+
+
+def _project_su(basis, T):
+  """Rank-3 block onto the orthonormal 5-basis rows: ``(E,3,3,3) -> (E,5,3)``."""
+  return jnp.einsum('aij,eijk->eak', basis, T)
+
+
+def _project_se(basis, M):
+  """Rank-4 block onto 5-basis rows and columns: ``(E,3,3,3,3) -> (E,5,5)``."""
+  return jnp.einsum('aij,eijkl,bkl->eab', basis, M, basis)
+
+
+def _assemble_gen_block(A, R_FW, R_LU, C, R_SU, R_SW, R_FE, R_LE, R_SE):
+  """Pack the nine sub-blocks into the ``(E, 11, 11)`` generalized layout."""
+  E = A.shape[0]
+  R = jnp.zeros((E, N_GEN, N_GEN), dtype=A.dtype)
+  R = R.at[:, SL_U, SL_U].set(A)
+  R = R.at[:, SL_U, SL_W].set(R_FW)
+  R = R.at[:, SL_W, SL_U].set(R_LU)
+  R = R.at[:, SL_W, SL_W].set(C)
+  R = R.at[:, SL_E, SL_U].set(R_SU)
+  R = R.at[:, SL_E, SL_W].set(R_SW)
+  R = R.at[:, SL_U, SL_E].set(R_FE)
+  R = R.at[:, SL_W, SL_E].set(R_LE)
+  R = R.at[:, SL_E, SL_E].set(R_SE)
+  return R
+
+
 def _build_pair_operators(rhat, scalars, a, eta):
   """Build per-edge generalized self/cross resistance blocks.
 
@@ -133,137 +236,51 @@ def _build_pair_operators(rhat, scalars, a, eta):
     generalized velocity.
   """
   dtype = rhat.dtype
-  E = rhat.shape[0]
   eye = jnp.eye(3, dtype=dtype)
   eps = jnp.asarray(_EPS_NP, dtype=dtype)
   basis = jnp.asarray(rpy_moments.stresslet_basis(), dtype=dtype)  # (5,3,3)
 
-  pref = _kim_karrila_prefactors(a, eta)
-  c = nf_table.COLUMN_INDEX
-  # Dimensionalize each scalar family.  Self = "11", cross = "12".
-  XA11 = pref['A'] * scalars[:, c['XA11']]
-  XA12 = pref['A'] * scalars[:, c['XA12']]
-  YA11 = pref['A'] * scalars[:, c['YA11']]
-  YA12 = pref['A'] * scalars[:, c['YA12']]
-  YB11 = pref['B'] * scalars[:, c['YB11']]
-  YB12 = pref['B'] * scalars[:, c['YB12']]
-  XC11 = pref['C'] * scalars[:, c['XC11']]
-  XC12 = pref['C'] * scalars[:, c['XC12']]
-  YC11 = pref['C'] * scalars[:, c['YC11']]
-  YC12 = pref['C'] * scalars[:, c['YC12']]
-  XG11 = pref['G'] * scalars[:, c['XG11']]
-  XG12 = pref['G'] * scalars[:, c['XG12']]
-  YG11 = pref['G'] * scalars[:, c['YG11']]
-  YG12 = pref['G'] * scalars[:, c['YG12']]
-  YH11 = pref['H'] * scalars[:, c['YH11']]
-  YH12 = pref['H'] * scalars[:, c['YH12']]
-  XM11 = pref['M'] * scalars[:, c['XM11']]
-  XM12 = pref['M'] * scalars[:, c['XM12']]
-  YM11 = pref['M'] * scalars[:, c['YM11']]
-  YM12 = pref['M'] * scalars[:, c['YM12']]
-  ZM11 = pref['M'] * scalars[:, c['ZM11']]
-  ZM12 = pref['M'] * scalars[:, c['ZM12']]
+  s = _dim_scalars(scalars, a, eta)
 
   # Geometric primitives (E, ...).
   P = _outer(rhat, rhat)                              # (E,3,3) r_i r_j
   Iperp = eye[None] - P                               # (E,3,3) delta - r r
+  Pt = P - eye[None] / 3.0                            # (E,3,3) traceless r r
   # eps_klm r_m  -> (E,3,3); acts as (cross with r) on the right index.
   epsr = jnp.einsum('klm,em->ekl', eps, rhat)         # (E,3,3)
 
-  def sym3(t):
-    return 0.5 * (t + jnp.swapaxes(t, -1, -2))
-
-  def s5_from_3(t):
-    """Project symmetric traceless (E,3,3) onto the 5 orthonormal coords."""
-    return jnp.einsum('aij,eij->ea', basis, sym3(t))
-
   # ---- 3x3 sub-blocks --------------------------------------------------
-  def A_block(XA, YA):
-    return XA[:, None, None] * P + YA[:, None, None] * Iperp
-
   # FU force from U: A.  (E,3,3)
-  A11 = A_block(XA11, YA11)
-  A12 = A_block(XA12, YA12)
+  A11 = _a_block(s['XA11'], s['YA11'], P, Iperp)
+  A12 = _a_block(s['XA12'], s['YA12'], P, Iperp)
   # LOmega torque from Omega: C.
-  C11 = A_block(XC11, YC11)
-  C12 = A_block(XC12, YC12)
+  C11 = _a_block(s['XC11'], s['YC11'], P, Iperp)
+  C12 = _a_block(s['XC12'], s['YC12'], P, Iperp)
   # F-Omega and L-U couplings (B family); see module docstring for signs.
   # FSD: fi += YB11*(-eps r . wi) + (-YB12)*(-eps r . wj); li += YB11*(eps r . ui)+YB12*(eps r . uj)
   # (eps r . w)_k = eps_klm r_m w_l = epsr_kl w_l.
-  R_FW11 = -YB11[:, None, None] * epsr        # F_i from Omega_i
-  R_FW12 = YB12[:, None, None] * epsr         # F_i from Omega_j (YB21 = -YB12)
-  R_LU11 = YB11[:, None, None] * epsr         # L_i from U_i
-  R_LU12 = YB12[:, None, None] * epsr         # L_i from U_j
+  R_FW11 = -s['YB11'][:, None, None] * epsr   # F_i from Omega_i
+  R_FW12 = s['YB12'][:, None, None] * epsr    # F_i from Omega_j (YB21 = -YB12)
+  R_LU11 = s['YB11'][:, None, None] * epsr    # L_i from U_i
+  R_LU12 = s['YB12'][:, None, None] * epsr    # L_i from U_j
 
   # ---- rank-3 G (S from U) and H (S from Omega) ------------------------
-  # G_ijk = XG (r_i r_j - d_ij/3) r_k + YG (d_ik r_j + r_i d_jk - 2 r_i r_j r_k)
-  Pt = P - eye[None] / 3.0                                   # (E,3,3)
-  def G_tensor(XG, YG):
-    t1 = XG[:, None, None, None] * Pt[..., None] * rhat[:, None, None, :]
-    dik_rj = eye[None, :, None, :] * rhat[:, None, :, None]  # d_ik r_j
-    ri_djk = rhat[:, :, None, None] * eye[None, None, :, :]  # r_i d_jk
-    rrr = P[..., None] * rhat[:, None, None, :]              # r_i r_j r_k
-    t2 = YG[:, None, None, None] * (dik_rj + ri_djk - 2.0 * rrr)
-    return t1 + t2                                           # (E,3,3,3) S_ij from U_k
-  G11 = G_tensor(XG11, YG11)
-  G12 = G_tensor(XG12, YG12)
+  G11 = _g_tensor(s['XG11'], s['YG11'], rhat, P, Pt, eye)
+  G12 = _g_tensor(s['XG12'], s['YG12'], rhat, P, Pt, eye)
+  H11 = _h_tensor(s['YH11'], rhat, epsr)
+  H12 = _h_tensor(s['YH12'], rhat, epsr)
 
-  # H_ijp = YH (r_i eps_jpq r_q + r_j eps_ipq r_q);  (eps . r) on last index.
-  epsr_jp = epsr  # eps_jpq r_q = epsr_jp
-  def H_tensor(YH):
-    ri_epsr = rhat[:, :, None, None] * epsr_jp[:, None, :, :]   # r_i eps_jpq r_q
-    rj_epsr = rhat[:, None, :, None] * epsr_jp[:, :, None, :]   # r_j eps_ipq r_q
-    return YH[:, None, None, None] * (ri_epsr + rj_epsr)        # (E,3,3,3) S_ij from Omega_p
-  H11 = H_tensor(YH11)
-  H12 = H_tensor(YH12)
-
-  # ---- rank-4 M (S from E) --------------------------------------------
-  # See Lubrication.cu:1151-1198 (and the comment block reproduced there).
-  def M_tensor(XM, YM, ZM):
-    d = eye
-    # XM term: 3/2 (r_i r_j - d_ij/3)(r_k r_l - d_kl/3)
-    tX = 1.5 * XM[:, None, None, None, None] * (Pt[:, :, :, None, None]
-                                                * Pt[:, None, None, :, :])
-    # YM term: 1/2 (r_i d_jl r_k + r_j d_il r_k + r_i d_jk r_l + r_j d_ik r_l
-    #               - 4 r_i r_j r_k r_l)
-    ri = rhat[:, :, None, None, None]
-    rj = rhat[:, None, :, None, None]
-    rk = rhat[:, None, None, :, None]
-    rl = rhat[:, None, None, None, :]
-    d_jl = d[None, None, :, None, :]
-    d_il = d[None, :, None, None, :]
-    d_jk = d[None, None, :, :, None]
-    d_ik = d[None, :, None, :, None]
-    d_ij = d[None, :, :, None, None]
-    d_kl = d[None, None, None, :, :]
-    tY = 0.5 * YM[:, None, None, None, None] * (
-        ri * d_jl * rk + rj * d_il * rk + ri * d_jk * rl + rj * d_ik * rl
-        - 4.0 * ri * rj * rk * rl)
-    # ZM term: 1/2 ( d_ik d_jl + d_jk d_il - d_ij d_kl + r_i r_j d_kl
-    #               + d_ij r_k r_l + r_i r_j r_k r_l
-    #               - r_i d_jl r_k - r_j d_il r_k - r_i d_jk r_l - r_j d_ik r_l )
-    tZ = 0.5 * ZM[:, None, None, None, None] * (
-        d_ik * d_jl + d_jk * d_il - d_ij * d_kl
-        + ri * rj * d_kl + d_ij * rk * rl + ri * rj * rk * rl
-        - ri * d_jl * rk - rj * d_il * rk - ri * d_jk * rl - rj * d_ik * rl)
-    return tX + tY + tZ          # (E,3,3,3,3) S_ij from E_kl
-  M11 = M_tensor(XM11, YM11, ZM11)
-  M12 = M_tensor(XM12, YM12, ZM12)
+  # ---- rank-4 M (S from E) ---------------------------------------------
+  M11 = _m_tensor(s['XM11'], s['YM11'], s['ZM11'], rhat, Pt, eye)
+  M12 = _m_tensor(s['XM12'], s['YM12'], s['ZM12'], rhat, Pt, eye)
 
   # ---- map rank-3/4 blocks into the orthonormal 5-coordinate basis -----
-  # S5 from U/Omega: (5,3) = basis_a:ij  T_ijk
-  def su_block(T):           # T: (E,3,3,3) -> (E,5,3)
-    return jnp.einsum('aij,eijk->eak', basis, T)
-  # S5 from E5: (5,5) = basis_a:ij M_ijkl basis_b:kl
-  def se_block(M):           # M: (E,3,3,3,3) -> (E,5,5)
-    return jnp.einsum('aij,eijkl,bkl->eab', basis, M, basis)
-
-  R_SU11 = su_block(G11)     # (E,5,3)
-  R_SU12 = su_block(G12)
-  R_SW11 = su_block(H11)     # S from Omega
-  R_SW12 = su_block(H12)
-  R_SE11 = se_block(M11)     # (E,5,5)
-  R_SE12 = se_block(M12)
+  R_SU11 = _project_su(basis, G11)     # (E,5,3)
+  R_SU12 = _project_su(basis, G12)
+  R_SW11 = _project_su(basis, H11)     # S from Omega
+  R_SW12 = _project_su(basis, H12)
+  R_SE11 = _project_se(basis, M11)     # (E,5,5)
+  R_SE12 = _project_se(basis, M12)
 
   # Symmetry: force-from-strain / torque-from-strain are transposes of
   # stresslet-from-velocity / stresslet-from-rotation.  The *self* blocks use
@@ -276,23 +293,10 @@ def _build_pair_operators(rhat, scalars, a, eta):
   R_LE11 = jnp.swapaxes(R_SW11, -1, -2)
   R_LE12 = jnp.swapaxes(R_SW12, -1, -2)
 
-  def assemble(A, R_FW, R_LU, Cc, R_SU, R_SW, R_FE, R_LE, R_SE):
-    R = jnp.zeros((E, N_GEN, N_GEN), dtype=dtype)
-    R = R.at[:, SL_U, SL_U].set(A)
-    R = R.at[:, SL_U, SL_W].set(R_FW)
-    R = R.at[:, SL_W, SL_U].set(R_LU)
-    R = R.at[:, SL_W, SL_W].set(Cc)
-    R = R.at[:, SL_E, SL_U].set(R_SU)
-    R = R.at[:, SL_E, SL_W].set(R_SW)
-    R = R.at[:, SL_U, SL_E].set(R_FE)
-    R = R.at[:, SL_W, SL_E].set(R_LE)
-    R = R.at[:, SL_E, SL_E].set(R_SE)
-    return R
-
-  R_self = assemble(A11, R_FW11, R_LU11, C11, R_SU11, R_SW11,
-                    R_FE11, R_LE11, R_SE11)
-  R_cross = assemble(A12, R_FW12, R_LU12, C12, R_SU12, R_SW12,
-                     R_FE12, R_LE12, R_SE12)
+  R_self = _assemble_gen_block(A11, R_FW11, R_LU11, C11, R_SU11, R_SW11,
+                               R_FE11, R_LE11, R_SE11)
+  R_cross = _assemble_gen_block(A12, R_FW12, R_LU12, C12, R_SU12, R_SW12,
+                                R_FE12, R_LE12, R_SE12)
   return R_self, R_cross
 
 
@@ -513,8 +517,8 @@ def build_nearfield_resistance(
     contrib = jnp.where(edge_mask[:, None], contrib, 0.0)
     return ops.segment_sum(contrib, receivers, N)
 
-  pref = _kim_karrila_prefactors(a, eta)
-  _c = nf_table.COLUMN_INDEX
+  _pref_diag = _kim_karrila_prefactors(a, eta)
+  _cidx_diag = nf_table.COLUMN_INDEX
 
   @jax.jit
   def _core_diag_FU(positions, neighbor_idx, neighbor_mask, box_matrix):
@@ -533,10 +537,10 @@ def build_nearfield_resistance(
     receivers, _senders, rhat, scalars, edge_mask, N = _edge_geometry(
         positions, neighbor_idx, neighbor_mask, box_matrix)
     rh2 = rhat * rhat                                          # (E,3)
-    XA = pref['A'] * scalars[:, _c['XA11']]
-    YA = pref['A'] * scalars[:, _c['YA11']]
-    XC = pref['C'] * scalars[:, _c['XC11']]
-    YC = pref['C'] * scalars[:, _c['YC11']]
+    XA = _pref_diag['A'] * scalars[:, _cidx_diag['XA11']]
+    YA = _pref_diag['A'] * scalars[:, _cidx_diag['YA11']]
+    XC = _pref_diag['C'] * scalars[:, _cidx_diag['XC11']]
+    YC = _pref_diag['C'] * scalars[:, _cidx_diag['YC11']]
     diag_A = XA[:, None] * rh2 + YA[:, None] * (1.0 - rh2)     # (E,3) translation
     diag_C = XC[:, None] * rh2 + YC[:, None] * (1.0 - rh2)     # (E,3) rotation
     diag_edge = jnp.concatenate([diag_A, diag_C], axis=-1)     # (E,6)

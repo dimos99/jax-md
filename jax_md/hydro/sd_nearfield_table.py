@@ -54,8 +54,6 @@ COLUMN_NAMES = (
 )
 COLUMN_INDEX = {name: i for i, name in enumerate(COLUMN_NAMES)}
 
-N_FUNC = 22
-
 # Use the full tabulated near-contact range.  FSD's production roughness clamp
 # uses row 232 (surface gap h/a ~= 1e-3); row 0 reaches h/a = 1e-4.
 REGULARIZATION_INDEX = 0

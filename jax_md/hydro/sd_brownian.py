@@ -152,7 +152,8 @@ def far_field_slip(solve_fn, state, positions, kT, dt, key, *,
 # Sec. 2 -- near-field Brownian force (the new preconditioned square root)
 # ---------------------------------------------------------------------------
 def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
-                                    preconditioned=True, iters=20, tol=1e-3):
+                                    preconditioned=True, iters=20, tol=1e-3,
+                                    prepared=None):
   """Build a jitted sampler ``F^B_nf ~ N(0, (2kT/dt) R^nf_FU)`` ``(N,6)``.
 
   Returns ``sampler(key) -> F (N,6)``.  The square root runs under ``jit`` so a
@@ -164,6 +165,10 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
   ``R^nf_FU`` (first-light covariance gate).  ``preconditioned=True`` adds the
   on-device ``D / Shift_nn / Proj`` Jacobi conditioning and must give the *same*
   covariance.
+
+  ``prepared`` optionally supplies blocks already built by
+  ``solve_fn.nf_apply.prepare(state.nf, positions)`` (the Brownian step shares
+  one prepare across its consumers); default ``None`` prepares here.
   """
   positions = jnp.asarray(positions, dtype=REAL_DTYPE)
   N = positions.shape[0]
@@ -175,7 +180,8 @@ def make_nearfield_brownian_sampler(solve_fn, state, positions, kT, dt, *,
   # (for which ``state.nf.neighbors`` was built): every one of the ``iters``
   # Lanczos matvecs is then gather -> block multiply -> segment_sum instead of
   # re-deriving geometry + table + block assembly (the FSD amortization).
-  prepared = nf_apply.prepare(state.nf, positions)
+  if prepared is None:
+    prepared = nf_apply.prepare(state.nf, positions)
 
   def rnf_FU(u6):
     """``R^nf_FU`` from prepared blocks: ``(N,6) [U|Omega] -> (N,6) [F|L]``."""
@@ -461,6 +467,13 @@ def build_sd_brownian_step(
     if current_box is not None:
       state = solve_fn.refresh_state(state, q, **shear_kwargs)
 
+    # One near-field prepare per step, shared by all three fixed-configuration
+    # consumers below (the sampler, the main solve, the drift stresslet) -- the
+    # state is already refreshed to this step's box, so the blocks match what
+    # each consumer would have built itself.  The two RFD solves displace the
+    # positions and correctly re-prepare internally.
+    prepared_nf = solve_fn.nf_apply.prepare(state.nf, q)
+
     # Clean key tree: the three random inputs must be independent (FD theorem,
     # positive split).  far_field_slip splits k_slip -> (real, wave) internally.
     k_slip, k_nf, k_rfd = jax.random.split(key, 3)
@@ -475,7 +488,7 @@ def build_sd_brownian_step(
         current_box=current_box)
     nf_sampler = make_nearfield_brownian_sampler(
         solve_fn, state, q, kT, dt, preconditioned=True,
-        iters=nf_iters, tol=lanczos_tol)
+        iters=nf_iters, tol=lanczos_tol, prepared=prepared_nf)
     U_B_flat = slip_sampler(k_slip)
     F_B_nf = nf_sampler(k_nf)
 
@@ -488,6 +501,7 @@ def build_sd_brownian_step(
     U_main, Om_main, S5, q11_sol, info = solve_fn(
         state, q, force=force, torque=torque, E_inf=E_inf, L_inf=L_inf,
         slip_top=U_B_flat, extra_force=F_B_nf, x0=x0,
+        prepared_nf=prepared_nf,
         return_stresslet=return_stresslet, return_residual=return_residual,
         **shear_kwargs)
 
@@ -507,7 +521,6 @@ def build_sd_brownian_step(
     # far-field drift stresslet (the 5N tail of the RFD divergence) is not
     # sampled.
     if return_stresslet:
-      prepared_nf = solve_fn.nf_apply.prepare(state.nf, q)
       S5 = S5 - solve_fn.nf_apply.apply_blocks(
           prepared_nf, _gv_from_u6(U_drift6))[..., 6:11]
 

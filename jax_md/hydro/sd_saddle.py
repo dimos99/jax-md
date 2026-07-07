@@ -49,10 +49,38 @@ already minimum-images via its stored ``box_matrix``.  The imposed rate-of-strai
 ``E^inf`` enters the RHS (resistance problem); the full ambient velocity gradient
 ``L_inf`` drives the background-flow add-back ``info['U_inf']``/``Omega_inf']``.
 With no ``box_fn`` (static box) the path is bit-for-bit the original behavior.
+
+Module layout (top to bottom):
+
+* **Projectors** -- ``rot_embed`` / ``b_apply`` / ``bt_apply`` /
+  ``stresslet_from_moment`` (Gate A) and the ``_gv_from_*`` near-field packers.
+* **Input normalization** -- ``_resolve_e_inf`` (strain conventions) and
+  ``_normalize_solve_inputs`` (all optional ``solve_fn`` inputs -> concrete
+  arrays; zeros mean "absent").
+* **Fixed-configuration operator factories** -- ``_make_grand_mv`` (far-field
+  grand matvec, real prepared blocks + wave) and ``_make_rnf`` (near-field
+  block applies from one ``prepare`` pass).
+* **Saddle system** -- ``_saddle_operator`` (the matrix ``A``),
+  ``_saddle_rhs`` (``b1``/``b2``), ``_ambient_addback`` (``U_inf``/
+  ``Omega_inf`` convenience outputs).
+* **Preconditioners** -- one block-LDL apply ``_block_ldl_pinv`` parameterized
+  by a signed Schur solve: jacobi (``-t2/zeta``), diagonal, Chebyshev
+  (``_cheb_bounds`` + ``_make_cheb_schur_solve``) or host IC(0)
+  (``_make_ic0_schur_solve``).
+* **``build_saddle_solve``** -- binds the above to a concrete space/parameter
+  set and returns ``(init_fn, solve_fn)``; nests only what must close over the
+  builder state: ``init_fn``/``refresh_state``, the jitted ``_body_impl`` /
+  ``_device_body`` (jit cache keyed on the static GMRES configuration),
+  ``solve_fn``, and the eager ``count_iterations`` validation harness (scipy
+  GMRES over the SAME operator/RHS helpers).
+* **Host IC(0) machinery** -- ``assemble_stilde`` / ``_ic0`` /
+  ``Ic0Preconditioner`` / ``build_ic0_from_state`` (validation-oriented;
+  everything else runs on device).
 """
 
+import functools
 import math
-from typing import Callable, Optional, Tuple
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +98,6 @@ from jax_md.hydro.rpy import (
     estimate_rpy_params,
     RpyState,
     _apply_wave_exact_grand,
-    _sample_wave_grand_noise,
 )
 from jax_md.hydro.rpy_real_det_dipole import (
     mr_grand_apply_blocks,
@@ -79,7 +106,6 @@ from jax_md.hydro.rpy_real_det_dipole import (
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE, current_box_matrix
 from jax_md.hydro.rpy_real_lattice_helpers import _neighbor_box_from_matrix
 from jax_md.hydro.rpy_moments import (
-    couplet_to_orthonormal,
     couplet_to_stresslet_torque,
     decompose_gradient,
     flat_to_grand,
@@ -93,6 +119,7 @@ from jax_md.hydro import sd_nearfield_table as nf_table
 from jax_md.hydro.sd_nearfield import (
     build_nearfield_resistance,
     NearFieldState,
+    PreparedNearField,
     _build_pair_operators,
 )
 
@@ -154,6 +181,360 @@ def _gv_from_e5(e5: jnp.ndarray) -> jnp.ndarray:
   e5 = jnp.asarray(e5)
   zeros6 = jnp.zeros(e5.shape[:-1] + (6,), dtype=e5.dtype)
   return jnp.concatenate([zeros6, e5], axis=-1)
+
+
+def _resolve_e_inf(E_inf, N, dtype):
+  """Normalize an imposed rate-of-strain input to ``(e5 (N,5), E_inf_mat (3,3))``.
+
+  ``E_inf`` may be ``None`` (no imposed strain), a single symmetric-traceless
+  ``(3,3)`` gradient (symmetrized + broadcast), or orthonormal ``(N,5)``
+  coefficients.  Resolved eagerly (Python branch on shape) so the jitted body
+  receives plain arrays; ``E_inf_mat`` feeds only the ``U_inf`` add-back.
+  """
+  if E_inf is None:
+    return (jnp.zeros((N, 5), dtype=dtype), jnp.zeros((3, 3), dtype=dtype))
+  E_inf = jnp.asarray(E_inf, dtype=dtype)
+  if E_inf.shape[-2:] == (3, 3):
+    E_inf_mat = traceless(0.5 * (E_inf + jnp.swapaxes(E_inf, -1, -2)))
+    e5_single = decompose_gradient(E_inf_mat)[0]
+    e5 = jnp.broadcast_to(e5_single, (N, 5))
+  else:
+    e5 = jnp.broadcast_to(E_inf, (N, 5))
+    E_inf_mat = stresslet_to_couplet(e5[0])  # for U_inf add-back only
+  return e5, E_inf_mat
+
+
+def _normalize_solve_inputs(positions_frac, force, torque, E_inf, L_inf,
+                            slip_top, extra_force, x0):
+  """Resolve ``solve_fn``'s optional inputs to concrete ``REAL_DTYPE`` arrays.
+
+  Runs eagerly (Python ``None`` branches) so the jitted body never sees a
+  ``None`` where an array is expected.  A zeroed array is the "absent" value
+  for every optional input: zero applied force/torque, zero imposed strain,
+  zero Brownian slip / extra force, and a zero (cold) GMRES warm start.
+
+  Returns ``(positions_frac, fp6, e5, E_inf_mat, L_inf_mat, slip_arr, extra,
+  x0)`` where ``fp6`` is the stacked ``[F|L] (N,6)`` applied generalized
+  force; see :func:`_resolve_e_inf` for the strain conventions.
+  """
+  positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+  N = positions_frac.shape[0]
+  dtype = REAL_DTYPE
+
+  force = (jnp.zeros((N, 3), dtype=dtype) if force is None
+           else jnp.asarray(force, dtype=dtype))
+  torque = (jnp.zeros((N, 3), dtype=dtype) if torque is None
+            else jnp.asarray(torque, dtype=dtype))
+  fp6 = jnp.concatenate([force, torque], axis=-1)
+
+  # Imposed strain in orthonormal (N,5) + (3,3) add-back matrix.
+  e5, E_inf_mat = _resolve_e_inf(E_inf, N, dtype)
+  # Full ambient velocity gradient for the add-back: default to the symmetric
+  # rate-of-strain (no ambient vorticity -> Omega_inf = 0, Phase-2 behavior).
+  L_inf_mat = (E_inf_mat if L_inf is None
+               else jnp.asarray(L_inf, dtype=dtype))
+
+  slip_arr = (jnp.zeros((N, 11), dtype=dtype) if slip_top is None
+              else jnp.asarray(slip_top, dtype=dtype))
+  extra = (jnp.zeros((N, 6), dtype=dtype) if extra_force is None
+           else jnp.asarray(extra_force, dtype=dtype))
+  if x0 is None:
+    x0 = (jnp.zeros((N, 11), dtype=dtype), jnp.zeros((N, 6), dtype=dtype))
+  return positions_frac, fp6, e5, E_inf_mat, L_inf_mat, slip_arr, extra, x0
+
+
+# ---------------------------------------------------------------------------
+# Fixed-configuration operator factories
+# ---------------------------------------------------------------------------
+def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
+                   current_box=None, *, wave_static, a, xi, eta):
+  """Far-field grand matvec on flat-11 (real + wave, fixed state).
+
+  With ``current_box`` (live shear) the real-space kernel runs under the
+  deformed box and the wave-space operator is re-evaluated *exactly*
+  (``_apply_wave_exact_grand`` rebuilds the screened k-modes for the deformed
+  reciprocal lattice -- the position-remap-only path in ``Mw_core`` keeps the
+  base-box modes and is wrong under shear).  ``current_box=None`` is the
+  static-box path (bit-for-bit the Phase-2 behavior).
+  """
+  # Per-pair real-space blocks precomputed ONCE per solve (positions and
+  # box fixed): every GMRES matvec's M^r apply is then gather -> block
+  # multiply -> segment_sum instead of re-evaluating ~36 transcendentals
+  # per edge per lattice image (equality with the matrix-free path pinned
+  # by test_mr_grand_prepared_blocks_match_matvec).  ``box_matrix=None``
+  # resolves to the stored box, so one call covers both branches.
+  prepared_real = mr_grand_prepare(
+      rpy_state.real, positions, box_matrix=current_box)
+
+  def grand_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
+    F, C = flat_to_grand(q11)
+    Ur, Dr = mr_grand_apply_blocks(prepared_real, F, C)
+    if current_box is None:
+      Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
+    else:
+      Uw, Dw = _apply_wave_exact_grand(
+          static=wave_static, current_box=current_box,
+          positions_frac=positions, forces=F, couplets=C,
+          a=a, xi=xi, eta=eta)
+    return grand_to_flat(Ur + Uw, traceless(Dr + Dw))
+  return grand_mv_flat
+
+
+def _make_rnf(nf_apply, nf_state: NearFieldState, positions: jnp.ndarray,
+              zero_nf: bool, prepared: Optional[PreparedNearField] = None):
+  """Fixed-config near-field block applies; ``zero_nf`` forces R^nf=0.
+
+  Precomputes the per-pair resistance blocks ONCE per solve
+  (``nf_apply.prepare``: geometry + table interpolation + 11x11 assembly at
+  the fixed ``positions``), so every subsequent matvec -- the GMRES operator,
+  the Chebyshev-Schur inner loop (``cheb_degree`` applies per iteration), the
+  power-iteration bounds, the RHS and the output stresslet -- reduces to
+  gather -> batched block multiply -> segment_sum.  This is the FSD
+  amortize-per-step pattern; equivalence to the matrix-free reference apply
+  is pinned by ``test_prepared_blocks_match_core``.
+
+  ``prepared`` optionally supplies blocks already built by
+  ``nf_apply.prepare(nf_state, positions)`` so a caller holding several
+  consumers at one fixed configuration (the Brownian step) prepares once.
+
+  Returns ``(rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU)`` where ``diag_FU()``
+  reads the FU diagonal off the same prepared blocks (no extra geometry
+  pass).
+  """
+  if zero_nf:
+    n = positions.shape[0]
+
+    def rnf_FU(u6):
+      return jnp.zeros_like(u6)
+
+    def rnf_FE(e5):
+      return jnp.zeros(e5.shape[:-1] + (6,), dtype=e5.dtype)
+
+    def rnf_SU(u6):
+      return jnp.zeros(u6.shape[:-1] + (5,), dtype=u6.dtype)
+
+    def rnf_SE(e5):
+      return jnp.zeros_like(e5)
+
+    def diag_FU():
+      return jnp.zeros((n, 6), dtype=REAL_DTYPE)
+
+    return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
+
+  if prepared is None:
+    prepared = nf_apply.prepare(nf_state, positions)
+
+  def nf_full(gv11: jnp.ndarray) -> jnp.ndarray:
+    return nf_apply.apply_blocks(prepared, gv11)
+
+  def rnf_FU(u6):
+    # FU sub-blocks directly: the cheb/GMRES hot path at ~(6/11)^2 the flops.
+    return nf_apply.apply_blocks_FU(prepared, u6)
+
+  def rnf_FE(e5):
+    return nf_full(_gv_from_e5(e5))[..., :6]
+
+  def rnf_SU(u6):
+    return nf_full(_gv_from_u6(u6))[..., 6:11]
+
+  def rnf_SE(e5):
+    return nf_full(_gv_from_e5(e5))[..., 6:11]
+
+  def diag_FU():
+    return nf_apply.prepared_diag_FU(prepared)
+
+  return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
+
+
+# ---------------------------------------------------------------------------
+# Saddle system: matrix apply, right-hand side, ambient add-back
+# ---------------------------------------------------------------------------
+def _saddle_operator(grand_mv_flat, rnf_FU):
+  """Matvec of the saddle matrix ``A = [[M, B], [Bᵀ, -R^nf_FU]]`` (Eq. 2.8).
+
+  Acts on the solution pytree ``x = (q11 (N,11) far-field moments,
+  u6 (N,6) [U|Omega])`` and returns the matching ``(flat-11, FU-6)`` pair.
+  Built from a fixed-configuration far-field matvec (:func:`_make_grand_mv`)
+  and near-field FU apply (:func:`_make_rnf`).
+
+  Shared by the jitted GMRES body and the eager ``count_iterations``
+  validation harness, so both solve the same system by construction.
+  """
+  def apply_A(x):
+    q11, u6 = x
+    top = grand_mv_flat(q11) + b_apply(u6)
+    bot = bt_apply(q11) - rnf_FU(u6)
+    return (top, bot)
+  return apply_A
+
+
+def _saddle_rhs(fp6, e5, rnf_FE, slip_top=None, extra=None):
+  """Right-hand side ``(b1, b2)`` of the saddle system.
+
+  b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots), plus
+  the optional far-field Brownian slip ``U^B`` (Phase 3).
+  b2 = -(F^P + extra_force + R^nf_FE : E^inf) in FU force space, where
+  ``extra`` is the optional Phase-3 bottom-block force (near-field Brownian
+  force for the main solve, RFD displacement for the drift solves).
+
+  ``slip_top``/``extra`` default to ``None`` (omitted) for the deterministic
+  validation paths that never carry Brownian terms.
+  """
+  N = fp6.shape[0]
+  b1 = grand_to_flat(
+      jnp.zeros((N, 3), dtype=fp6.dtype), stresslet_to_couplet(e5))
+  if slip_top is not None:
+    b1 = b1 + slip_top
+  if extra is not None:
+    b2 = -(fp6 + extra + rnf_FE(e5))
+  else:
+    b2 = -(fp6 + rnf_FE(e5))
+  return b1, b2
+
+
+def _ambient_addback(L_inf_mat, positions_frac, box):
+  """Background-flow add-back ``(U_inf (N,3), Omega_inf (N,3))``.
+
+  Convenience outputs only -- the solve itself works in the relative frame
+  (the pinned convention); callers add these back if they want lab-frame
+  velocities.  Evaluated at the box-centred Cartesian positions
+  ``r = box . (q - 1/2)``.
+
+  The translational add-back uses the FULL velocity gradient ``L_inf_mat``
+  (``u^inf = L . r``), not just the symmetric rate-of-strain, so the ambient
+  vorticity is included; ``Omega_inf = 1/2 curl u^inf`` is the angular
+  add-back (a torque-free sphere co-rotates with the ambient spin).
+  With ``L_inf_mat == E_inf_mat`` (symmetric, the default when no spin is
+  supplied) this reduces bit-for-bit to the Phase-2 behavior (Omega_inf = 0).
+
+  Omega_inf_k = 1/2 (curl u^inf)_k = 1/2 eps_kij d_i u^inf_j with
+  d_i u^inf_j = L_ji.  Simple-shear check: L[0,1]=gamma_dot
+  (u_x = gamma_dot * y) => Omega_z = 1/2 (L[1,0]-L[0,1]) = -gamma_dot/2
+  (fluid above moves +x, below -x: the sphere rolls clockwise in the xy
+  plane).  Same convention as ``rpy_moments.decompose_gradient``.
+  """
+  N = positions_frac.shape[0]
+  dtype = positions_frac.dtype
+  cart = space.transform(box, positions_frac - jnp.asarray(0.5, dtype=dtype))
+  U_inf = jnp.einsum('ij,nj->ni', L_inf_mat, cart)
+  Omega_inf_vec = 0.5 * jnp.stack([
+      L_inf_mat[2, 1] - L_inf_mat[1, 2],
+      L_inf_mat[0, 2] - L_inf_mat[2, 0],
+      L_inf_mat[1, 0] - L_inf_mat[0, 1],
+  ])
+  Omega_inf = jnp.broadcast_to(Omega_inf_vec, (N, 3))
+  return U_inf, Omega_inf
+
+
+# ---------------------------------------------------------------------------
+# Saddle preconditioners (block-LDL applies differing only in the Schur solve)
+# ---------------------------------------------------------------------------
+def _block_ldl_pinv(zeta, schur_solve):
+  """Block-LDL preconditioner apply for the saddle matrix, given a Schur solve.
+
+  Exact block-LDL inverse of A = [[M, B], [Bᵀ, -R^nf_FU]] with M^-1 ~ zeta I
+  and (negative) Schur S = -(R^nf_FU + Bᵀ M^-1 B) ~ -S~:
+    t2 = y2 - Bᵀ M^-1 y1         (note the zeta on Bᵀ y1)
+    z2 = S^-1 t2 = schur_solve(t2)   (the SIGNED approximate Schur inverse)
+    z1 = M^-1 y1 - M^-1 B z2 = zeta y1 - zeta B z2
+  Dropping the zeta factors / the Schur sign (as a previous version did)
+  leaves sigma(P A) straddling zero and ~doubles the GMRES iteration count.
+
+  ``schur_solve``: ``t2 (N,6) -> z2 (N,6)`` applying ``-S~^-1`` for the
+  chosen Schur approximation ``S~`` (jacobi ``zeta I``, diagonal, Chebyshev,
+  IC(0)); it must be a fixed LINEAR map (required for GMRES).
+  """
+  def apply_pinv(x):
+    y1, y2 = x                       # y1 (N,11) moment, y2 (N,6) FU
+    t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
+    z2 = schur_solve(t2)             # S^-1 t2
+    z1 = zeta * y1                   # M^-1 y1
+    return (z1 - zeta * b_apply(z2), z2)
+  return apply_pinv
+
+
+def _cheb_bounds(stil, diag_S, *, zeta, power_iters, safety):
+  """(lo, hi) eigenvalue bounds of D^{-1/2} S~ D^{-1/2}, D = diag_S.
+
+  lo: rigorous lower bound zeta/max(diag_S) (R^nf_FU >= 0).
+  hi: safety * Rayleigh-quotient power-iteration estimate of lambda_max,
+      seeded with a fixed RANDOM vector (NOT the RHS, and NOT a structured
+      vector -- on a symmetric lattice a structured seed lies in an invariant
+      subspace that misses the dominant eigenvector, so ``hi`` underestimates
+      lambda_max and the Chebyshev polynomial diverges with degree).
+  """
+  lo = zeta / jnp.max(diag_S)
+  dinv_sqrt = jax.lax.rsqrt(diag_S)               # D^{-1/2}, (N,6)
+  # Fixed random seed: deterministic (keeps the preconditioner linear) but
+  # breaks lattice symmetry so power iteration finds the true lambda_max.
+  v = jax.random.normal(jax.random.PRNGKey(0), diag_S.shape, dtype=diag_S.dtype)
+  v = v / jnp.sqrt(jnp.vdot(v, v).real)
+  hi = lo
+  for _ in range(power_iters):
+    w = dinv_sqrt * stil(dinv_sqrt * v)           # D^{-1/2} S~ D^{-1/2} v
+    hi = jnp.vdot(v, w).real                       # Rayleigh quotient
+    nrm = jnp.sqrt(jnp.vdot(w, w).real)
+    v = w / jnp.maximum(nrm, 1e-300)
+  hi = jnp.maximum(hi * safety, lo * (1.0 + 1e-6))
+  return lo, hi
+
+
+def _make_cheb_schur_solve(diag_S, stil, lo, hi, degree):
+  """Jacobi-preconditioned degree-``degree`` Chebyshev approximation of S~^-1.
+
+  ``S~ = zeta I + R^nf_FU`` (SPD), applied matrix-free as ``stil(v)``.  All
+  applies are near-field (no FFTs) so the per-GMRES-iteration cost is small;
+  the win is fewer (expensive) GMRES iterations.  The spectral bounds
+  ``(lo, hi)`` of the Jacobi-scaled operator are computed ONCE per solve
+  (independent of the RHS), so the returned map is a fixed LINEAR operator --
+  required for GMRES.  Returns the POSITIVE solve ``t2 -> ~S~^-1 t2`` (the
+  caller wires the Schur sign).
+  """
+  theta = 0.5 * (hi + lo)
+  delta = 0.5 * (hi - lo)
+
+  def schur_solve(t2):
+    # Preconditioned Chebyshev iteration (Saad, Alg. 12.1) for S~ y = t2,
+    # D = diag_S as the inner Jacobi preconditioner.  Returns y ~ S~^-1 t2.
+    y = jnp.zeros_like(t2)
+    r = t2
+    p = jnp.zeros_like(t2)
+    alpha = 1.0 / theta
+    for i in range(degree):
+      z = r / diag_S
+      if i == 0:
+        p = z
+        alpha = 1.0 / theta
+      else:
+        beta = (delta * alpha * 0.5) ** 2
+        alpha = 1.0 / (theta - beta / alpha)
+        p = z + beta * p
+      y = y + alpha * p
+      r = r - alpha * stil(p)
+    return y
+
+  return schur_solve
+
+
+def _make_ic0_schur_solve(ic0):
+  """Signed Schur solve from the host RCM + incomplete-Cholesky factor.
+
+  ``ic0.solve`` applies ``S~^-1`` with ``S~ = zeta I + R~^nf_FU`` (positive
+  definite); the true Schur is ``S = -S~``, so ``z2 = S^-1 t2 =
+  -ic0.solve(t2)``.  The host solve is bridged into the traced GMRES via
+  ``jax.pure_callback``.
+  """
+  def _host_solve(v):
+    return np.asarray(ic0.solve(np.asarray(v, dtype=np.float64)),
+                      dtype=np.float64)
+
+  def schur_solve(t2):
+    flat = t2.reshape(-1)
+    z2flat = jax.pure_callback(
+        _host_solve, jax.ShapeDtypeStruct(flat.shape, REAL_DTYPE), flat)
+    return -z2flat.reshape(t2.shape)
+
+  return schur_solve
 
 
 # ---------------------------------------------------------------------------
@@ -245,9 +626,6 @@ def build_saddle_solve(
   cheb_power_iters = int(cheb_power_iters)
   cheb_safety = float(cheb_safety)
   default_preconditioner = preconditioner
-  if len(space_fns) > 2 and space_fns[2] is not None:
-    # A box_fn is allowed in the tuple but live shear is not supported here.
-    pass
   displacement_fn = space_fns[0]
   box_fn = space_fns[2] if len(space_fns) > 2 else None
 
@@ -362,211 +740,14 @@ def build_saddle_solve(
     nf2 = dataclasses.replace(nf, neighbors=nf_nbrs, box_matrix=nf_box)
     return SaddleState(rpy=rpy_state, nf=nf2, positions=positions_frac)
 
-  # -- Operator factories (fixed state) -----------------------------------
-  def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
-                     current_box=None):
-    """Far-field grand matvec on flat-11 (real + wave, fixed state).
+  # -- Operator factories (fixed state), builder constants bound once -------
+  make_grand_mv = functools.partial(
+      _make_grand_mv, wave_static=wave_static, a=a, xi=xi, eta=eta)
+  make_rnf = functools.partial(_make_rnf, nf_apply)
 
-    With ``current_box`` (live shear) the real-space kernel runs under the
-    deformed box and the wave-space operator is re-evaluated *exactly*
-    (``_apply_wave_exact_grand`` rebuilds the screened k-modes for the deformed
-    reciprocal lattice -- the position-remap-only path in ``Mw_core`` keeps the
-    base-box modes and is wrong under shear).  ``current_box=None`` is the
-    static-box path (bit-for-bit the Phase-2 behavior).
-    """
-    # Per-pair real-space blocks precomputed ONCE per solve (positions and
-    # box fixed): every GMRES matvec's M^r apply is then gather -> block
-    # multiply -> segment_sum instead of re-evaluating ~36 transcendentals
-    # per edge per lattice image (equality with the matrix-free path pinned
-    # by test_mr_grand_prepared_blocks_match_matvec).  ``box_matrix=None``
-    # resolves to the stored box, so one call covers both branches.
-    prepared_real = mr_grand_prepare(
-        rpy_state.real, positions, box_matrix=current_box)
-
-    def grand_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
-      F, C = flat_to_grand(q11)
-      Ur, Dr = mr_grand_apply_blocks(prepared_real, F, C)
-      if current_box is None:
-        Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
-      else:
-        Uw, Dw = _apply_wave_exact_grand(
-            static=wave_static, current_box=current_box,
-            positions_frac=positions, forces=F, couplets=C,
-            a=a, xi=xi, eta=eta)
-      return grand_to_flat(Ur + Uw, traceless(Dr + Dw))
-    return grand_mv_flat
-
-  def _make_rnf(nf_state: NearFieldState, positions: jnp.ndarray, zero_nf: bool):
-    """Fixed-config near-field block applies; ``zero_nf`` forces R^nf=0.
-
-    Precomputes the per-pair resistance blocks ONCE per solve
-    (``nf_apply.prepare``: geometry + table interpolation + 11x11 assembly at
-    the fixed ``positions``), so every subsequent matvec -- the GMRES operator,
-    the Chebyshev-Schur inner loop (``cheb_degree`` applies per iteration), the
-    power-iteration bounds, the RHS and the output stresslet -- reduces to
-    gather -> batched block multiply -> segment_sum.  This is the FSD
-    amortize-per-step pattern; equivalence to the matrix-free reference apply
-    is pinned by ``test_prepared_blocks_match_core``.
-
-    Returns ``(rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU)`` where ``diag_FU()``
-    reads the FU diagonal off the same prepared blocks (no extra geometry
-    pass).
-    """
-    if zero_nf:
-      n = positions.shape[0]
-
-      def rnf_FU(u6):
-        return jnp.zeros_like(u6)
-
-      def rnf_FE(e5):
-        return jnp.zeros(e5.shape[:-1] + (6,), dtype=e5.dtype)
-
-      def rnf_SU(u6):
-        return jnp.zeros(u6.shape[:-1] + (5,), dtype=u6.dtype)
-
-      def rnf_SE(e5):
-        return jnp.zeros_like(e5)
-
-      def diag_FU():
-        return jnp.zeros((n, 6), dtype=REAL_DTYPE)
-
-      return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
-
-    prepared = nf_apply.prepare(nf_state, positions)
-
-    def nf_full(gv11: jnp.ndarray) -> jnp.ndarray:
-      return nf_apply.apply_blocks(prepared, gv11)
-
-    def rnf_FU(u6):
-      # FU sub-blocks directly: the cheb/GMRES hot path at ~(6/11)^2 the flops.
-      return nf_apply.apply_blocks_FU(prepared, u6)
-
-    def rnf_FE(e5):
-      return nf_full(_gv_from_e5(e5))[..., :6]
-
-    def rnf_SU(u6):
-      return nf_full(_gv_from_u6(u6))[..., 6:11]
-
-    def rnf_SE(e5):
-      return nf_full(_gv_from_e5(e5))[..., 6:11]
-
-    def diag_FU():
-      return nf_apply.prepared_diag_FU(prepared)
-
-    return rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU
-
-  # -- Block-Jacobi preconditioner (Stage 1; Schur approx S~ = zeta I) ------
-  # Exact block-LDL inverse of A = [[M, B], [Bᵀ, -R^nf_FU]] with M^-1 ~ zeta I
-  # and (negative) Schur S = -(R^nf_FU + Bᵀ M^-1 B) ~ -zeta I:
-  #   t2 = y2 - Bᵀ M^-1 y1         (note the zeta on Bᵀ y1)
-  #   z2 = S^-1 t2 ~ -t2 / zeta
-  #   z1 = M^-1 y1 - M^-1 B z2 = zeta y1 - zeta B z2
-  # Dropping the zeta factors / the Schur sign (as a previous version did)
-  # leaves sigma(P A) straddling zero and ~doubles the GMRES iteration count.
-  def _apply_pinv(x):
-    y1, y2 = x                       # y1 (N,11) moment, y2 (N,6) FU
-    t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
-    z2 = -t2 / zeta                  # S^-1 ~ -(1/zeta) I
-    z1 = zeta * y1                   # M^-1 y1
-    return (z1 - zeta * b_apply(z2), z2)
-
-  # -- Diagonal-Schur preconditioner: identical block-LDL apply, but the Schur
-  # solve uses the on-device diagonal approximation S~ = zeta I + diag(R^nf_FU),
-  # so z2 = S^-1 t2 = -t2 / diag_S (pure elementwise, jittable -- no callback).
-  # ``diag_S`` is (N,6); neighborless rows have diag 0 -> S~ = zeta I there.
-  def _make_diag_pinv(diag_S):
-    def _apply_pinv_diag(x):
-      y1, y2 = x
-      t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
-      z2 = -t2 / diag_S                # S^-1 ~ -(zeta I + diag R^nf_FU)^-1
-      z1 = zeta * y1                   # M^-1 y1
-      return (z1 - zeta * b_apply(z2), z2)
-    return _apply_pinv_diag
-
-  # -- Chebyshev-Schur preconditioner: identical block-LDL apply, but z2 is the
-  # Jacobi-preconditioned degree-k Chebyshev approximation of S~^-1 t2 with
-  # S~ = zeta I + R^nf_FU (SPD), applied matrix-free as ``stil(v)``.  All applies
-  # are near-field (no FFTs) so the per-GMRES-iteration cost is small; the win is
-  # fewer (expensive) GMRES iterations.  The spectral bounds (lo, hi) of the
-  # Jacobi-scaled operator are computed ONCE per solve (independent of t2), so
-  # the map t2 -> z2 is a fixed LINEAR operator -- required for GMRES.
-  def _cheb_bounds(stil, diag_S):
-    """(lo, hi) eigenvalue bounds of D^{-1/2} S~ D^{-1/2}, D = diag_S.
-
-    lo: rigorous lower bound zeta/max(diag_S) (R^nf_FU >= 0).
-    hi: cheb_safety * Rayleigh-quotient power-iteration estimate of lambda_max,
-        seeded with a fixed RANDOM vector (NOT the RHS, and NOT a structured
-        vector -- on a symmetric lattice a structured seed lies in an invariant
-        subspace that misses the dominant eigenvector, so ``hi`` underestimates
-        lambda_max and the Chebyshev polynomial diverges with degree).
-    """
-    lo = zeta / jnp.max(diag_S)
-    dinv_sqrt = jax.lax.rsqrt(diag_S)               # D^{-1/2}, (N,6)
-    # Fixed random seed: deterministic (keeps the preconditioner linear) but
-    # breaks lattice symmetry so power iteration finds the true lambda_max.
-    v = jax.random.normal(jax.random.PRNGKey(0), diag_S.shape, dtype=diag_S.dtype)
-    v = v / jnp.sqrt(jnp.vdot(v, v).real)
-    hi = lo
-    for _ in range(cheb_power_iters):
-      w = dinv_sqrt * stil(dinv_sqrt * v)           # D^{-1/2} S~ D^{-1/2} v
-      hi = jnp.vdot(v, w).real                       # Rayleigh quotient
-      nrm = jnp.sqrt(jnp.vdot(w, w).real)
-      v = w / jnp.maximum(nrm, 1e-300)
-    hi = jnp.maximum(hi * cheb_safety, lo * (1.0 + 1e-6))
-    return lo, hi
-
-  def _make_cheb_pinv(diag_S, stil, lo, hi):
-    theta = 0.5 * (hi + lo)
-    delta = 0.5 * (hi - lo)
-
-    def _schur_solve(t2):
-      # Preconditioned Chebyshev iteration (Saad, Alg. 12.1) for S~ y = t2,
-      # D = diag_S as the inner Jacobi preconditioner.  Returns y ~ S~^-1 t2.
-      y = jnp.zeros_like(t2)
-      r = t2
-      p = jnp.zeros_like(t2)
-      alpha = 1.0 / theta
-      for i in range(cheb_degree):
-        z = r / diag_S
-        if i == 0:
-          p = z
-          alpha = 1.0 / theta
-        else:
-          beta = (delta * alpha * 0.5) ** 2
-          alpha = 1.0 / (theta - beta / alpha)
-          p = z + beta * p
-        y = y + alpha * p
-        r = r - alpha * stil(p)
-      return y
-
-    def _apply_pinv_cheb(x):
-      y1, y2 = x
-      t2 = y2 - zeta * bt_apply(y1)    # y2 - Bᵀ M^-1 y1
-      z2 = -_schur_solve(t2)           # S^-1 ~ -(S~)^-1 via Chebyshev
-      z1 = zeta * y1                   # M^-1 y1
-      return (z1 - zeta * b_apply(z2), z2)
-    return _apply_pinv_cheb
-
-  # -- IC(0) preconditioner: identical block-LDL apply, but the Schur solve
-  # uses the host-side RCM + incomplete-Cholesky factor of S~ = zeta I + R~^nf_FU
-  # (positive definite), so z2 = S^-1 t2 = -S~^-1 t2 = -ic0.solve(t2).  The host
-  # solve is bridged into the traced GMRES via jax.pure_callback.
-  def _make_ic0_pinv(ic0):
-    def _host_solve(v):
-      return np.asarray(ic0.solve(np.asarray(v, dtype=np.float64)),
-                        dtype=np.float64)
-
-    def _apply_pinv_ic0(x):
-      y1, y2 = x
-      t2 = y2 - zeta * bt_apply(y1)
-      flat = t2.reshape(-1)
-      z2flat = jax.pure_callback(
-          _host_solve, jax.ShapeDtypeStruct(flat.shape, REAL_DTYPE), flat)
-      z2 = -z2flat.reshape(y2.shape)
-      z1 = zeta * y1
-      return (z1 - zeta * b_apply(z2), z2)
-
-    return _apply_pinv_ic0
+  # Block-Jacobi preconditioner (Schur approx S~ = zeta I): see
+  # :func:`_block_ldl_pinv` for the LDL derivation and the zeta/sign pitfalls.
+  jacobi_pinv = _block_ldl_pinv(zeta, lambda t2: -t2 / zeta)
 
   # -- Numeric body (shared by the eager IC(0) path and the jitted device path).
   # ``pc``/``zero_nf``/``ret_s``/``ret_r``/``tol_``/``atol_`` are static; for the
@@ -576,10 +757,12 @@ def build_saddle_solve(
   def _body_impl(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
                  current_box, slip_top, extra, x0,
                  pc, zero_nf, ret_s, ret_r, tol_, atol_, ic0_obj,
-                 restart_, maxiter_):
+                 restart_, maxiter_, prepared_nf=None):
+    # ``prepared_nf`` is a TRACED trailing arg (a PreparedNearField pytree or
+    # None), deliberately after the static block so _STATIC_ARGNUMS is stable.
     N = positions_frac.shape[0]
     dtype = REAL_DTYPE
-    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac, current_box)
+    grand_mv_flat = make_grand_mv(state.rpy, positions_frac, current_box)
     # Live-box consistency: the far field above takes ``current_box`` as an
     # explicit override, so the near-field minimum-image geometry must follow
     # the same box -- re-bind it here (the stored candidate neighbor list is
@@ -588,38 +771,33 @@ def build_saddle_solve(
     # far-field/near-field box mix.
     nf_state = (state.nf if current_box is None else
                 dataclasses.replace(state.nf, box_matrix=current_box))
-    rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU = _make_rnf(
-        nf_state, positions_frac, zero_nf)
+    rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU = make_rnf(
+        nf_state, positions_frac, zero_nf, prepared=prepared_nf)
 
-    def apply_A(x):
-      q11, u6 = x
-      top = grand_mv_flat(q11) + b_apply(u6)
-      bot = bt_apply(q11) - rnf_FU(u6)
-      return (top, bot)
-
-    # b1 = (0_rigid, E^inf) in the velocity-output flat-11 (strain slots), plus
-    # the optional far-field Brownian slip U^B (Phase 3).
-    b1 = grand_to_flat(
-        jnp.zeros((N, 3), dtype=dtype), stresslet_to_couplet(e5)) + slip_top
-    # b2 = -(F^P + extra_force + R^nf_FE : E^inf) in FU force space.
-    b2 = -(fp6 + extra + rnf_FE(e5))
+    # Saddle matvec + RHS (shared, by construction, with count_iterations).
+    apply_A = _saddle_operator(grand_mv_flat, rnf_FU)
+    b1, b2 = _saddle_rhs(fp6, e5, rnf_FE, slip_top=slip_top, extra=extra)
 
     if pc == 'ic0' and not zero_nf:
-      M_op = _make_ic0_pinv(ic0_obj)
-    elif pc == 'cheb' and not zero_nf:
-      # Diagonal read off the same prepared blocks (no extra geometry pass).
-      diag6 = diag_FU()                                              # (N,6)
-      diag_S = zeta + diag6
-      def stil(v):                # S~ v = zeta v + R^nf_FU v (prepared blocks)
-        return zeta * v + rnf_FU(v)
-      lo, hi = _cheb_bounds(stil, diag_S)
-      M_op = _make_cheb_pinv(diag_S, stil, lo, hi)
-    elif pc == 'diag' and not zero_nf:
-      # Diagonal read off the same prepared blocks (no extra geometry pass).
-      diag6 = diag_FU()                                              # (N,6)
-      M_op = _make_diag_pinv(zeta + diag6)
+      M_op = _block_ldl_pinv(zeta, _make_ic0_schur_solve(ic0_obj))
+    elif pc in ('cheb', 'diag') and not zero_nf:
+      # Schur approx S~ = zeta I + (diag of) R^nf_FU; the diagonal is read off
+      # the same prepared blocks (no extra geometry pass).
+      diag_S = zeta + diag_FU()                                      # (N,6)
+      if pc == 'cheb':
+        def stil(v):              # S~ v = zeta v + R^nf_FU v (prepared blocks)
+          return zeta * v + rnf_FU(v)
+        lo, hi = _cheb_bounds(stil, diag_S, zeta=zeta,
+                              power_iters=cheb_power_iters,
+                              safety=cheb_safety)
+        cheb_solve = _make_cheb_schur_solve(diag_S, stil, lo, hi, cheb_degree)
+        M_op = _block_ldl_pinv(zeta, lambda t2: -cheb_solve(t2))
+      else:
+        # Pure elementwise Schur solve (jittable -- no callback); neighborless
+        # rows have diag 0 -> S~ = zeta I there.
+        M_op = _block_ldl_pinv(zeta, lambda t2: -t2 / diag_S)
     else:
-      M_op = _apply_pinv
+      M_op = jacobi_pinv
 
     x, conv_info = sparse_linalg.gmres(
         apply_A, (b1, b2), x0=x0, tol=tol_, atol=atol_,
@@ -637,35 +815,18 @@ def build_saddle_solve(
     else:
       S5 = jnp.zeros((N, 5), dtype=dtype)
 
-    # Background-flow add-back (convenience; relative frame is the pinned one).
-    # The translational add-back uses the FULL velocity gradient ``L_inf_mat``
-    # (``u^inf = L . r``), not just the symmetric rate-of-strain, so the ambient
-    # vorticity is included; ``Omega_inf = 1/2 curl u^inf`` is the angular
-    # add-back (a torque-free sphere co-rotates with the ambient spin).
-    # With ``L_inf_mat == E_inf_mat`` (symmetric, the default when no spin is
-    # supplied) this reduces bit-for-bit to the Phase-2 behavior (Omega_inf = 0).
+    # Background-flow add-back (convenience; relative frame is the pinned one);
+    # see :func:`_ambient_addback` for the vorticity/curl conventions.
     box = state.rpy.real.box_matrix if current_box is None else current_box
-    cart = space.transform(box, positions_frac - jnp.asarray(0.5, dtype=dtype))
-    U_inf = jnp.einsum('ij,nj->ni', L_inf_mat, cart)
-    # Omega_inf_k = 1/2 (curl u^inf)_k = 1/2 eps_kij d_i u^inf_j with
-    # d_i u^inf_j = L_ji.  Simple-shear check: L[0,1]=gamma_dot
-    # (u_x = gamma_dot * y) => Omega_z = 1/2 (L[1,0]-L[0,1]) = -gamma_dot/2
-    # (fluid above moves +x, below -x: the sphere rolls clockwise in the xy
-    # plane).  Same convention as ``rpy_moments.decompose_gradient``.
-    Omega_inf_vec = 0.5 * jnp.stack([
-        L_inf_mat[2, 1] - L_inf_mat[1, 2],
-        L_inf_mat[0, 2] - L_inf_mat[2, 0],
-        L_inf_mat[1, 0] - L_inf_mat[0, 1],
-    ])
-    Omega_inf = jnp.broadcast_to(Omega_inf_vec, (N, 3))
+    U_inf, Omega_inf = _ambient_addback(L_inf_mat, positions_frac, box)
 
     info = {'gmres_info': conv_info, 'U_inf': U_inf, 'Omega_inf': Omega_inf}
     # Residual diagnostic, on-device (jnp, no host float) so the body stays
     # jittable; costs one extra grand+near-field matvec -> gated by ``ret_r``.
     if ret_r:
       Ax = apply_A(x)
-      res = jnp.sqrt(_pytree_dot((Ax[0] - b1, Ax[1] - b2),
-                                 (Ax[0] - b1, Ax[1] - b2)))
+      resid = (Ax[0] - b1, Ax[1] - b2)
+      res = jnp.sqrt(_pytree_dot(resid, resid))
       bnorm = jnp.sqrt(_pytree_dot((b1, b2), (b1, b2)))
       info['rel_residual'] = res / jnp.maximum(bnorm, 1e-300)
     return U_rel, Omega_rel, S5, q11, info
@@ -679,7 +840,7 @@ def build_saddle_solve(
   def _device_body(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
                    current_box, slip_top, extra,
                    x0, pc, zero_nf, ret_s, ret_r, tol_, atol_,
-                   restart_, maxiter_):
+                   restart_, maxiter_, prepared_nf=None):
     key = (pc, zero_nf, ret_s, ret_r, tol_, atol_, restart_, maxiter_)
     fn = _body_jit_cache.get(key)
     if fn is None:
@@ -687,7 +848,8 @@ def build_saddle_solve(
       _body_jit_cache[key] = fn
     return fn(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
               slip_top, extra, x0,
-              pc, zero_nf, ret_s, ret_r, tol_, atol_, None, restart_, maxiter_)
+              pc, zero_nf, ret_s, ret_r, tol_, atol_, None, restart_, maxiter_,
+              prepared_nf)
 
   # -- solve_fn ------------------------------------------------------------
   def solve_fn(
@@ -703,6 +865,7 @@ def build_saddle_solve(
       preconditioner: Optional[str] = None,
       slip_top: Optional[jnp.ndarray] = None,
       extra_force: Optional[jnp.ndarray] = None,
+      prepared_nf: Optional[PreparedNearField] = None,
       ic0=None,
       tol: Optional[float] = None,
       atol: Optional[float] = None,
@@ -742,6 +905,13 @@ def build_saddle_solve(
       extra_force: optional generalized force ``(N,6)`` added inside the bottom
         block (Phase 3): the near-field Brownian force ``F^B_nf`` for the main
         solve, or the RFD displacement ``Delta q`` for the drift solves.
+      prepared_nf: optional near-field blocks already built by
+        ``solve_fn.nf_apply.prepare(state.nf, positions_frac)`` -- MUST be at
+        the same positions and box this solve uses (under live shear, refresh
+        the state first; ``build_sd_brownian_step`` does).  Lets the Brownian
+        step share one prepare across its sampler / solve / drift-stresslet
+        consumers.  Ignored when ``zero_nearfield=True``; default ``None``
+        prepares internally (the previous behavior).
       ic0: optional prebuilt :class:`Ic0Preconditioner` used in place of a
         host rebuild from ``state`` -- lets the RFD displaced solves reuse the
         factor built at ``q`` (only affects convergence, never the solution).
@@ -757,53 +927,13 @@ def build_saddle_solve(
       orthonormal, far-field moments ``(N,11)``, and an info dict.  Work in the
       relative frame; ``info['U_inf']`` carries the background-flow add-back.
     """
-    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
-    N = positions_frac.shape[0]
-    dtype = REAL_DTYPE
-
-    if force is None:
-      force = jnp.zeros((N, 3), dtype=dtype)
-    else:
-      force = jnp.asarray(force, dtype=dtype)
-    if torque is None:
-      torque = jnp.zeros((N, 3), dtype=dtype)
-    else:
-      torque = jnp.asarray(torque, dtype=dtype)
-    fp6 = jnp.concatenate([force, torque], axis=-1)
-
-    # Imposed strain in orthonormal (N,5).  Resolved eagerly (Python branch on
-    # shape) so the jitted body receives plain (N,5) / (3,3) arrays.
-    if E_inf is None:
-      e5 = jnp.zeros((N, 5), dtype=dtype)
-      E_inf_mat = jnp.zeros((3, 3), dtype=dtype)
-    else:
-      E_inf = jnp.asarray(E_inf, dtype=dtype)
-      if E_inf.shape[-2:] == (3, 3):
-        E_inf_mat = traceless(0.5 * (E_inf + jnp.swapaxes(E_inf, -1, -2)))
-        e5_single = decompose_gradient(E_inf_mat)[0]
-        e5 = jnp.broadcast_to(e5_single, (N, 5))
-      else:
-        e5 = jnp.broadcast_to(E_inf, (N, 5))
-        E_inf_mat = stresslet_to_couplet(e5[0])  # for U_inf add-back only
-
-    # Full ambient velocity gradient for the add-back: default to the symmetric
-    # rate-of-strain (no ambient vorticity -> Omega_inf = 0, Phase-2 behavior).
-    if L_inf is None:
-      L_inf_mat = E_inf_mat
-    else:
-      L_inf_mat = jnp.asarray(L_inf, dtype=dtype)
+    # All optional array inputs -> concrete REAL_DTYPE arrays (zeros = absent).
+    (positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
+     slip_arr, extra, x0) = _normalize_solve_inputs(
+        positions_frac, force, torque, E_inf, L_inf, slip_top, extra_force, x0)
 
     # Live deformed box from the shear kwargs (None for a static box).
     current_box = _resolve_current_box(positions_frac, **shear_kwargs)
-
-    # Normalize the optional Phase-3 / warm-start inputs to concrete arrays so
-    # the jitted body never sees ``None`` (which is untraceable).
-    slip_arr = (jnp.zeros((N, 11), dtype=dtype) if slip_top is None
-                else jnp.asarray(slip_top, dtype=dtype))
-    extra = (jnp.zeros((N, 6), dtype=dtype) if extra_force is None
-             else jnp.asarray(extra_force, dtype=dtype))
-    if x0 is None:
-      x0 = (jnp.zeros((N, 11), dtype=dtype), jnp.zeros((N, 6), dtype=dtype))
 
     pc = preconditioner if preconditioner is not None else default_preconditioner
     if pc not in ('cheb', 'diag', 'ic0', 'jacobi'):
@@ -826,12 +956,12 @@ def build_saddle_solve(
           state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
           slip_arr, extra, x0,
           pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
-          ic0_obj, _restart, _maxiter)
+          ic0_obj, _restart, _maxiter, prepared_nf)
     return _device_body(
         state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
         slip_arr, extra, x0,
         pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
-        _restart, _maxiter)
+        _restart, _maxiter, prepared_nf)
 
   # -- Eager iteration-count harness (check 3; runs outside JIT) -----------
   def count_iterations(
@@ -856,26 +986,14 @@ def build_saddle_solve(
     """
     import scipy.sparse.linalg as spla
 
-    positions_frac = jnp.asarray(positions_frac, dtype=REAL_DTYPE)
+    # Same input normalization as solve_fn (slip/extra/x0 unused here).
+    (positions_frac, fp6, e5, _E_inf_mat, _L_inf_mat,
+     _slip, _extra, _x0) = _normalize_solve_inputs(
+        positions_frac, force, torque, E_inf, None, None, None, None)
     N = positions_frac.shape[0]
-    if force is None:
-      force = jnp.zeros((N, 3), dtype=REAL_DTYPE)
-    if torque is None:
-      torque = jnp.zeros((N, 3), dtype=REAL_DTYPE)
-    fp6 = jnp.concatenate([jnp.asarray(force, REAL_DTYPE),
-                           jnp.asarray(torque, REAL_DTYPE)], axis=-1)
-    if E_inf is None:
-      e5 = jnp.zeros((N, 5), dtype=REAL_DTYPE)
-    else:
-      E_inf = jnp.asarray(E_inf, dtype=REAL_DTYPE)
-      if E_inf.shape[-2:] == (3, 3):
-        e5 = jnp.broadcast_to(
-            decompose_gradient(traceless(0.5 * (E_inf + E_inf.T)))[0], (N, 5))
-      else:
-        e5 = jnp.broadcast_to(E_inf, (N, 5))
 
-    grand_mv_flat = _make_grand_mv(state.rpy, positions_frac)
-    rnf_FU, rnf_FE, _su, _se, diag_FU = _make_rnf(
+    grand_mv_flat = make_grand_mv(state.rpy, positions_frac)
+    rnf_FU, rnf_FE, _su, _se, diag_FU = make_rnf(
         state.nf, positions_frac, False)
 
     nm, nf6 = 11 * N, 6 * N
@@ -887,40 +1005,38 @@ def build_saddle_solve(
     def join(q11, u6):
       return np.concatenate([np.asarray(q11).ravel(), np.asarray(u6).ravel()])
 
+    # The SAME saddle matvec/RHS the jitted body uses (shared helpers),
+    # wrapped flat for scipy's LinearOperator.
+    apply_A = _saddle_operator(grand_mv_flat, rnf_FU)
+
     def matvec(v):
-      q11, u6 = split(v)
-      top = grand_mv_flat(q11) + b_apply(u6)
-      bot = bt_apply(q11) - rnf_FU(u6)
+      top, bot = apply_A(split(v))
       return join(top, bot)
 
     A_op = spla.LinearOperator((nm + nf6, nm + nf6), matvec=matvec)
 
-    b1 = grand_to_flat(jnp.zeros((N, 3), REAL_DTYPE), stresslet_to_couplet(e5))
-    b2 = -(fp6 + rnf_FE(e5))
+    b1, b2 = _saddle_rhs(fp6, e5, rnf_FE)
     b = join(b1, b2)
 
     M_op = None
     diag = {'relaxed': 0.0, 'preconditioner': preconditioner}
     if preconditioner == 'jacobi':
       def mjac(v):
-        q11, u6 = split(v)
-        t2 = u6 - zeta * bt_apply(q11)   # y2 - Bᵀ M^-1 y1
-        z2 = -t2 / zeta                  # S^-1 ~ -(1/zeta) I
-        z1 = zeta * q11                  # M^-1 y1
-        return join(z1 - zeta * b_apply(z2), z2)
+        z1, z2 = jacobi_pinv(split(v))
+        return join(z1, z2)
       M_op = spla.LinearOperator((nm + nf6, nm + nf6), matvec=mjac)
     elif preconditioner == 'cheb':
       # Same on-device Chebyshev Schur operator the jitted solve uses, applied
       # eagerly to a flat scipy vector.
-      diag6 = diag_FU()
-      diag_S = zeta + diag6
+      diag_S = zeta + diag_FU()
       def stil(vv):
         return zeta * vv + rnf_FU(vv)
-      lo, hi = _cheb_bounds(stil, diag_S)
-      cheb_pinv = _make_cheb_pinv(diag_S, stil, lo, hi)
+      lo, hi = _cheb_bounds(stil, diag_S, zeta=zeta,
+                            power_iters=cheb_power_iters, safety=cheb_safety)
+      cheb_solve = _make_cheb_schur_solve(diag_S, stil, lo, hi, cheb_degree)
+      cheb_pinv = _block_ldl_pinv(zeta, lambda t2: -cheb_solve(t2))
       def mcheb(v):
-        q11, u6 = split(v)
-        z1, z2 = cheb_pinv((q11, u6))
+        z1, z2 = cheb_pinv(split(v))
         return join(z1, z2)
       M_op = spla.LinearOperator((nm + nf6, nm + nf6), matvec=mcheb)
     elif preconditioner == 'ic0':
