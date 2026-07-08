@@ -62,7 +62,6 @@ import numpy as np
 
 from jax_md.hydro.sd_saddle import (
     build_saddle_solve,
-    _gv_from_u6,
 )
 from jax_md.hydro.rpy import _sample_wave_grand_noise
 from jax_md.hydro.rpy_real_det_helpers import REAL_DTYPE
@@ -250,7 +249,8 @@ def nearfield_brownian_force(solve_fn, state, positions, kT, dt, key, *,
 # ---------------------------------------------------------------------------
 def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
               atol=1e-8, atol2=None, step_kwargs=None,
-              gmres_restart=None, gmres_maxiter=None):
+              gmres_restart=None, gmres_maxiter=None,
+              return_stresslet=False):
   """Random-finite-difference estimate of ``kT div R_FU^{-1}`` as a velocity.
 
   Two displaced saddle solves at ``q +/- (eps/2) dq`` with the fixed RHS
@@ -262,9 +262,24 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   fixed *absolute* GMRES tolerance ``atol`` (with ``tol=0``) so the difference is
   not corrupted by a warm-start residual asymmetry (amplified by ``1/eps``).
 
+  With ``return_stresslet=True`` the same two solves also return the drift
+  stresslet ``S5_drift = (kT/eps)(S5_+ - S5_-)``: a single-sample estimator of
+  the mean Brownian stresslet ``<S^B> = -kT div(R_SU . R_FU^{-1})`` (Foss &
+  Brady 2000, Eq. 10c).  Each displaced solve assembles
+  ``S = S^ff - R^nf_SU u`` from near-field blocks prepared at the **displaced**
+  positions, so the estimator carries all three product-rule terms of Eq. 10c
+  -- the far-field response divergence, ``R^nf_SU . div(R_FU^{-1})``, and
+  ``(grad R^nf_SU) : R_FU^{-1}`` -- with the near-contact ``1/gap``
+  cancellation of the last two happening inside the ``+/-`` subtraction.  The
+  stresslet difference is amplified by the same ``1/eps`` as the velocity, so
+  the matched absolute-tolerance discipline applies to it unchanged.
+
   ``atol2`` overrides the absolute tolerance of the second (warm-started) solve;
   default ``atol``.  Used only by the validation negative control -- loosening it
   deliberately reintroduces the warm-start asymmetry that check 4 must catch.
+
+  Returns ``U_drift (N, 6)``, or ``(U_drift, S5_drift (N, 5))`` when
+  ``return_stresslet=True``.
   """
   step_kwargs = step_kwargs or {}
   atol2 = atol if atol2 is None else atol2
@@ -280,19 +295,22 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   # solves so the wave/real/near-field matvecs use the deformed box (the
   # neighbor lists built at ``q`` are reused -- the eps-displacement is far
   # inside the skin, and the box is essentially unchanged over eps).
-  Up, Op, _s5p, q11p, _ip = solve_fn(
+  Up, Op, s5p, q11p, _ip = solve_fn(
       state, q_plus, extra_force=dq6, tol=0.0, atol=atol,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
-      return_stresslet=False, return_residual=False, **step_kwargs)
+      return_stresslet=return_stresslet, return_residual=False, **step_kwargs)
   x0 = (q11p, jnp.concatenate([Up, Op], axis=-1))          # warm start
-  Um, Om, _s5m, _q11m, _im = solve_fn(
+  Um, Om, s5m, _q11m, _im = solve_fn(
       state, q_minus, extra_force=dq6, x0=x0, tol=0.0, atol=atol2,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
-      return_stresslet=False, return_residual=False, **step_kwargs)
+      return_stresslet=return_stresslet, return_residual=False, **step_kwargs)
 
   U_plus = jnp.concatenate([Up, Op], axis=-1)
   U_minus = jnp.concatenate([Um, Om], axis=-1)
-  return (kT / eps) * (U_plus - U_minus)
+  U_drift = (kT / eps) * (U_plus - U_minus)
+  if return_stresslet:
+    return U_drift, (kT / eps) * (s5p - s5m)
+  return U_drift
 
 
 def _sd_coordinate_velocity(U_main, U_drift6, U_inf, advect_ambient: bool):
@@ -382,7 +400,11 @@ def build_sd_brownian_step(
     fractional coordinates, the changing box basis already carries the affine
     motion, so applying ``U^inf`` to the coordinates would double-count the
     relative affine shear.  ``S5`` is the total stresslet ``(N,5)``, including
-    the near-field drift stresslet ``-R^nf_SU U_drift`` (FSD convention).
+    the drift stresslet ``(kT/eps)(S5_+ - S5_-)`` from the RFD displaced
+    solves -- a single-sample estimator of the mean Brownian stresslet
+    ``<S^B> = -kT div(R_SU . R_FU^{-1})`` (Foss & Brady 2000, Eq. 10c; also
+    exposed as ``info['S5_drift']``).  Per-step values are noisy; only time
+    averages are physically meaningful (as for the fluctuating stresslet).
   """
   # The whole step is jitted end-to-end, so the saddle solve must use an
   # on-device preconditioner.  ``'ic0'`` builds a host RCM + incomplete-Cholesky
@@ -467,11 +489,12 @@ def build_sd_brownian_step(
     if current_box is not None:
       state = solve_fn.refresh_state(state, q, **shear_kwargs)
 
-    # One near-field prepare per step, shared by all three fixed-configuration
-    # consumers below (the sampler, the main solve, the drift stresslet) -- the
+    # One near-field prepare per step, shared by the two fixed-configuration
+    # consumers below (the near-field sampler and the main solve) -- the
     # state is already refreshed to this step's box, so the blocks match what
     # each consumer would have built itself.  The two RFD solves displace the
-    # positions and correctly re-prepare internally.
+    # positions and correctly re-prepare internally (which is what lets the
+    # drift stresslet estimator see the near-field resistance gradients).
     prepared_nf = solve_fn.nf_apply.prepare(state.nf, q)
 
     # Clean key tree: the three random inputs must be independent (FD theorem,
@@ -506,23 +529,33 @@ def build_sd_brownian_step(
         **shear_kwargs)
 
     # (4) RFD thermal drift (reuses state at q; absolute-tol displaced solves).
-    U_drift6 = rfd_drift(
-        solve_fn, state, q, k_rfd,
-        eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
-        step_kwargs=shear_kwargs,
-        gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
-
-    # Near-field drift stresslet: the reference FSD feeds the total velocity
-    # (solve + RFD drift) into the near-field stresslet term, so the reported
-    # stresslet is S = S^ff - R^nf_SU (U_rel + U_drift) + R^nf_SE : E^inf
-    # (../FSD Integrator.cu:899, "use d_Velocity directly because it contains
-    # U_drift").  The solve's S5 carries only the main-solve velocity, so add
-    # the drift piece here (linear in U, exactly zero at kT=0).  Like FSD, the
-    # far-field drift stresslet (the 5N tail of the RFD divergence) is not
-    # sampled.
+    # With return_stresslet, the SAME two displaced solves also return the
+    # drift stresslet S5_drift = (kT/eps)(S5+ - S5-): a single-sample estimator
+    # of the full mean Brownian stresslet <S^B> = -kT div(R_SU . R_FU^{-1})
+    # (Foss & Brady 2000, Eq. 10c).  The product rule splits Eq. 10c into the
+    # far-field response divergence, R^nf_SU . div(R_FU^{-1}), and
+    # (grad R^nf_SU) : R_FU^{-1}; the last two diverge like 1/gap near contact
+    # and cancel, and the +/- subtraction performs that cancellation exactly.
+    # This deliberately deviates from the reference FSD (../FSD
+    # Integrator.cu:899), which keeps only the coupling term -R^nf_SU U_drift
+    # (author-flagged "the stress might be slightly off. (To check)") and so
+    # leaves the un-cancelled 1/gap piece in near-contact pair stress.
+    # S5_drift already CONTAINS that coupling term: no -R^nf_SU U_drift
+    # add-back may ever be applied on top of it (double counting).
     if return_stresslet:
-      S5 = S5 - solve_fn.nf_apply.apply_blocks(
-          prepared_nf, _gv_from_u6(U_drift6))[..., 6:11]
+      U_drift6, S5_drift = rfd_drift(
+          solve_fn, state, q, k_rfd,
+          eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+          step_kwargs=shear_kwargs,
+          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter,
+          return_stresslet=True)
+      S5 = S5 + S5_drift
+    else:
+      U_drift6 = rfd_drift(
+          solve_fn, state, q, k_rfd,
+          eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+          step_kwargs=shear_kwargs,
+          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
 
     # Advance with the deterministic+Brownian relative velocity.  In a live
     # fractional sheared box, H(t) already carries the affine translational
@@ -541,6 +574,8 @@ def build_sd_brownian_step(
 
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
+    if return_stresslet:
+      out_info['S5_drift'] = S5_drift
     out_info['next_state'] = next_state
     # Warm start for the NEXT step's main solve (moments + relative velocity;
     # the drift is excluded -- it is not part of the saddle solution).
