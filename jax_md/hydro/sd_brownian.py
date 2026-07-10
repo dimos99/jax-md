@@ -339,7 +339,7 @@ def build_sd_brownian_step(
     r_lub: Optional[float] = None,
     r_p: Optional[float] = None,
     mr_iters: int = 50,
-    nf_iters: int = 20,
+    nf_iters: int = 40,
     lanczos_tol: float = 1e-3,
     gmres_tol: float = 1e-3,
     rfd_gmres_restart: Optional[int] = None,
@@ -373,13 +373,18 @@ def build_sd_brownian_step(
       every RFD GMRES burn its full ``gmres_restart*gmres_maxiter`` budget.
     r_lub, r_p: near-field and IC(0)-truncation cutoffs (defaults ``4a`` / ``2.1a``).
     mr_iters, nf_iters: Lanczos iteration caps for the far/near-field samplers.
+      ``nf_iters`` defaults to 40: the near-field square root is stiff at
+      dense packings and a 20-iteration cap was measured UNCONVERGED at
+      phi=0.45 near contact (2026-07-10, both precisions); the far-field
+      Lanczos converges in ~5 iterations there, so ``mr_iters`` is pure
+      headroom.
     lanczos_tol, gmres_tol: square-root and saddle-solve tolerances.
     rfd_gmres_restart, rfd_gmres_maxiter: GMRES budget for the two RFD displaced
-      solves (default = the main-solve budget; in float32 they default to
-      ``restart=50, maxiter=2`` -- FSD's restart length, sized so a
-      cheb-preconditioned solve actually reaches the clamped ``atol`` instead
-      of being truncated).  Benchmarked 2026-07: a hard 20-iteration cap left
-      the drift ~20x wrong on near-contact configs.
+      solves (default ``restart=50, maxiter=2`` in both precisions -- FSD's
+      restart length, two cycles).  Measured on near-contact phi=0.45 configs
+      (``examples/hydro/rfd_scheme_check.py``, 2026-07-10): this budget gives
+      ~0.5% drift error; one cycle gives 10-40%; the main-solve budget (50x4)
+      gives 1e-6 -- far tighter than useful at 2x the cost.
     **rpy_kwargs: forwarded to ``build_saddle_solve`` / ``build_rpy_mobility``.
 
   Returns:
@@ -429,17 +434,20 @@ def build_sd_brownian_step(
   if rfd_epsilon is None:
     rfd_epsilon = max(gmres_tol, 1e-4)
   rfd_epsilon = float(rfd_epsilon)
-  # In f32, bound the RFD GMRES budget to keep the per-step cost predictable,
-  # but size it so the displaced solves actually CONVERGE to the clamped atol:
-  # restart=50 is FSD's restart length (Solvers.cu), and benchmarking
-  # (2026-07, N=4000 phi=0.45 near contact) showed a hard 20-iteration cap
-  # truncates the solves and leaves the drift ~20x wrong -- the error was
-  # budget-limited, not at the f32 precision floor.
-  if _f32:
-    if rfd_gmres_restart is None:
-      rfd_gmres_restart = 50
-    if rfd_gmres_maxiter is None:
-      rfd_gmres_maxiter = 2
+  # Bound the RFD GMRES budget in BOTH precisions.  restart=50 is FSD's
+  # restart length (Solvers.cu); two cycles bring a cheb-preconditioned solve
+  # to true rel residual ~1e-4, i.e. drift error ~0.5% via
+  # err ~ residual / (|U_+ - U_-|/|U_+| ~ 0.02)   (rfd_scheme_check.py,
+  # 2026-07-10, N<=4000 phi=0.45 near contact, both precisions).  History: a
+  # hard 20-iteration cap left the drift ~20x wrong (2026-07-04 -- budget-
+  # limited, not the f32 precision floor), while the pre-2026-07-10 f64
+  # fallback to the main-solve budget (50x4) burned 2x the iterations for
+  # drift error 7e-7, three decades tighter than useful.  One 50-iteration
+  # cycle is NOT enough (drift error 0.1-0.4).
+  if rfd_gmres_restart is None:
+    rfd_gmres_restart = 50
+  if rfd_gmres_maxiter is None:
+    rfd_gmres_maxiter = 2
 
   init_fn, solve_fn = build_saddle_solve(
       space_fns, a, eta,
