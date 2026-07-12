@@ -2542,12 +2542,16 @@ class ShearedSDState:
   Mirrors `StokesianDynamicsState`; the Lees-Edwards remap of the fractional
   positions is applied each step before the Brownian stepper advances them, and
   `omega_inf` carries the ambient angular velocity `1/2 curl u^inf` (the affine
-  spin) for downstream orientation tracking.
+  spin) for downstream orientation tracking. `stresslet_main` is the main
+  saddle-solve stresslet before the RFD correction;
+  `stresslet_brownian_drift` is that correction, and their sum is `stresslet`.
   """
   real_position: Array
   positions: Array
   sd_state: Any
   stresslet: Array
+  stresslet_main: Array
+  stresslet_brownian_drift: Array
   saddle_x0: Any
   omega_inf: Array
   rng: Array
@@ -2771,6 +2775,8 @@ def sd_with_shear(
     return ShearedSDState(
         real_position=real_position, positions=q, sd_state=sd_state,
         stresslet=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        stresslet_main=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
+        stresslet_brownian_drift=jnp.zeros((q.shape[0], 5), dtype=q.dtype),
         saddle_x0=(jnp.zeros((q.shape[0], 11), dtype=q.dtype),
                    jnp.zeros((q.shape[0], 6), dtype=q.dtype)),
         omega_inf=jnp.zeros((3,), dtype=q.dtype),
@@ -2811,7 +2817,9 @@ def sd_with_shear(
                                       box)
     return ShearedSDState(
         real_position=real_position, positions=q_new, sd_state=next_sd,
-        stresslet=S5, saddle_x0=info['x0'], omega_inf=info['Omega_inf'][0],
+        stresslet=S5, stresslet_main=info['S5_main'],
+        stresslet_brownian_drift=info['S5_drift'],
+        saddle_x0=info['x0'], omega_inf=info['Omega_inf'][0],
         rng=key, step=next_step, time=time_next)
 
   return init_fn, apply_fn

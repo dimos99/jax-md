@@ -1,4 +1,4 @@
-"""Brownian motion for Fast Stokesian Dynamics (Phase 3).
+jax_md/hydro/sd_brownian.py"""Brownian motion for Fast Stokesian Dynamics (Phase 3).
 
 Adds thermal fluctuations to the deterministic Phase-2 saddle solve
 (:mod:`jax_md.hydro.sd_saddle`).  One overdamped Euler--Maruyama timestep
@@ -535,6 +535,7 @@ def build_sd_brownian_step(
         prepared_nf=prepared_nf,
         return_stresslet=return_stresslet, return_residual=return_residual,
         **shear_kwargs)
+    S5_main = S5
 
     # (4) RFD thermal drift (reuses state at q; absolute-tol displaced solves).
     # With return_stresslet, the SAME two displaced solves also return the
@@ -583,6 +584,7 @@ def build_sd_brownian_step(
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
     if return_stresslet:
+      out_info['S5_main'] = S5_main
       out_info['S5_drift'] = S5_drift
     out_info['next_state'] = next_state
     # Warm start for the NEXT step's main solve (moments + relative velocity;
