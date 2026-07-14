@@ -69,7 +69,7 @@ for _i, _j, _k in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
 def _kim_karrila_prefactors(a, eta):
   """Dimensional prefactors re-dimensionalizing the bare FSD resistance table.
 
-  The resistance table (``resistance_table.npz``, ported from FSD) is in
+  The regenerated table (``resistance_table.npz``) is in
   **Stokesian-Dynamics normalization** (``a = 1``, drag-scaled) and FSD applies
   it *bare* in every kernel -- no ``pi``, no ``(2a)^k``, no per-block numeric
   factor (Lubrication.cu RFU:280, RSU/G:583, RSE/M:1160).  The bare functions

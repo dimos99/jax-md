@@ -1,9 +1,9 @@
 """Near-field lubrication resistance table: loading and interpolation.
 
-Loads the committed ``data/resistance_table.npz`` (extracted from Fiore's FSD
-``Stokes_ResistanceTable.cc`` by ``data/extract_resistance_table.py``) and
-provides a pure-JAX, vmappable scalar lookup that reproduces the FSD
-interpolation (``Lubrication.cu:140-238``) exactly.
+Loads the committed ``data/resistance_table.npz``, regenerated from the
+Townsend and Wilson expressions by ``data/generate_resistance_table.py``,
+and provides a pure-JAX, vmappable scalar lookup using FSD's interpolation
+scheme (``Lubrication.cu:140-238``).
 
 The 22 monodisperse scalar functions are *already* the near-field part (exact
 Jeffrey-Onishi minus the two-body far-field multipole), tabulated against the
@@ -24,18 +24,30 @@ cannot catch an error here, so it is pinned to the source):
     ``dr`` metadata:
     ``ind = floor(log10(xi / xi_min) / dr)``  (C++ truncates the float cast;
     ``floor`` matches for the positive argument), then clipped to
-    ``[REGULARIZATION_INDEX, N_DIST - 2]`` so ``ind`` and ``ind + 1`` are valid.
+    ``[REGULARIZATION_INDEX, N_DIST - 2]`` so ``ind`` and ``ind + 1`` are
+    valid.
   * Lerp weight in *raw distance* using the stored tabulated distances:
     ``fac = (s - dist[ind]) / (dist[ind + 1] - dist[ind])``, clipped to [0, 1].
   * Result: ``vals[ind] + fac * (vals[ind + 1] - vals[ind])``.
 
-Unlike FSD's roughness-regularized production path, jax-md uses the full
-committed table: ``REGULARIZATION_INDEX = 0``.  For gaps at or below the
-tabulated ``xi_min``, the clip pins the lookup to the first row, and approaching
-``s = 4`` the weight ``fac -> 1`` lerps toward the all-zero final row.
+Unlike FSD's roughness-regularized production path, float64 uses the full
+committed table (``REGULARIZATION_INDEX = 0``). Float32 clamps at the first row
+whose gap is at least ``1e-5`` because smaller center-to-center increments are
+poorly resolved at ``s ~= 2``. Approaching ``s = 4``, the weight ``fac -> 1``
+lerps toward the all-zero final row.
 
 The lubrication cutoff itself (``r < r_lub = 4a``) is enforced by the caller's
 neighbor mask, never by this table.
+
+The 2000 rows span gaps ``1e-8..2``. Townsend's (2023) corrected
+Jeffrey-Onishi expressions cover gaps through ``0.01``, a slope-limited bridge
+joins Wilson's (2013) Lamb/reflection solution at ``0.02``, and the two-body FTS
+far-field resistance is subtracted throughout.
+
+The float64 clamp makes near-contact resistance up to ``1e4``x stiffer than the
+legacy table for overlapping / deeply contacting pairs (XA11 ~ 1/(4 xi)),
+which increases saddle GMRES iteration counts on contact-rich configurations.
+The float32 clamp avoids relying on table spacing below its useful precision.
 """
 
 import os
@@ -54,13 +66,27 @@ COLUMN_NAMES = (
 )
 COLUMN_INDEX = {name: i for i, name in enumerate(COLUMN_NAMES)}
 
-# Use the full tabulated near-contact range.  FSD's production roughness clamp
-# uses row 232 (surface gap h/a ~= 1e-3); row 0 reaches h/a = 1e-4.
-REGULARIZATION_INDEX = 0
 R_LUB_OVER_A = 4.0        # lubrication cutoff in units of the radius a
 
-_DATA_PATH = os.path.join(
+_TABLE_PATH = os.path.join(
     os.path.dirname(__file__), 'data', 'resistance_table.npz')
+_FLOAT32_REGULARIZATION_GAP = 1e-5
+
+
+def _regularization_index_for_dtype(dist, dtype) -> int:
+  """Return the first usable table row for the requested precision."""
+  if np.dtype(dtype) == np.dtype(np.float64):
+    return 0
+  gaps = np.asarray(dist, dtype=np.float64) - 2.0
+  return int(np.searchsorted(gaps, _FLOAT32_REGULARIZATION_GAP, side='left'))
+
+
+if np.dtype(REAL_DTYPE) == np.dtype(np.float64):
+  REGULARIZATION_INDEX = 0
+else:
+  with np.load(_TABLE_PATH, allow_pickle=False) as _npz:
+    REGULARIZATION_INDEX = _regularization_index_for_dtype(
+        _npz['dist'], REAL_DTYPE)
 
 
 class ResistanceTable(NamedTuple):
@@ -71,28 +97,29 @@ class ResistanceTable(NamedTuple):
   dr: jnp.ndarray     # scalar, log-space discretization step
 
 
-_CACHE = {}
+_CACHE = None
 
 
 def load_resistance_table() -> ResistanceTable:
-  """Load (and cache) the resistance table as JAX arrays in ``REAL_DTYPE``."""
-  if 'table' not in _CACHE:
-    if not os.path.exists(_DATA_PATH):
+  """Load and cache the regenerated resistance table as ``REAL_DTYPE`` arrays."""
+  global _CACHE
+  if _CACHE is None:
+    if not os.path.exists(_TABLE_PATH):
       raise FileNotFoundError(
-          'resistance_table.npz not found at %s; run '
-          'jax_md/hydro/data/extract_resistance_table.py first.' % _DATA_PATH)
-    npz = np.load(_DATA_PATH, allow_pickle=True)
-    dist = jnp.asarray(npz['dist'], dtype=REAL_DTYPE)
-    vals = jnp.asarray(npz['vals'], dtype=REAL_DTYPE)
-    xi_min = jnp.asarray(npz['xi_min'], dtype=REAL_DTYPE)
-    dr = jnp.asarray(npz['dr'], dtype=REAL_DTYPE)
-    # Sanity: column ordering in the file matches our expectation.
-    file_cols = tuple(str(c) for c in npz['column_names'])
+          '%s not found; run generate_resistance_table.py in '
+          'jax_md/hydro/data/.' % _TABLE_PATH)
+    with np.load(_TABLE_PATH, allow_pickle=True) as npz:
+      dist = jnp.asarray(npz['dist'], dtype=REAL_DTYPE)
+      vals = jnp.asarray(npz['vals'], dtype=REAL_DTYPE)
+      xi_min = jnp.asarray(npz['xi_min'], dtype=REAL_DTYPE)
+      dr = jnp.asarray(npz['dr'], dtype=REAL_DTYPE)
+      # Sanity: column ordering in the file matches our expectation.
+      file_cols = tuple(str(c) for c in npz['column_names'])
     if file_cols != COLUMN_NAMES:
       raise ValueError('Table column order mismatch: %s' % (file_cols,))
-    _CACHE['table'] = ResistanceTable(
+    _CACHE = ResistanceTable(
         dist=dist, vals=vals, xi_min=xi_min, dr=dr)
-  return _CACHE['table']
+  return _CACHE
 
 
 def interpolate_scalars(r: jnp.ndarray, a, table: ResistanceTable = None):
@@ -126,11 +153,16 @@ def interpolate_scalars(r: jnp.ndarray, a, table: ResistanceTable = None):
   # regularization row anyway.
   xi_safe = jnp.maximum(xi, xi_min)
   ind_f = jnp.floor(jnp.log10(xi_safe / xi_min) / dr)
-  ind = jnp.clip(ind_f.astype(jnp.int32), REGULARIZATION_INDEX, n_dist - 2)
+  ind = jnp.clip(
+      ind_f.astype(jnp.int32), REGULARIZATION_INDEX, n_dist - 2)
 
   d_lo = dist[ind]
   d_hi = dist[ind + 1]
-  fac = (s - d_lo) / (d_hi - d_lo)
+  delta = d_hi - d_lo
+  # Adjacent production-grid distances can coincide after float32 rounding.
+  safe_delta = jnp.where(delta > 0, delta, jnp.ones_like(delta))
+  fac = (s - d_lo) / safe_delta
+  fac = jnp.where(delta > 0, fac, jnp.zeros_like(fac))
   fac = jnp.clip(fac, 0.0, 1.0)
 
   v_lo = vals[ind]                       # (..., 22)

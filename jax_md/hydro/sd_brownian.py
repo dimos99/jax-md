@@ -1,4 +1,4 @@
-jax_md/hydro/sd_brownian.py"""Brownian motion for Fast Stokesian Dynamics (Phase 3).
+"""Brownian motion for Fast Stokesian Dynamics (Phase 3).
 
 Adds thermal fluctuations to the deterministic Phase-2 saddle solve
 (:mod:`jax_md.hydro.sd_saddle`).  One overdamped Euler--Maruyama timestep
