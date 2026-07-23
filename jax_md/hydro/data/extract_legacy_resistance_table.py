@@ -1,7 +1,7 @@
 """One-time extractor for the FSD near-field resistance table.
 
 Parses the hard-coded arrays in Fiore's Fast Stokesian Dynamics source
-(``Stokes_ResistanceTable.cc``) into a committed ``resistance_table.npz`` so that
+(``Stokes_ResistanceTable.cc``) into ``resistance_table_legacy.npz`` so that
 jax-md does not depend on the FSD C++/CUDA tree at runtime.
 
 The 22 monodisperse scalar functions are the *difference* between the exact
@@ -18,9 +18,9 @@ Column order (per row, matching FSD ``Stokes_ResistanceTable.cc``):
 
 Usage::
 
-    python jax_md/hydro/data/extract_resistance_table.py \
+    python jax_md/hydro/data/extract_legacy_resistance_table.py \
         [--source /path/to/FSD/source/Stokes_ResistanceTable.cc] \
-        [--out jax_md/hydro/data/resistance_table.npz]
+        [--out jax_md/hydro/data/resistance_table_legacy.npz]
 """
 
 import argparse
@@ -46,7 +46,8 @@ _DEFAULT_SOURCE = os.path.normpath(
     os.path.join(os.path.dirname(__file__),
                  '..', '..', '..', '..', 'FSD', 'source',
                  'Stokes_ResistanceTable.cc'))
-_DEFAULT_OUT = os.path.join(os.path.dirname(__file__), 'resistance_table.npz')
+_DEFAULT_OUT = os.path.join(
+    os.path.dirname(__file__), 'resistance_table_legacy.npz')
 
 # Matches e.g. ``h_ResTable_dist.data[12] = 2.000113;`` (any whitespace).
 _DIST_RE = re.compile(
