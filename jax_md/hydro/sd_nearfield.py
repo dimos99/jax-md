@@ -381,6 +381,7 @@ def build_nearfield_resistance(
     fractional_coordinates: bool = True,
     dr_threshold: Optional[float] = None,
     capacity_multiplier: float = 1.25,
+    extra_capacity: int = 0,
     disable_cell_list: bool = False,
 ):
   """Construct the matrix-free near-field lubrication resistance operator.
@@ -391,6 +392,11 @@ def build_nearfield_resistance(
     r_lub: lubrication cutoff (default ``4a``).
     fractional_coordinates: positions in ``[0,1)^d`` (default) or real.
     dr_threshold, capacity_multiplier, disable_cell_list: neighbor-list knobs.
+    extra_capacity: additional neighbor slots beyond the allocation estimate.
+      This is *per particle* for both Dense and Sparse neighbor lists.  For this
+      Dense list it directly increases the buffer width, which multiplies the
+      cost of every near-field matvec -- keep it small.  A value supplied to
+      ``init_fn`` overrides this construction-time default.
 
   Returns:
     ``(init_fn, apply_fn)``.
@@ -433,6 +439,8 @@ def build_nearfield_resistance(
 
   def _allocate(positions, box_matrix, **kwargs):
     neighbor_kwargs = dict(kwargs)
+    allocation_extra_capacity = int(
+        neighbor_kwargs.pop('extra_capacity', extra_capacity))
     neighbor_box = _neighbor_box_from_matrix(box_matrix, fractional_coordinates)
     dim = int(positions.shape[1])
     if box_fn is not None and fractional_coordinates and neighbor_box is not None:
@@ -446,15 +454,22 @@ def build_nearfield_resistance(
       neighbor_kwargs.setdefault('box', neighbor_box)
     else:
       neighbor_kwargs.pop('box', None)
-    return neighbor_fn.allocate(positions, **neighbor_kwargs)
+    return neighbor_fn.allocate(positions,
+                                extra_capacity=allocation_extra_capacity,
+                                **neighbor_kwargs)
 
   def init_fn(positions, **kwargs):
     positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    init_kwargs = dict(kwargs)
+    allocation_extra_capacity = init_kwargs.pop(
+        'extra_capacity', extra_capacity)
     dim = int(positions.shape[1])
     box_matrix = current_box_matrix(
         displacement_fn, box_fn, dim,
-        fractional_coordinates=fractional_coordinates, **kwargs)
-    neighbors = _allocate(positions, box_matrix, **kwargs)
+        fractional_coordinates=fractional_coordinates, **init_kwargs)
+    neighbors = _allocate(
+        positions, box_matrix, extra_capacity=allocation_extra_capacity,
+        **init_kwargs)
     return NearFieldState(
         neighbors=neighbors,
         box_matrix=box_matrix,
