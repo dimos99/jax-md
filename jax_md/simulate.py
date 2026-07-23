@@ -627,7 +627,7 @@ def nvt_nose_hoover(energy_or_force_fn: Callable[..., Array],
     return state.set(chain=thermostat.initialize(dof, KE, _kT))
 
   @jit
-  def _apply_fn_impl(state, **kwargs):
+  def apply_fn(state, **kwargs):
     _kT = kT if 'kT' not in kwargs else kwargs['kT']
 
     chain = state.chain
@@ -1305,7 +1305,7 @@ def brownian(energy_or_force: Callable[..., Array],
     return state
 
   @jit
-  def _apply_fn_impl(state, **kwargs):
+  def apply_fn(state, **kwargs):
     # Allow temperature to be overridden at step time.
     _kT = kwargs.get('kT', kT)
 
@@ -1480,7 +1480,7 @@ def brownian_with_shear(energy_or_force: Callable[..., Array],
     return state
   
   @jit
-  def _apply_fn_impl(state, **kwargs):
+  def apply_fn(state, **kwargs):
     # Allow temperature to be overridden at step time.
     _kT = kwargs.get('kT', kT)
 
@@ -2637,8 +2637,8 @@ def sd(space_fns: Tuple[Callable, ...],
   if len(space_fns) < 2:
     raise ValueError("space_fns must contain displacement and shift functions.")
   force_fn = quantity.canonicalize_force(energy_or_force)
-  _dt = f32(dt)
-  t0 = f32(t0)
+  _dt = jnp.asarray(dt, dtype=hydro_sd.REAL_DTYPE)
+  t0 = jnp.asarray(t0, dtype=hydro_sd.REAL_DTYPE)
 
   xi, rcut, P, Mgrid, theta, lattice_extent = _resolve_constrained_ewald_params(
       space_fns=space_fns, a=a, t0=float(t0), xi=xi, rcut=rcut, P=P,
@@ -2651,7 +2651,7 @@ def sd(space_fns: Tuple[Callable, ...],
       fractional_coordinates=fractional_coordinates, **sd_kwargs)
 
   def init_fn(key, R, **kwargs):
-    q = jnp.asarray(R)
+    q = jnp.asarray(R, dtype=hydro_sd.REAL_DTYPE)
     sd_state = sd_init(q, **kwargs)
     real_position = _sd_real_position(q, sd_state, fractional_coordinates)
     return StokesianDynamicsState(
@@ -2740,8 +2740,8 @@ def sd_with_shear(
         "space.shearing.")
   _, _, box_of = space_fns[:3]
   force_fn = quantity.canonicalize_force(energy_or_force)
-  _dt = f32(dt)
-  t0 = f32(t0)
+  _dt = jnp.asarray(dt, dtype=hydro_sd.REAL_DTYPE)
+  t0 = jnp.asarray(t0, dtype=hydro_sd.REAL_DTYPE)
 
   box = box_of(t=t0)
   dim = box.shape[0]
@@ -2767,7 +2767,7 @@ def sd_with_shear(
         sf_xy, sf_xz, sf_yz, t0, dim, remap)
     shear_kwargs.update(_shear_kwargs_from_dim(dim, curr_xy, curr_xz, curr_yz))
 
-    q = jnp.asarray(R)
+    q = jnp.asarray(R, dtype=hydro_sd.REAL_DTYPE)
     sd_state = sd_init(q, **shear_kwargs)
     box0 = _current_box_from_reduced_shear(box_of, dim, curr_xy, curr_xz,
                                            curr_yz)
