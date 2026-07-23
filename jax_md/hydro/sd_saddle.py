@@ -575,6 +575,8 @@ def build_saddle_solve(
     cheb_power_iters: int = 12,
     cheb_safety: float = 1.2,
     fractional_coordinates: bool = True,
+    nf_capacity_multiplier: Optional[float] = None,
+    nf_extra_capacity: int = 0,
     **rpy_kwargs,
 ):
   """Build the deterministic FSD saddle-point solve.
@@ -612,8 +614,21 @@ def build_saddle_solve(
       eigenvalue of the Jacobi-scaled Schur for ``'cheb'`` (default 12).
     cheb_safety: multiplicative safety factor (>=1) on the estimated largest
       eigenvalue so Chebyshev stays stable (default 1.2).
+    nf_capacity_multiplier: capacity headroom for the near-field ``r_lub``
+      neighbor list.  ``None`` (default) inherits ``capacity_multiplier`` from
+      ``rpy_kwargs`` (else 1.25).  The near-field list is **Dense**, so its
+      capacity is a per-particle buffer width that multiplies the cost of every
+      near-field matvec (one per GMRES/Chebyshev iteration): on aggregating
+      systems where the far-field Sparse list wants a large multiplier, cap
+      this one at the expected max coordination growth (~3-4x) instead of
+      inheriting.
+    nf_extra_capacity: additional per-particle slots for the near-field Dense
+      list (default 0).  NOT inherited from the Sparse ``extra_capacity`` in
+      ``rpy_kwargs``.  Sparse ``extra_capacity`` is also specified per particle
+      and is multiplied by ``N`` internally to obtain total pair capacity;
+      passing a total-pair count would therefore cause an N-fold over-allocation.
     **rpy_kwargs: forwarded to ``build_rpy_mobility`` (e.g. ``P``, ``Mgrid``,
-      ``rcut``).
+      ``rcut``, ``capacity_multiplier``, ``extra_capacity``).
 
   Returns:
     ``(init_fn, solve_fn)``.
@@ -680,10 +695,14 @@ def build_saddle_solve(
         fractional_coordinates=fractional_coordinates, **shear_kwargs)
 
   # -- Near-field resistance (Phase 1) -------------------------------------
+  if nf_capacity_multiplier is None:
+    nf_capacity_multiplier = rpy_kwargs.get('capacity_multiplier', 1.25)
   nf_init, nf_apply = build_nearfield_resistance(
       space_fns, a, eta,
       r_lub=r_lub,
       fractional_coordinates=fractional_coordinates,
+      capacity_multiplier=float(nf_capacity_multiplier),
+      extra_capacity=int(nf_extra_capacity),
   )
 
   # -- init_fn -------------------------------------------------------------
