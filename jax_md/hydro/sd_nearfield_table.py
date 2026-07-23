@@ -36,6 +36,17 @@ whose gap is at least ``1e-5`` because smaller center-to-center increments are
 poorly resolved at ``s ~= 2``. Approaching ``s = 4``, the weight ``fac -> 1``
 lerps toward the all-zero final row.
 
+The environment variable ``JAX_MD_SD_MIN_GAP`` (a surface gap in units of
+``a``, e.g. ``1e-4``) raises the clamp row above the precision default: pairs
+closer than that gap take the resistance at the clamp row, exactly like FSD's
+roughness regularization. It caps the near-contact stiffness (``XA11 ~
+1/(4 xi)``), which bounds the saddle conditioning -- and therefore GMRES
+iteration counts -- on contact-rich configurations. It never lowers the clamp
+below the float32 floor and must select a row that has a following row for
+interpolation; non-finite values and gaps beyond that range are rejected. Like
+the dtype, it is read once at import: set it before ``jax_md.hydro`` is first
+imported.
+
 The lubrication cutoff itself (``r < r_lub = 4a``) is enforced by the caller's
 neighbor mask, never by this table.
 
@@ -71,22 +82,46 @@ R_LUB_OVER_A = 4.0        # lubrication cutoff in units of the radius a
 _TABLE_PATH = os.path.join(
     os.path.dirname(__file__), 'data', 'resistance_table.npz')
 _FLOAT32_REGULARIZATION_GAP = 1e-5
+_MIN_GAP_ENV = 'JAX_MD_SD_MIN_GAP'
 
 
-def _regularization_index_for_dtype(dist, dtype) -> int:
-  """Return the first usable table row for the requested precision."""
+def _regularization_gap_for_dtype(dtype) -> float:
+  """Smallest surface gap the table resolves at the requested precision."""
   if np.dtype(dtype) == np.dtype(np.float64):
+    return 0.0
+  return _FLOAT32_REGULARIZATION_GAP
+
+
+def _resolve_regularization_index(dtype) -> int:
+  """Clamp row from the precision floor and the optional env-var cap."""
+  gap = _regularization_gap_for_dtype(dtype)
+  env = os.environ.get(_MIN_GAP_ENV)
+  if env is not None:
+    try:
+      requested = float(env)
+    except ValueError as exc:
+      raise ValueError(
+          '%s=%r is not a valid surface gap.' % (_MIN_GAP_ENV, env)) from exc
+    if not np.isfinite(requested):
+      raise ValueError(
+          '%s=%r must be a finite surface gap.' % (_MIN_GAP_ENV, env))
+    if requested < 0.0:
+      raise ValueError(
+          '%s=%r must be a non-negative surface gap.' % (_MIN_GAP_ENV, env))
+    gap = max(gap, requested)
+  if gap == 0.0:
     return 0
-  gaps = np.asarray(dist, dtype=np.float64) - 2.0
-  return int(np.searchsorted(gaps, _FLOAT32_REGULARIZATION_GAP, side='left'))
+  with np.load(_TABLE_PATH, allow_pickle=False) as npz:
+    gaps = np.asarray(npz['dist'], dtype=np.float64) - 2.0
+  index = int(np.searchsorted(gaps, gap, side='left'))
+  if index > len(gaps) - 2:
+    raise ValueError(
+        '%s=%r exceeds the largest supported regularization gap %r.'
+        % (_MIN_GAP_ENV, env, gaps[-2]))
+  return index
 
 
-if np.dtype(REAL_DTYPE) == np.dtype(np.float64):
-  REGULARIZATION_INDEX = 0
-else:
-  with np.load(_TABLE_PATH, allow_pickle=False) as _npz:
-    REGULARIZATION_INDEX = _regularization_index_for_dtype(
-        _npz['dist'], REAL_DTYPE)
+REGULARIZATION_INDEX = _resolve_regularization_index(REAL_DTYPE)
 
 
 class ResistanceTable(NamedTuple):
