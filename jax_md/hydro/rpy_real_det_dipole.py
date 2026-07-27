@@ -84,7 +84,7 @@ class PreparedGrandReal(NamedTuple):
   then reduces each matvec to gather -> batched block multiply ->
   ``segment_sum``.  Mirrors ``sd_nearfield.PreparedNearField`` (and, in
   spirit, the pre-tabulated ``d_ewaldC1`` real-space Ewald table of the
-  reference FSD ``Mobility.cu``).
+  the original FSD code).
 
   The blocks are built by PROBING the existing ``pair_contrib`` closure with
   the 11 flat unit basis moments (it is linear in the sender moments per

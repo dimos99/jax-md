@@ -164,7 +164,8 @@ def _h_tensor(YH, rhat, epsr):
 def _m_tensor(XM, YM, ZM, rhat, Pt, eye):
   """Rank-4 M coupling: ``(E,3,3,3,3)`` stresslet ``S_ij`` from strain ``E_kl``.
 
-  See Lubrication.cu:1151-1198 (and the comment block reproduced there).
+  See the near-field lubrication kernels of the original FSD code (and the
+  comment block reproduced there).
   """
   d = eye
   # XM term: 3/2 (r_i r_j - d_ij/3)(r_k r_l - d_kl/3)

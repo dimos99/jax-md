@@ -38,7 +38,7 @@ COLUMN_NAMES = (
     'YM11', 'YM12', 'ZM11', 'ZM12',
 )
 
-# FSD tabulation metadata (Stokes_ResistanceTable.cc:37-40).
+# Tabulation metadata of the original FSD resistance table.
 XI_MIN = 1.0e-4          # smallest tabulated surface gap (s - 2)
 DR = 0.004305            # log-space discretization: ind*dr = log10(xi/xi_min)
 

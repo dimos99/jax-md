@@ -392,6 +392,27 @@ def _saddle_rhs(fp6, e5, rnf_FE, slip_top=None, extra=None):
   return b1, b2
 
 
+def _warn_nonconvergence(converged, rel_residual, tol, atol):
+  """Print a GMRES non-convergence warning, as the original FSD code does.
+
+  Emitted from inside the jitted solve via ``jax.debug.print`` under a
+  ``lax.cond``, so the host callback runs *only* on the solves that actually
+  fail; a converged solve pays one scalar predicate.  ``tol``/``atol`` are
+  static Python floats (the requested target); ``converged``/``rel_residual``
+  are traced scalars measured on the true residual.
+  """
+  def _emit(r):
+    jax.debug.print(
+        '  SD saddle GMRES failed to converge: true relative residual = {r} '
+        '(requested tol={t}, atol={a}).  jax GMRES stops on the '
+        'PRECONDITIONED residual, so this can trip well inside the iteration '
+        'budget; on contact-rich configurations the usual cause is saddle '
+        'conditioning rather than the budget (see JAX_MD_SD_MIN_GAP).',
+        r=r, t=tol, a=atol)
+    return None
+  jax.lax.cond(converged, lambda _r: None, _emit, rel_residual)
+
+
 def _ambient_addback(L_inf_mat, positions_frac, box):
   """Background-flow add-back ``(U_inf (N,3), Omega_inf (N,3))``.
 
@@ -567,7 +588,7 @@ def build_saddle_solve(
     tol: float = 1e-3,
     gmres_tol: float = 1e-3,
     gmres_restart: int = 50,
-    gmres_maxiter: int = 4,
+    gmres_maxiter: int = 20,
     r_lub: Optional[float] = None,
     r_p: Optional[float] = None,
     preconditioner: str = 'cheb',
@@ -588,8 +609,21 @@ def build_saddle_solve(
       ``estimate_rpy_params`` (requires ``n_particles`` and ``phi``).
     n_particles, phi: needed only for ``xi`` estimation / cost-optimal split.
     tol: target accuracy used by the parameter estimator when ``xi`` is None.
-    gmres_tol: relative GMRES tolerance on the saddle residual.
+    gmres_tol: relative GMRES tolerance on the saddle residual.  NOTE that
+      ``jax``'s GMRES tests the *preconditioned* residual ``||M(b - Ax)||``
+      against ``max(tol ||b||, atol)`` with an unpreconditioned ``||b||``, so
+      the tolerance actually delivered on the true residual is looser than
+      ``tol`` by roughly the scale of ``M``.  The original FSD code monitors
+      the true residual instead; ``info['rel_residual']`` and
+      ``info['converged']`` report that (FSD-comparable) criterion, and a
+      warning is printed whenever it is not met.
     gmres_restart, gmres_maxiter: Krylov basis size and number of restarts.
+      The default ``50 x 20 = 1000`` matches the original FSD code's restart
+      length and iteration limit.  Both of jax's GMRES loops are
+      ``lax.while_loop``s with early exit and the Krylov memory depends only
+      on ``restart``, so a larger ``maxiter`` costs nothing on solves that
+      converge -- it only buys headroom on the ones that would otherwise be
+      truncated silently.
     r_lub: near-field cutoff (default ``4a``).
     r_p: near-field truncation for the IC(0) Schur factor (default ``2.1a``).
     preconditioner: default GMRES preconditioner.  ``'cheb'`` (the default) is
@@ -827,7 +861,7 @@ def build_saddle_solve(
 
     # Total stresslet (Eq. 2.9): S = S^ff - R^nf_SU (U-U^inf) + R^nf_SE : E^inf.
     # Skipped when ``ret_s`` is False (the SU/SE near-field applies are not
-    # free) -- ../FSD likewise computes the stresslet only on output.
+    # free) -- the original FSD code likewise computes it only on output.
     if ret_s:
       sff5 = stresslet_from_moment(q11)
       S5 = sff5 - rnf_SU(u6) + rnf_SE(e5)
@@ -847,7 +881,17 @@ def build_saddle_solve(
       resid = (Ax[0] - b1, Ax[1] - b2)
       res = jnp.sqrt(_pytree_dot(resid, resid))
       bnorm = jnp.sqrt(_pytree_dot((b1, b2), (b1, b2)))
-      info['rel_residual'] = res / jnp.maximum(bnorm, 1e-300)
+      rel = res / jnp.maximum(bnorm, 1e-300)
+      info['rel_residual'] = rel
+      # Convergence verdict on the TRUE residual -- the criterion the original
+      # FSD code monitors, NOT jax's internal preconditioned-residual test,
+      # which stops on ||M(b - Ax)|| and so can declare success while the true
+      # residual is O(1) on ill-conditioned (contact-degenerate) systems.  This
+      # is the only convergence signal the caller gets: jax's ``gmres_info`` is
+      # 0 unless the solution went NaN.
+      converged = res <= jnp.maximum(tol_ * bnorm, atol_)
+      info['converged'] = converged
+      _warn_nonconvergence(converged, rel, tol_, atol_)
     return U_rel, Omega_rel, S5, q11, info
 
   # Cache jitted device-path bodies keyed by their static configuration so the
@@ -939,12 +983,21 @@ def build_saddle_solve(
         solves set a fixed ``atol`` (with ``tol=0``) so both converge to the
         same *absolute* residual regardless of warm-start -- the drift divides
         ``U_+ - U_-`` by a tiny ``eps`` and amplifies any residual asymmetry.
+      return_residual: compute the true relative residual (one extra saddle
+        matvec).  Also gates ``info['converged']`` and the non-convergence
+        warning; the RFD displaced solves run to a fixed truncated budget by
+        design and pass ``False``.
 
     Returns:
       ``(U_rel, Omega_rel, S5, F_moments, info)`` -- relative velocities
       ``(N,3)``, angular velocities ``(N,3)``, total stresslet ``(N,5)``
       orthonormal, far-field moments ``(N,11)``, and an info dict.  Work in the
       relative frame; ``info['U_inf']`` carries the background-flow add-back.
+      With ``return_residual=True`` the info dict also carries
+      ``rel_residual`` (true ``||b - Ax|| / ||b||``) and ``converged`` (that
+      residual against ``max(tol ||b||, atol)``, the criterion the original
+      FSD code monitors).  Do NOT read ``info['gmres_info']`` as a convergence
+      flag -- jax sets it to 0 unless the solution is NaN.
     """
     # All optional array inputs -> concrete REAL_DTYPE arrays (zeros = absent).
     (positions_frac, fp6, e5, E_inf_mat, L_inf_mat,

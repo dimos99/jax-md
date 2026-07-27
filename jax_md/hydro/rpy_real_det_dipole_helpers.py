@@ -79,7 +79,7 @@ def _skeleton(r, a, xi, f0_lt, f1, f2, f3, f4, f5, f6):
 
 
 # ----------------------------------------------------------------------------
-# Coefficients, auto-generated from FSD Stokes.cc -- DO NOT EDIT BY HAND.
+# Coefficients, auto-generated from the original FSD code -- DO NOT EDIT BY HAND.
 # Regenerate with the sympy decomposition described in the module docstring.
 # ----------------------------------------------------------------------------
 

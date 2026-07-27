@@ -3,7 +3,7 @@
 Loads the committed ``data/resistance_table.npz``, regenerated from the
 Townsend and Wilson expressions by ``data/generate_resistance_table.py``,
 and provides a pure-JAX, vmappable scalar lookup using FSD's interpolation
-scheme (``Lubrication.cu:140-238``).
+scheme of the original FSD code.
 
 The 22 monodisperse scalar functions are *already* the near-field part (exact
 Jeffrey-Onishi minus the two-body far-field multipole), tabulated against the

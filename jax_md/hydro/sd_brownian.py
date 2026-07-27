@@ -76,7 +76,7 @@ from jax_md.hydro.rpy_moments import grand_to_flat
 
 
 # Isolated-sphere rotational self-resistance scale (in a-units) for the
-# neighborless conditioning shift; matches FSD Helper_Precondition.cu.
+# neighborless conditioning shift; matches the original FSD code.
 _SHIFT_PATTERN = np.array([1.0, 1.0, 1.0, 4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0])
 
 
@@ -362,29 +362,30 @@ def build_sd_brownian_step(
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
     rfd_epsilon: RFD finite-difference step.  Default ``None`` resolves to
       ``max(gmres_tol, 1e-4)`` (= 1e-3 at default settings), matching the
-      reference FSD convention ``rfd_epsilon = solver tolerance``
-      (``Stokes.cc:125``): the drift divides ``U_+ - U_-`` by ``eps``, so a
+      original FSD convention ``rfd_epsilon = solver tolerance``
+      ; the drift divides ``U_+ - U_-`` by ``eps``, so a
       larger ``eps`` relaxes the residual accuracy the displaced solves must
       reach by the same factor, while the centered-difference bias is only
       ``O(eps^2)``.  (Confirm drift is ``eps``-independent when overriding.)
     rfd_atol: absolute GMRES tolerance for the two RFD displaced solves.  In
       float32 this is clamped up to a reachable floor (~1e-5): with the f32
       residual floor at ~1e-6, an unreachable ``atol`` (e.g. 1e-8) would make
-      every RFD GMRES burn its full ``gmres_restart*gmres_maxiter`` budget.
+      every RFD GMRES burn its full
+      ``rfd_gmres_restart * rfd_gmres_maxiter`` budget.
     r_lub, r_p: near-field and IC(0)-truncation cutoffs (defaults ``4a`` / ``2.1a``).
     mr_iters, nf_iters: Lanczos iteration caps for the far/near-field samplers.
       ``nf_iters`` defaults to 40: the near-field square root is stiff at
-      dense packings and a 20-iteration cap was measured UNCONVERGED at
-      phi=0.45 near contact (2026-07-10, both precisions); the far-field
-      Lanczos converges in ~5 iterations there, so ``mr_iters`` is pure
-      headroom.
+      dense packings, where a 20-iteration cap is unconverged at phi=0.45 near
+      contact in both precisions; the far-field Lanczos converges in ~5
+      iterations there, so ``mr_iters`` is pure headroom.
     lanczos_tol, gmres_tol: square-root and saddle-solve tolerances.
     rfd_gmres_restart, rfd_gmres_maxiter: GMRES budget for the two RFD displaced
-      solves (default ``restart=50, maxiter=2`` in both precisions -- FSD's
-      restart length, two cycles).  Measured on near-contact phi=0.45 configs
-      (``examples/hydro/rfd_scheme_check.py``, 2026-07-10): this budget gives
-      ~0.5% drift error; one cycle gives 10-40%; the main-solve budget (50x4)
-      gives 1e-6 -- far tighter than useful at 2x the cost.
+      solves (default ``restart=50, maxiter=2`` in both precisions -- the
+      original FSD restart length, two cycles).  On near-contact phi=0.45
+      configurations this gives ~0.5% drift error; one cycle gives 10-40%,
+      while the main solve's budget reaches 1e-6 at twice the cost -- far
+      tighter than this single-sample estimator can use.  Deliberately
+      truncated, so these solves report no residual and never warn.
     **rpy_kwargs: forwarded to ``build_saddle_solve`` / ``build_rpy_mobility``.
 
   Returns:
@@ -429,21 +430,21 @@ def build_sd_brownian_step(
   rfd_atol = max(float(rfd_atol), _tol_floor)
   lanczos_tol = max(float(lanczos_tol), _tol_floor)
   gmres_tol = max(float(gmres_tol), _tol_floor)
-  # FSD convention: rfd_epsilon = solver tolerance (Stokes.cc:125).  The 1/eps
-  # amplification of solve residuals then matches what the tolerance delivers.
+  # As in the original FSD code, rfd_epsilon is tied to the solver tolerance:
+  # the 1/eps amplification of solve residuals then matches what the tolerance
+  # delivers.
   if rfd_epsilon is None:
     rfd_epsilon = max(gmres_tol, 1e-4)
   rfd_epsilon = float(rfd_epsilon)
-  # Bound the RFD GMRES budget in BOTH precisions.  restart=50 is FSD's
-  # restart length (Solvers.cu); two cycles bring a cheb-preconditioned solve
-  # to true rel residual ~1e-4, i.e. drift error ~0.5% via
-  # err ~ residual / (|U_+ - U_-|/|U_+| ~ 0.02)   (rfd_scheme_check.py,
-  # 2026-07-10, N<=4000 phi=0.45 near contact, both precisions).  History: a
-  # hard 20-iteration cap left the drift ~20x wrong (2026-07-04 -- budget-
-  # limited, not the f32 precision floor), while the pre-2026-07-10 f64
-  # fallback to the main-solve budget (50x4) burned 2x the iterations for
-  # drift error 7e-7, three decades tighter than useful.  One 50-iteration
-  # cycle is NOT enough (drift error 0.1-0.4).
+  # Bound the RFD GMRES budget in BOTH precisions, independently of the main
+  # solve's (larger) budget.  restart=50 is the original FSD restart length;
+  # two cycles bring a cheb-preconditioned solve to true rel residual ~1e-4,
+  # i.e. drift error ~0.5% via err ~ residual / (|U_+ - U_-|/|U_+| ~ 0.02) at
+  # N <= 4000, phi = 0.45 near contact, in both precisions.  One cycle is NOT
+  # enough (drift error 0.1-0.4); the main solve's budget reaches ~1e-6, three
+  # decades tighter than this single-sample estimator can use, at twice the
+  # iterations.  These solves are truncated by design and therefore pass
+  # ``return_residual=False`` (no convergence warning).
   if rfd_gmres_restart is None:
     rfd_gmres_restart = 50
   if rfd_gmres_maxiter is None:
@@ -524,7 +525,7 @@ def build_sd_brownian_step(
     F_B_nf = nf_sampler(k_nf)
 
     # (3) one combined deterministic + Brownian saddle solve.  ``x0`` is the
-    # previous step's solution (the FSD warm start, ../FSD Integrator.cu:777):
+    # previous step's solution (the warm start the original FSD code uses):
     # positions move O(U dt) per step, so the smooth (deterministic) part of
     # the solution is an excellent initial guess; the fresh Brownian part of
     # the RHS is independent each step, so at worst the initial residual is
@@ -545,12 +546,11 @@ def build_sd_brownian_step(
     # far-field response divergence, R^nf_SU . div(R_FU^{-1}), and
     # (grad R^nf_SU) : R_FU^{-1}; the last two diverge like 1/gap near contact
     # and cancel, and the +/- subtraction performs that cancellation exactly.
-    # This deliberately deviates from the reference FSD (../FSD
-    # Integrator.cu:899), which keeps only the coupling term -R^nf_SU U_drift
-    # (author-flagged "the stress might be slightly off. (To check)") and so
-    # leaves the un-cancelled 1/gap piece in near-contact pair stress.
-    # S5_drift already CONTAINS that coupling term: no -R^nf_SU U_drift
-    # add-back may ever be applied on top of it (double counting).
+    # This deliberately deviates from the original FSD code, which keeps only
+    # the coupling term -R^nf_SU U_drift and so leaves the un-cancelled 1/gap
+    # piece in near-contact pair stress.  S5_drift already CONTAINS that
+    # coupling term: no -R^nf_SU U_drift add-back may ever be applied on top
+    # of it (double counting).
     if return_stresslet:
       U_drift6, S5_drift = rfd_drift(
           solve_fn, state, q, k_rfd,
