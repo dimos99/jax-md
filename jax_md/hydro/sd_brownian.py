@@ -250,6 +250,7 @@ def nearfield_brownian_force(solve_fn, state, positions, kT, dt, key, *,
 def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
               atol=1e-8, atol2=None, step_kwargs=None,
               gmres_restart=None, gmres_maxiter=None,
+              gmres_solve_method='batched',
               return_stresslet=False):
   """Random-finite-difference estimate of ``kT div R_FU^{-1}`` as a velocity.
 
@@ -278,6 +279,30 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   default ``atol``.  Used only by the validation negative control -- loosening it
   deliberately reintroduces the warm-start asymmetry that check 4 must catch.
 
+  ``gmres_solve_method`` **must stay ``'batched'`` here**, and the reason is the
+  same matched-tolerance discipline.  jax's ``'incremental'`` GMRES exits a
+  restart as soon as its *preconditioned residual estimate* meets ``ptol``,
+  which the cold and the warm solve reach at different true residuals; that
+  asymmetry is then amplified by ``1/eps``.  ``'batched'`` cannot exit early, so
+  both displaced solves run the identical iteration count and land symmetrically
+  far below ``atol``.  Measured on a disordered N=108 phi=0.50 config (min gap
+  0.073a), sweeping ``eps`` at the production budget (restart=50, maxiter=2):
+
+    f64, atol=1e-8   -- ``'batched'`` returns 0.24768 flat for eps 1e-5..1e-8;
+      ``'incremental'`` drifts 0.24768 -> 0.24774 -> 0.24827 -> 0.25350, i.e.
+      the two disagree by 3.9e-5 at eps=1e-5 growing to 3.6e-2 at eps=1e-8.
+      At the default eps it is already 180x less accurate against a tight
+      reference (3.50e-6 vs 1.93e-8 relative) for 35% fewer matvecs.
+    f32, atol=1e-4   -- at eps<=1e-7 the displacement is below f32 resolution
+      and ``'batched'`` correctly returns exactly 0; ``'incremental'`` returns
+      8.4 and 74 against a true scale of 0.19.
+
+  Matching on delivered accuracy instead (``'incremental'`` at atol=1e-10 vs
+  ``'batched'`` at atol=1e-8, both ~2e-8 relative error) leaves only a 17%
+  matvec saving in f64 -- and none of it survives f32 or small eps.  The knob
+  exists so this can be re-measured on other hardware, not because
+  ``'incremental'`` is the safer choice for a warm-started solve.
+
   Returns ``U_drift (N, 6)``, or ``(U_drift, S5_drift (N, 5))`` when
   ``return_stresslet=True``.
   """
@@ -298,11 +323,13 @@ def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
   Up, Op, s5p, q11p, _ip = solve_fn(
       state, q_plus, extra_force=dq6, tol=0.0, atol=atol,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
+      gmres_solve_method=gmres_solve_method,
       return_stresslet=return_stresslet, return_residual=False, **step_kwargs)
   x0 = (q11p, jnp.concatenate([Up, Op], axis=-1))          # warm start
   Um, Om, s5m, _q11m, _im = solve_fn(
       state, q_minus, extra_force=dq6, x0=x0, tol=0.0, atol=atol2,
       gmres_restart=gmres_restart, gmres_maxiter=gmres_maxiter,
+      gmres_solve_method=gmres_solve_method,
       return_stresslet=return_stresslet, return_residual=False, **step_kwargs)
 
   U_plus = jnp.concatenate([Up, Op], axis=-1)
@@ -344,6 +371,7 @@ def build_sd_brownian_step(
     gmres_tol: float = 1e-3,
     rfd_gmres_restart: Optional[int] = None,
     rfd_gmres_maxiter: Optional[int] = None,
+    rfd_gmres_solve_method: str = 'batched',
     return_stresslet: bool = True,
     return_residual: bool = True,
     **rpy_kwargs,
@@ -386,6 +414,12 @@ def build_sd_brownian_step(
       while the main solve's budget reaches 1e-6 at twice the cost -- far
       tighter than this single-sample estimator can use.  Deliberately
       truncated, so these solves report no residual and never warn.
+    rfd_gmres_solve_method: jax GMRES implementation for the two displaced
+      solves.  Leave at ``'batched'``: ``'incremental'`` exits a restart on a
+      residual *estimate*, which the cold and warm solve hit at different true
+      residuals, and ``1/eps`` amplifies the asymmetry -- it is measurably less
+      accurate in f64 and returns garbage in f32 at small ``eps``.  See
+      :func:`rfd_drift` for the numbers.
     **rpy_kwargs: forwarded to ``build_saddle_solve`` / ``build_rpy_mobility``.
 
   Returns:
@@ -449,6 +483,10 @@ def build_sd_brownian_step(
     rfd_gmres_restart = 50
   if rfd_gmres_maxiter is None:
     rfd_gmres_maxiter = 2
+  if rfd_gmres_solve_method not in ('batched', 'incremental'):
+    raise ValueError(
+        "rfd_gmres_solve_method must be 'batched' or 'incremental', got %r"
+        % (rfd_gmres_solve_method,))
 
   init_fn, solve_fn = build_saddle_solve(
       space_fns, a, eta,
@@ -557,6 +595,7 @@ def build_sd_brownian_step(
           eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
           step_kwargs=shear_kwargs,
           gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter,
+          gmres_solve_method=rfd_gmres_solve_method,
           return_stresslet=True)
       S5 = S5 + S5_drift
     else:
@@ -564,7 +603,8 @@ def build_sd_brownian_step(
           solve_fn, state, q, k_rfd,
           eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
           step_kwargs=shear_kwargs,
-          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter)
+          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter,
+          gmres_solve_method=rfd_gmres_solve_method)
 
     # Advance with the deterministic+Brownian relative velocity.  In a live
     # fractional sheared box, H(t) already carries the affine translational

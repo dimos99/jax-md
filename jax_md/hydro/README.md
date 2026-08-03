@@ -14,19 +14,73 @@ where:
 - **M^(r)**: Real-space contribution (short-range, computed with closed-form kernels)
 - **M^(w)**: Wave-space contribution (long-range, computed using Spectral Ewald with FFTs)
 
+## Three levels of hydrodynamics
+
+The package offers three levels of accuracy. Pick the cheapest one that captures
+the physics you need — each level costs more than the one above it.
+
+| Level | What it resolves | Entry point |
+|---|---|---|
+| **RPY mobility** | Far-field hydrodynamic coupling only. Fastest. | `rpy.build_rpy_mobility()`, `simulate.rpy` |
+| **Stresslet-constrained RPY** | Adds rigidity (E = 0): particles resist local strain. | `build_rpy_mobility(..., use_stresslet=True, constrained=True)`, `simulate.constrained_rpy` |
+| **Full Stokesian Dynamics** | Adds near-field lubrication, so near-contact pairs are resolved. Most accurate, most expensive. | `hydro.build_saddle_solve()`, `simulate.sd` |
+
+The RPY levels are documented below. For full SD, see
+**[`STOKESIAN_DYNAMICS.md`](STOKESIAN_DYNAMICS.md)** — a self-contained
+walkthrough of the method, the code map, the sign conventions, and the tuning
+knobs, written for someone who does not already know Stokesian Dynamics.
+
 ## Modules
 
-### `rpy.py` - Main Interface
+Public API is re-exported from `jax_md.hydro`; the implementation modules are
+listed so you know where to look when modifying.
+
+**Far-field RPY mobility**
+
+| Module | Role |
+|---|---|
+| `rpy.py` | Public builder `build_rpy_mobility()` + `estimate_rpy_params()`; combines M^(r) and M^(w) |
+| `rpy_real.py` | Re-export shim for the real-space modules below |
+| `rpy_real_det.py` | Deterministic M^(r), force-only |
+| `rpy_real_det_dipole.py` | Deterministic M^(r), grand (force + couplet) |
+| `rpy_real_stoch.py` | Lanczos sampler for M^(r)^{1/2} |
+| `rpy_real_det_helpers.py`, `rpy_real_det_dipole_helpers.py`, `rpy_real_lattice_helpers.py` | Scalar kernels, lattice-image bookkeeping |
+| `rpy_wave.py` | Re-export shim for the wave-space modules below |
+| `rpy_wave_det.py` | Deterministic M^(w), force-only (Spectral Ewald) |
+| `rpy_wave_det_dipole.py` | Deterministic M^(w), grand (force + couplet) |
+| `rpy_wave_stoch.py` | Fourier-space sampler for M^(w)^{1/2} |
+| `rpy_wave_det_helpers.py` | NUFFT spread/gather, mode builders |
+| `rpy_moments.py` | **Single source of truth** for couplet / stresslet / torque conventions |
+
+**Stresslet constraint**
+
+| Module | Role |
+|---|---|
+| `rpy_constrained.py` | Solves `E = 0` for the stresslet: `R_FU^{-1} = M_UF − M_US M_ES^{-1} M_EF` |
+| `rpy_brownian_constrained.py` | Constrained Brownian midpoint SDAE integrator |
+
+**Full Stokesian Dynamics** (see [`STOKESIAN_DYNAMICS.md`](STOKESIAN_DYNAMICS.md))
+
+| Module | Role |
+|---|---|
+| `sd_nearfield_table.py` | Loads/interpolates the 22 tabulated lubrication scalars |
+| `sd_nearfield.py` | Matrix-free near-field resistance `R^nf` |
+| `sd_saddle.py` | Deterministic saddle-point solve `R_FU = Bᵀ M⁻¹ B + R^nf_FU` |
+| `sd_brownian.py` | Brownian SD step: split noise + RFD thermal drift |
+
+### Key functions in the RPY modules
+
+#### `rpy.py` - Main Interface
 High-level function for building complete RPY mobility operators:
 - `build_rpy_mobility()`: Accepts JAX-MD space functions (works with static and shearing boxes)
 
-### `rpy_real.py` - Real-Space Mobility
+#### `rpy_real.py` - Real-Space Mobility
 Implements M^(r) using Fiore's closed-form F1,F2 coefficients:
 - `build_Mr_apply()`: Returns `(init_fn, apply_fn)` that manage neighbor lists automatically
 - `F1F2_closed_form()`: Viscosity-independent geometric coefficients F1(r; a, ξ) and F2(r; a, ξ) from Fiore Appendix A
 - `Mr_self()`: Eta-independent self-mobility factor; multiply by 1/(6πηa) for Cartesian self-mobility
 
-### `rpy_wave.py` - Wave-Space Mobility  
+#### `rpy_wave.py` - Wave-Space Mobility  
 Implements M^(w) using Spectral Ewald:
 - `build_wave_modes()`: Precomputes shape (P), fluid kernels (B), and metadata, returning a `WaveSpaceState` for M^(w)
 - `build_Mw_apply()`: Constructs the wave-space mobility operator from a `WaveSpaceState`
@@ -77,42 +131,15 @@ velocities, noise, state, info = apply_fn(
 
 `xi` must be positive; values with `xi * a ≈ 0.5` are a good starting point.
 
-## Fiore 2017 Figure Reproduction
+## Worked examples
 
-Reproduce the analytically/algorithmically reproducible Fiore 2017 figures
-(condition number, error vs tolerance, RPY vs FCM kernel speedup):
+Runnable end-to-end scripts, in rough order of increasing complexity:
 
-```bash
-python jax_md/hydro/rpy_2017_figures.py --outdir output/rpy_2017
-```
-
-Performance/timing figures (FIG. 4–8) require implementation-specific benchmarks.
-
-## Fiore Ch. 3 Performance Benchmarks
-
-Reproduce Fiore Ch. 3 performance figures (3.6–3.9) with the JAX RPY
-implementation. Outputs PNGs plus CSV/JSON metadata under
-`output/rpy_ch3_benchmarks/`:
-
-```bash
-python jax_md/hydro/rpy_ch3_benchmarks.py --figs 6,7,8,9
-```
-
-These timings are hardware-dependent; defaults assume a strong GPU. For a
-quick smoke run:
-
-```bash
-python jax_md/hydro/rpy_ch3_benchmarks.py --figs 6 --N_list 1024 --xi_a_vals 0.3,0.5,0.7 --steps 2 --warmup 1
-```
-
-## Tutorial Script
-
-Run a compact end-to-end tutorial with equilibrium + shear simulations and an xi-scan
-diagnostic (plots saved under `output/rpy_tutorial/`):
-
-```bash
-python examples/rpy_tutorial.py
-```
+| Path | What it shows |
+|---|---|
+| [`notebooks/constrained_rpy_shear_tutorial.ipynb`](../../notebooks/constrained_rpy_shear_tutorial.ipynb) | Guided walkthrough: build a mobility, run constrained Brownian dynamics under shear |
+| [`examples/shear/shear_constrained_rpy.py`](../../examples/shear/shear_constrained_rpy.py) | Constrained-RPY NEMD driver with a Lees-Edwards shear schedule |
+| [`examples/shear/shear_rpy.py`](../../examples/shear/shear_rpy.py) | Plain RPY under shear |
 
 ## Shearing Flows
 
@@ -236,6 +263,66 @@ unsheared case. Worked end-to-end examples:
 and the notebook
 [`notebooks/constrained_rpy_shear_tutorial.ipynb`](../../notebooks/constrained_rpy_shear_tutorial.ipynb).
 
+## Full Stokesian Dynamics (Fiore & Swan 2019)
+
+The RPY mobility is a *far-field* approximation: it misses the lubrication
+forces that diverge as two spheres approach contact. Full Stokesian Dynamics
+adds the short-ranged near-field resistance `R^nf` back in, giving the FSD
+resistance
+
+```
+R_FU = Bᵀ M⁻¹ B + R^nf_FU
+```
+
+where `M` is the same grand mobility used above, `B` embeds the rigid degrees of
+freedom `(U, Ω)` into moment space, and `R^nf` is a pairwise-additive lubrication
+correction that is nonzero only below `r_lub = 4a`. Because `M⁻¹` is never
+formed, this is solved as a symmetric **indefinite** saddle-point system with
+GMRES:
+
+```
+A = [[M, B], [Bᵀ, −R^nf_FU]]
+```
+
+Use this level when particles come close enough for lubrication to matter —
+dense suspensions, gelation, contact-rich rheology.
+
+```python
+from jax_md import energy, simulate, space
+
+displacement, shift = space.periodic_general(box, fractional_coordinates=True)
+energy_fn = energy.soft_sphere_pair(displacement, sigma=2 * a, epsilon=100.0)
+
+init_fn, apply_fn = simulate.sd(
+    (displacement, shift), energy_fn, dt=1e-4, kT=1.0,
+    a=1.0, eta=1.0,
+    tol=1e-3, n_particles=positions.shape[0])
+
+state = init_fn(jax.random.PRNGKey(0), positions)
+for _ in range(n_steps):
+    state = apply_fn(state)
+# Per-particle hydrodynamic stresslets: state.stresslet  (N, 5) orthonormal
+```
+
+`simulate.sd_with_shear` is the Lees-Edwards counterpart, taking the same
+`shear_vector_schedule` as `constrained_rpy_with_shear`. Ewald parameters are
+estimated from `tol` exactly as in the constrained case.
+
+Note the contrast with the constrained-RPY example above: the SD timestep is
+already jitted end-to-end internally, so **do not** wrap `apply_fn` in an outer
+`jax.jit`. Neighbor lists are refreshed with shape-preserving updates to keep
+that compilation reusable across steps.
+
+The lower-level deterministic solve is available directly as
+`hydro.build_saddle_solve(...) -> (init_fn, solve_fn)` when you want resistance
+solves without an integrator.
+
+**Read [`STOKESIAN_DYNAMICS.md`](STOKESIAN_DYNAMICS.md) before modifying any
+`sd_*` module.** It documents the three coordinate spaces, the sign conventions
+that differ from the reference FSD C++/CUDA code, the preconditioner options,
+the validation tests, and the tuning knobs (`JAX_MD_SD_MIN_GAP`, GMRES
+tolerances, neighbor-list capacity).
+
 ## Implementation Details
 
 ### Coordinate Systems
@@ -262,9 +349,12 @@ The method has three independent error sources:
 
 1. Fiore, A. M., et al. "Rapid sampling of stochastic displacements in Brownian dynamics simulations." *J. Chem. Phys.* 146, 124116 (2017). — PSE method.
 2. Fiore, A. M., & Swan, J. W. "Rapid sampling of stochastic displacements in Brownian dynamics simulations with stresslet constraints." *J. Chem. Phys.* 148, 044114 (2018). — Grand mobility, stresslet constraint, constrained Brownian dynamics.
-3. Fiore, A. M., & Swan, J. W. "Fast Stokesian dynamics." *J. Fluid Mech.* 878 (2019): 544-597.
+3. Fiore, A. M., & Swan, J. W. "Fast Stokesian dynamics." *J. Fluid Mech.* 878 (2019): 544-597. — Near-field lubrication, saddle-point solve, Brownian SD.
 4. Wang, M., & Brady, J. F. "Spectral Ewald acceleration of Stokesian dynamics." *J. Comput. Phys.* 306 (2016): 443-477.
 5. Lindbo, D., & Tornberg, A. K. "Spectral accuracy in fast Ewald-based methods." *J. Comput. Phys.* 230 (2011): 8744-8761.
+6. Jeffrey, D. J., & Onishi, Y. "Calculation of the resistance and mobility functions for two unequal rigid spheres in low-Reynolds-number flow." *J. Fluid Mech.* 139 (1984): 261-290. — Near-field resistance scalars.
+7. Townsend, A. K. *Phys. Fluids* 35 (2023): 127126. — Corrected near-field Jeffrey-Onishi expressions; the near-contact source for `data/resistance_table.npz`.
+8. Wilson, H. J. *J. Comput. Phys.* 245 (2013): 302-316. — Lamb/reflection method; the midfield source for the same table.
 
 ## Testing
 
@@ -282,9 +372,32 @@ The test suite lives under `tests/`. Fast (`not slow`) coverage:
   midpoint vs Euler-Maruyama equilibrium (Boltzmann / structure-factor) checks.
 - `tests/rpy_constrained_integrator_test.py` — `simulate.py` integrator wiring.
 
+Full Stokesian Dynamics:
+- `tests/sd_nearfield_test.py` — near-field resistance `R^nf`: pair tensor
+  construction, table interpolation, symmetry (`R_FE = +R_SU^T`), far-field
+  reduction near `r = 4a`.
+- `tests/sd_saddle_test.py` — saddle-point solve: degenerate reduction to
+  stresslet-constrained RPY at `zero_nearfield=True`, adjoint `B`/`Bᵀ` pair,
+  preconditioner iteration counts.
+- `tests/sd_brownian_test.py` — Brownian SD step: fluctuation-dissipation
+  covariance of the split samplers, RFD drift, key-stream independence.
+- `tests/sd_shear_test.py`, `tests/sd_stress_average_test.py` — sheared SD and
+  stress accumulation.
+
 Shared diagnostics live in `tests/rpy_test_utils.py`. Slow physical-validation
 tests are marked `@pytest.mark.slow`; run them with, e.g.:
 
 ```bash
 pytest tests/rpy_test.py -m "slow" -v
 ```
+
+> **Run the `rpy_*` and `sd_*` test files in separate pytest invocations.** The
+> `sd_*` modules force 64-bit precision at import time while the `rpy_*` modules
+> adapt to whatever is already set. Collecting both in one run bakes in
+> 32-bit `REAL_DTYPE` and *then* enables x64, producing dozens of spurious
+> tolerance failures. Each group passes on its own:
+>
+> ```bash
+> pytest tests/sd_nearfield_test.py tests/sd_saddle_test.py tests/sd_brownian_test.py
+> JAX_ENABLE_X64=1 pytest tests/rpy_test.py tests/rpy_constrained_test.py
+> ```

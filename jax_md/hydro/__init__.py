@@ -3,22 +3,55 @@ Hydrodynamic mobility operators for Stokes flow.
 
 This package provides positively-split Ewald (PSE) Rotne-Prager-Yamakawa (RPY)
 mobility operators for suspensions of spherical particles in periodic domains,
-including the stresslet extension of Fiore & Swan, *J. Chem. Phys.* **148**,
-044114 (2018).
+the stresslet extension of Fiore & Swan, *J. Chem. Phys.* **148**, 044114
+(2018), and full Fast Stokesian Dynamics (Fiore & Swan, *J. Fluid Mech.* **878**,
+544-597, 2019), which adds near-field lubrication.
+
+Three levels of accuracy, cheapest first:
+
+  1. RPY mobility            -- far-field coupling only.
+  2. Stresslet-constrained   -- adds rigidity (E = 0).
+  3. Stokesian Dynamics      -- adds near-field lubrication.
+
+See ``README.md`` for a guided tour and ``STOKESIAN_DYNAMICS.md`` for a
+self-contained treatment of level 3 (method, code map, sign conventions,
+tuning). Read the latter before modifying any ``sd_*`` module.
 
 Modules
 -------
-rpy_real             : Real-space RPY mobility (M^r)
-rpy_wave             : Wave-space Spectral Ewald RPY mobility (M^w)
-rpy                  : Combined mobility operator (M = M^r + M^w) and the
-                       grand / stresslet-constrained builders
-rpy_moments          : Couplet / stresslet / torque moment conventions
-rpy_constrained      : Stresslet-constrained mobility solver
-rpy_brownian_constrained : Constrained Brownian midpoint SDAE integrator
+Public API (re-exported below):
+
+  rpy                : Combined mobility M = M^r + M^w; ``build_rpy_mobility``,
+                       ``estimate_rpy_params``, and the grand /
+                       stresslet-constrained builders
+  rpy_moments        : Couplet / stresslet / torque conventions -- the single
+                       source of truth for moment packing and index order
+  rpy_constrained    : Stresslet-constrained mobility solver (E = 0)
+  rpy_brownian_constrained : Constrained Brownian midpoint SDAE integrator
+  sd_nearfield       : Near-field lubrication resistance R^nf (matrix-free)
+  sd_saddle          : SD saddle-point solve R_FU = B^T M^-1 B + R^nf_FU
+  sd_brownian        : Brownian SD step (split noise + RFD thermal drift)
+
+Implementation modules (import directly when modifying):
+
+  rpy_real           : Re-export shim for the real-space M^r modules
+  rpy_real_det       : Deterministic M^r, force-only
+  rpy_real_det_dipole: Deterministic M^r, grand (force + couplet)
+  rpy_real_stoch     : Lanczos sampler for (M^r)^{1/2}
+  rpy_wave           : Re-export shim for the wave-space M^w modules
+  rpy_wave_det       : Deterministic M^w, force-only (Spectral Ewald)
+  rpy_wave_det_dipole: Deterministic M^w, grand (force + couplet)
+  rpy_wave_stoch     : Fourier-space sampler for (M^w)^{1/2}
+  sd_nearfield_table : Loads / interpolates the 22 lubrication scalars
+  *_helpers          : Scalar kernels, NUFFT spread/gather, lattice bookkeeping
 
 Only the stable, user-facing names are re-exported here. Lower-level building
 blocks (scalar kernels, FFT primitives, mode builders, square-root samplers)
 remain available from their submodules, e.g. ``jax_md.hydro.rpy_wave``.
+
+For writing simulation *scripts*, prefer the integrators in ``jax_md.simulate``
+(``rpy``, ``constrained_rpy``, ``sd``, and their ``_with_shear`` variants) over
+driving these builders directly.
 
 Example
 -------
@@ -41,6 +74,19 @@ Example
 >>>     use_stresslet=True, constrained=True)
 >>> # Constrained Brownian dynamics:
 >>> brownian_init, step = apply_fn.make_brownian_step(kT=1.0, dt=1e-3)
+>>>
+>>> # Full Stokesian Dynamics (near-field lubrication + saddle-point solve).
+>>> from jax_md.hydro import build_saddle_solve
+>>> sd_init, solve_fn = build_saddle_solve(
+>>>     space_fns, a=1.0, eta=1.0, P=16, Mgrid=64)
+>>> sd_state = sd_init(positions_fractional)
+>>> U, Omega, S5, F_moments, info = solve_fn(
+>>>     sd_state, positions_fractional, force, torque, E_inf)
+>>>
+>>> # ...or, for a whole simulation, use the integrators in jax_md.simulate:
+>>> from jax_md import simulate
+>>> init_fn, apply_fn = simulate.sd(
+>>>     space_fns, energy_fn, dt=1e-4, kT=1.0, a=1.0, eta=1.0)
 """
 
 from jax_md.hydro.rpy_real import RealSpaceState
@@ -115,6 +161,11 @@ __all__ = [
     'build_saddle_solve',
     'SaddleState',
     'Ic0Preconditioner',
+    # Full Stokesian Dynamics: Brownian step and its samplers.
+    'build_sd_brownian_step',
+    'nearfield_brownian_force',
+    'make_nearfield_brownian_sampler',
+    'make_far_field_slip_sampler',
     # Constrained Brownian dynamics.
     'make_constrained_brownian_step',
     'run_brownian_chunked',

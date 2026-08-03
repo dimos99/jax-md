@@ -384,6 +384,8 @@ def build_nearfield_resistance(
     capacity_multiplier: float = 1.25,
     extra_capacity: int = 0,
     disable_cell_list: bool = False,
+    neighbor_format: partition.NeighborListFormat = (
+        partition.NeighborListFormat.Dense),
 ):
   """Construct the matrix-free near-field lubrication resistance operator.
 
@@ -393,11 +395,38 @@ def build_nearfield_resistance(
     r_lub: lubrication cutoff (default ``4a``).
     fractional_coordinates: positions in ``[0,1)^d`` (default) or real.
     dr_threshold, capacity_multiplier, disable_cell_list: neighbor-list knobs.
+      NOTE ``capacity_multiplier`` means something different for the two
+      ``neighbor_format`` choices: for ``Dense`` it scales a per-particle buffer
+      width (and the ``N * max_k`` buffer then carries several times the live
+      edge count as *accidental* slack), whereas for ``Sparse`` it is headroom
+      on the *total* pair count, so 1.25 really is 25%.  Under ``Sparse``, on
+      configurations whose coordination grows over the run (aggregation,
+      quenches), size this from the expected final pair count and check
+      ``state.neighbors.did_buffer_overflow``.
     extra_capacity: additional neighbor slots beyond the allocation estimate.
-      This is *per particle* for both Dense and Sparse neighbor lists.  For this
-      Dense list it directly increases the buffer width, which multiplies the
-      cost of every near-field matvec -- keep it small.  A value supplied to
-      ``init_fn`` overrides this construction-time default.
+      This is *per particle* for both Dense and Sparse neighbor lists, and it
+      directly increases the edge count ``E`` that every near-field matvec
+      streams -- keep it small.  A value supplied to ``init_fn`` overrides this
+      construction-time default.
+    neighbor_format: ``Dense`` (default) or ``Sparse``.  Both enumerate the same
+      directed edges and agree bit-for-bit -- the ``segment_sum`` is over the
+      same receiver partition, in the same order -- so this is purely a
+      cost/allocation trade-off.
+
+      ``Sparse`` is the faster option on heterogeneous configurations.  The edge
+      count ``E`` drives the whole near-field cost: the Chebyshev-Schur
+      preconditioner does ``cheb_degree`` applies of ``R^nf_FU`` per GMRES
+      iteration (~1e4 per SD step), each one a gather -> block multiply ->
+      ``segment_sum`` over all ``E`` edges.  ``Dense`` allocates
+      ``E = N * max_k`` with ``max_k`` sized by the single most-crowded
+      particle, so a clustered config pays worst-case occupancy on *every*
+      particle -- measured 2-3x more edges streamed than are live, a penalty no
+      capacity multiplier can remove.  ``Sparse`` allocates from the true pair
+      count instead, so ``E`` tracks the live edges; the flip side is that it
+      gives up Dense's accidental overflow slack (see ``capacity_multiplier``).
+
+      NOTE ``OrderedSparse`` is NOT valid here: the near-field matvec
+      ``segment_sum``s over receivers and needs both ``i->j`` and ``j->i``.
 
   Returns:
     ``(init_fn, apply_fn)``.
@@ -418,6 +447,13 @@ def build_nearfield_resistance(
   if dr_threshold is None:
     dr_threshold = 0.1 * r_lub
 
+  if neighbor_format is partition.NeighborListFormat.OrderedSparse:
+    raise ValueError(
+        'neighbor_format=OrderedSparse is invalid for the near-field '
+        'resistance: the matvec segment-sums over receivers and needs both '
+        'i->j and j->i edges.  Use Sparse or Dense.')
+  _sparse_nbrs = partition.is_sparse(neighbor_format)
+
   if len(space_fns) < 2:
     raise ValueError('space_fns must contain displacement and shift functions.')
   displacement_fn, _ = space_fns[:2]
@@ -435,7 +471,7 @@ def build_nearfield_resistance(
       disable_cell_list=disable_cell_list,
       mask_self=False,
       fractional_coordinates=fractional_coordinates,
-      format=partition.NeighborListFormat.Dense,
+      format=neighbor_format,
   )
 
   def _allocate(positions, box_matrix, **kwargs):
@@ -493,15 +529,29 @@ def build_nearfield_resistance(
     else:
       positions_frac = space.transform(jnp.linalg.inv(box_matrix), positions)
 
-    # Dense -> flat directed edge list (receiver i, sender j).
+    # Both formats -> flat directed edge list (receiver i, sender j).
     neighbor_idx = jnp.asarray(neighbor_idx, dtype=jnp.int32)
-    if neighbor_idx.ndim == 1:
-      neighbor_idx = neighbor_idx[:, None]
-      neighbor_mask = neighbor_mask[:, None]
-    max_k = neighbor_idx.shape[1]
-    receivers = jnp.repeat(jnp.arange(N, dtype=jnp.int32), max_k)
-    senders = jnp.where(neighbor_mask, neighbor_idx, 0).ravel()
-    flat_mask = neighbor_mask.ravel()
+    if _sparse_nbrs:
+      # jax_md packs Sparse as ``stack((receiver_idx, sender_idx))`` where
+      # ``sender_idx`` is the broadcast ``arange(N)`` (the centre particle) and
+      # ``receiver_idx`` is its neighbour -- the opposite of the naming used
+      # here, so idx[1] is our receiver i and idx[0] our sender j.  This makes
+      # the Sparse edge list agree with the Dense one, whose receiver is the row
+      # (centre) index.  Overflow slots have BOTH entries set to N, so the
+      # ``idx[0] < N`` test in ``partition.neighbor_list_mask`` covers both;
+      # clamp them so the gathers stay in range and let ``edge_mask`` zero the
+      # contribution.
+      flat_mask = neighbor_mask
+      receivers = jnp.where(flat_mask, neighbor_idx[1], 0)
+      senders = jnp.where(flat_mask, neighbor_idx[0], 0)
+    else:
+      if neighbor_idx.ndim == 1:
+        neighbor_idx = neighbor_idx[:, None]
+        neighbor_mask = neighbor_mask[:, None]
+      max_k = neighbor_idx.shape[1]
+      receivers = jnp.repeat(jnp.arange(N, dtype=jnp.int32), max_k)
+      senders = jnp.where(neighbor_mask, neighbor_idx, 0).ravel()
+      flat_mask = neighbor_mask.ravel()
 
     # Minimum-image displacement (handles shear via the live deformed box).
     delta_frac = positions_frac[senders] - positions_frac[receivers]

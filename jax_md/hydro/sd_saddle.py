@@ -91,6 +91,7 @@ from scipy.sparse.linalg import spsolve_triangular
 from jax.scipy.sparse import linalg as sparse_linalg
 
 from jax_md import dataclasses
+from jax_md import partition
 from jax_md import space
 
 from jax_md.hydro.rpy import (
@@ -589,6 +590,7 @@ def build_saddle_solve(
     gmres_tol: float = 1e-3,
     gmres_restart: int = 50,
     gmres_maxiter: int = 20,
+    gmres_solve_method: str = 'batched',
     r_lub: Optional[float] = None,
     r_p: Optional[float] = None,
     preconditioner: str = 'cheb',
@@ -598,6 +600,7 @@ def build_saddle_solve(
     fractional_coordinates: bool = True,
     nf_capacity_multiplier: Optional[float] = None,
     nf_extra_capacity: int = 0,
+    nf_neighbor_format: Optional[partition.NeighborListFormat] = None,
     **rpy_kwargs,
 ):
   """Build the deterministic FSD saddle-point solve.
@@ -624,6 +627,39 @@ def build_saddle_solve(
       on ``restart``, so a larger ``maxiter`` costs nothing on solves that
       converge -- it only buys headroom on the ones that would otherwise be
       truncated silently.
+    gmres_solve_method: which of jax's two GMRES implementations to use,
+      ``'batched'`` (default) or ``'incremental'``.  They differ in how the
+      Krylov least-squares problem is solved *within* one restart:
+
+      * ``'batched'`` builds the full ``restart``-dimensional basis and then
+        solves the least-squares problem from scratch.  It ignores the
+        within-restart tolerance entirely (jax's ``_gmres_batched`` does
+        ``del ptol``), so it always runs the full ``restart`` matvecs unless
+        it hits an exact Arnoldi breakdown -- and therefore routinely
+        *overshoots* the requested tolerance.
+      * ``'incremental'`` builds the QR incrementally with Givens rotations
+        and stops inside a restart as soon as its residual *estimate* meets
+        ``ptol``.
+
+      **Keep the default.**  ``'incremental'``'s early exit looks like free
+      savings and is not: measured on a disordered N=108 phi=0.50 config
+      (min gap 0.073a, ``'cheb'`` preconditioner), matching the two on
+      *delivered* true residual rather than on the nominal tolerance gives
+
+        resid 3.5e-3: batched 13 matvecs | incremental 14
+        resid 4.7e-6: batched 33 matvecs | incremental 34
+        resid 1.8e-9: batched 53 matvecs | incremental 53   (2.09 s vs 2.62 s)
+
+      i.e. the same Krylov space and the same iteration count, plus a ~25%
+      wall-clock penalty from the per-iteration Givens work.  The apparent
+      speedup of ``'incremental'`` at a fixed nominal ``tol`` is entirely the
+      accuracy it declines to deliver.
+
+      The knob is exposed because the per-iteration overhead is
+      architecture-dependent (jax documents ``'batched'`` as the GPU-friendly
+      path, which is where this was measured to matter least), NOT because
+      warm-started solves want ``'incremental'`` -- they specifically do not;
+      see :func:`~jax_md.hydro.sd_brownian.rfd_drift`.
     r_lub: near-field cutoff (default ``4a``).
     r_p: near-field truncation for the IC(0) Schur factor (default ``2.1a``).
     preconditioner: default GMRES preconditioner.  ``'cheb'`` (the default) is
@@ -650,17 +686,32 @@ def build_saddle_solve(
       eigenvalue so Chebyshev stays stable (default 1.2).
     nf_capacity_multiplier: capacity headroom for the near-field ``r_lub``
       neighbor list.  ``None`` (default) inherits ``capacity_multiplier`` from
-      ``rpy_kwargs`` (else 1.25).  The near-field list is **Dense**, so its
-      capacity is a per-particle buffer width that multiplies the cost of every
-      near-field matvec (one per GMRES/Chebyshev iteration): on aggregating
-      systems where the far-field Sparse list wants a large multiplier, cap
-      this one at the expected max coordination growth (~3-4x) instead of
-      inheriting.
-    nf_extra_capacity: additional per-particle slots for the near-field Dense
-      list (default 0).  NOT inherited from the Sparse ``extra_capacity`` in
-      ``rpy_kwargs``.  Sparse ``extra_capacity`` is also specified per particle
-      and is multiplied by ``N`` internally to obtain total pair capacity;
-      passing a total-pair count would therefore cause an N-fold over-allocation.
+      ``rpy_kwargs`` (else 1.25).  This scales the near-field edge count ``E``,
+      which multiplies the cost of every near-field matvec -- and the
+      Chebyshev-Schur preconditioner does ``cheb_degree`` of them per GMRES
+      iteration, ~1e4 per SD step.  It is the single most expensive capacity
+      knob in the solver: keep it near the expected max coordination growth
+      (~3-4x for the **Dense** default, whose capacity is a per-particle buffer
+      width) rather than inheriting a large far-field multiplier.  Under
+      ``nf_neighbor_format=Sparse`` it instead means headroom on the *total*
+      pair count -- real headroom, where Dense's ``N * max_k`` buffer happens to
+      carry several times the live edge count -- so on systems that densify
+      (aggregation, quenches) size it from the expected FINAL pair count and
+      watch ``did_buffer_overflow``.
+    nf_extra_capacity: additional per-particle slots for the near-field list
+      (default 0).  NOT inherited from the ``extra_capacity`` in
+      ``rpy_kwargs``.  Specified per particle for both formats, and multiplied
+      by ``N`` internally to obtain total pair capacity for Sparse lists
+      (near-field and far-field alike), so passing a total-pair count would
+      cause an N-fold over-allocation.
+    nf_neighbor_format: near-field neighbor-list format, or ``None`` (default)
+      to take ``build_nearfield_resistance``'s own default (``Dense``).
+      ``Dense`` sizes ``E = N * max_k`` from the single most-crowded particle,
+      so heterogeneous configs (gels) pay the worst-case occupancy on every
+      particle -- 2-3x more edges streamed than are live.  ``Sparse`` sizes from
+      the true pair count instead and is the faster choice there, at the cost of
+      Dense's accidental overflow slack.  Both enumerate the same directed edges
+      and agree bit-for-bit.
     **rpy_kwargs: forwarded to ``build_rpy_mobility`` (e.g. ``P``, ``Mgrid``,
       ``rcut``, ``capacity_multiplier``, ``extra_capacity``).
 
@@ -675,6 +726,11 @@ def build_saddle_solve(
   cheb_power_iters = int(cheb_power_iters)
   cheb_safety = float(cheb_safety)
   default_preconditioner = preconditioner
+  if gmres_solve_method not in ('batched', 'incremental'):
+    raise ValueError(
+        "gmres_solve_method must be 'batched' or 'incremental', got %r"
+        % (gmres_solve_method,))
+  default_gmres_solve_method = gmres_solve_method
   displacement_fn = space_fns[0]
   box_fn = space_fns[2] if len(space_fns) > 2 else None
 
@@ -731,12 +787,16 @@ def build_saddle_solve(
   # -- Near-field resistance (Phase 1) -------------------------------------
   if nf_capacity_multiplier is None:
     nf_capacity_multiplier = rpy_kwargs.get('capacity_multiplier', 1.25)
+  nf_kwargs = {}
+  if nf_neighbor_format is not None:
+    nf_kwargs['neighbor_format'] = nf_neighbor_format
   nf_init, nf_apply = build_nearfield_resistance(
       space_fns, a, eta,
       r_lub=r_lub,
       fractional_coordinates=fractional_coordinates,
       capacity_multiplier=float(nf_capacity_multiplier),
       extra_capacity=int(nf_extra_capacity),
+      **nf_kwargs,
   )
 
   # -- init_fn -------------------------------------------------------------
@@ -810,7 +870,7 @@ def build_saddle_solve(
   def _body_impl(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
                  current_box, slip_top, extra, x0,
                  pc, zero_nf, ret_s, ret_r, tol_, atol_, ic0_obj,
-                 restart_, maxiter_, prepared_nf=None):
+                 restart_, maxiter_, solve_method_, prepared_nf=None):
     # ``prepared_nf`` is a TRACED trailing arg (a PreparedNearField pytree or
     # None), deliberately after the static block so _STATIC_ARGNUMS is stable.
     N = positions_frac.shape[0]
@@ -854,7 +914,8 @@ def build_saddle_solve(
 
     x, conv_info = sparse_linalg.gmres(
         apply_A, (b1, b2), x0=x0, tol=tol_, atol=atol_,
-        restart=int(restart_), maxiter=int(maxiter_), M=M_op)
+        restart=int(restart_), maxiter=int(maxiter_), M=M_op,
+        solve_method=solve_method_)
 
     q11, u6 = x
     U_rel, Omega_rel = u6[..., :3], u6[..., 3:]
@@ -897,14 +958,15 @@ def build_saddle_solve(
   # Cache jitted device-path bodies keyed by their static configuration so the
   # XLA program is compiled once per (pc, flags, tol, gmres budget) combination,
   # not per call.
-  _STATIC_ARGNUMS = tuple(range(10, 19))  # pc..ic0_obj, restart_, maxiter_
+  _STATIC_ARGNUMS = tuple(range(10, 20))  # pc..maxiter_, solve_method_
   _body_jit_cache = {}
 
   def _device_body(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat,
                    current_box, slip_top, extra,
                    x0, pc, zero_nf, ret_s, ret_r, tol_, atol_,
-                   restart_, maxiter_, prepared_nf=None):
-    key = (pc, zero_nf, ret_s, ret_r, tol_, atol_, restart_, maxiter_)
+                   restart_, maxiter_, solve_method_, prepared_nf=None):
+    key = (pc, zero_nf, ret_s, ret_r, tol_, atol_, restart_, maxiter_,
+           solve_method_)
     fn = _body_jit_cache.get(key)
     if fn is None:
       fn = jax.jit(_body_impl, static_argnums=_STATIC_ARGNUMS)
@@ -912,7 +974,7 @@ def build_saddle_solve(
     return fn(state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
               slip_top, extra, x0,
               pc, zero_nf, ret_s, ret_r, tol_, atol_, None, restart_, maxiter_,
-              prepared_nf)
+              solve_method_, prepared_nf)
 
   # -- solve_fn ------------------------------------------------------------
   def solve_fn(
@@ -934,6 +996,7 @@ def build_saddle_solve(
       atol: Optional[float] = None,
       gmres_restart: Optional[int] = None,
       gmres_maxiter: Optional[int] = None,
+      gmres_solve_method: Optional[str] = None,
       return_stresslet: bool = True,
       return_residual: bool = True,
       **shear_kwargs,
@@ -983,6 +1046,9 @@ def build_saddle_solve(
         solves set a fixed ``atol`` (with ``tol=0``) so both converge to the
         same *absolute* residual regardless of warm-start -- the drift divides
         ``U_+ - U_-`` by a tiny ``eps`` and amplifies any residual asymmetry.
+      gmres_solve_method: override the builder's ``'batched'`` /
+        ``'incremental'`` choice for this call.  Pass ``'incremental'`` on
+        warm-started solves -- see ``build_saddle_solve``.
       return_residual: compute the true relative residual (one extra saddle
         matvec).  Also gates ``info['converged']`` and the non-convergence
         warning; the RFD displaced solves run to a fixed truncated budget by
@@ -1018,6 +1084,12 @@ def build_saddle_solve(
                 else int(gmres_restart))
     _maxiter = (_default_gmres_maxiter if gmres_maxiter is None
                 else int(gmres_maxiter))
+    _solve_method = (default_gmres_solve_method if gmres_solve_method is None
+                     else gmres_solve_method)
+    if _solve_method not in ('batched', 'incremental'):
+      raise ValueError(
+          "gmres_solve_method must be 'batched' or 'incremental', got %r"
+          % (_solve_method,))
 
     # IC(0) stays eager (host RCM + scipy factor + pure_callback triangular
     # solves); the on-device preconditioners run the cached jitted body.
@@ -1028,12 +1100,12 @@ def build_saddle_solve(
           state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
           slip_arr, extra, x0,
           pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
-          ic0_obj, _restart, _maxiter, prepared_nf)
+          ic0_obj, _restart, _maxiter, _solve_method, prepared_nf)
     return _device_body(
         state, positions_frac, fp6, e5, E_inf_mat, L_inf_mat, current_box,
         slip_arr, extra, x0,
         pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
-        _restart, _maxiter, prepared_nf)
+        _restart, _maxiter, _solve_method, prepared_nf)
 
   # -- Eager iteration-count harness (check 3; runs outside JIT) -----------
   def count_iterations(
