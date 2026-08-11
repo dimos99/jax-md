@@ -47,6 +47,17 @@ interpolation; non-finite values and gaps beyond that range are rejected. Like
 the dtype, it is read once at import: set it before ``jax_md.hydro`` is first
 imported.
 
+The clamp is not only a conditioning knob: it also sets a **ceiling on the
+Brownian RFD step** ``rfd_epsilon``. Flattening the resistance leaves a corner
+where the plateau meets the diverging near-contact branch, and a centred finite
+difference that straddles that corner converges to the average of the two
+one-sided slopes rather than to either one, biasing the thermal drift for
+near-contact pairs. ``sd_brownian.rfd_epsilon_bounds`` derives the resulting
+window and ``build_sd_brownian_step`` enforces it; see "The RFD step and the
+lubrication clamp are coupled" in ``STOKESIAN_DYNAMICS.md``. Raising this gap
+widens that window as well as easing conditioning, which is why it -- rather
+than the RFD step -- is the knob to turn when no valid step exists.
+
 The lubrication cutoff itself (``r < r_lub = 4a``) is enforced by the caller's
 neighbor mask, never by this table.
 

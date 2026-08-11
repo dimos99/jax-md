@@ -55,11 +55,14 @@ torque-row assertion is the empirical gate.
 
 from functools import partial
 from typing import Callable, Optional, Tuple
+import os
+import warnings
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
+from jax_md.hydro import sd_nearfield_table as nf_table
 from jax_md.hydro.sd_saddle import (
     build_saddle_solve,
 )
@@ -78,6 +81,128 @@ from jax_md.hydro.rpy_moments import grand_to_flat
 # Isolated-sphere rotational self-resistance scale (in a-units) for the
 # neighborless conditioning shift; matches the original FSD code.
 _SHIFT_PATTERN = np.array([1.0, 1.0, 1.0, 4.0 / 3.0, 4.0 / 3.0, 4.0 / 3.0])
+
+
+# --------------------------------------------------------------------------- #
+# RFD step-size selection
+# --------------------------------------------------------------------------- #
+# The drift is a centered difference of the saddle solve, so ``eps`` is bounded
+# from both sides.
+#
+# Ceiling: the lubrication clamp flattens ``R^nf`` below a surface gap, leaving
+# a C0 corner.  A difference straddling it returns the mean of the two one-sided
+# slopes rather than either, and shrinking ``eps`` does not repair that -- the
+# drift comes out too large inside the plateau (true slope ~0 there) and too
+# small just outside it.  Pairs away from contact are unaffected.
+#
+# Floor: the drift divides by ``eps``, amplifying the displaced solves' residual
+# by ``1/eps``.  Set by the residual ACHIEVED, not by ``rfd_atol`` -- float64
+# converges below any requested tolerance, so sweeping ``rfd_atol`` there says
+# nothing about this bound.
+#
+# The clamp cancels out of the floor: the condition number grows as the clamp
+# gap shrinks while the response's variation length shrinks with it.  So the
+# clamp sets the ceiling directly and the floor only through stiffness -- when
+# the window closes, widen the clamp rather than shrink ``eps``.
+#
+# The floor constants are calibrations, not derivations; the achievable residual
+# is configuration dependent.  To check, sweep ``eps`` and look for a plateau in
+# the drift magnitude, holding the RFD direction fixed (single-sample estimator,
+# so re-drawing compares samples rather than step sizes).
+_RFD_CEILING_FRAC = 0.3
+_RFD_FLOOR_F32 = 1e-4
+_RFD_FLOOR_F64 = 1e-5
+# Below this the clamp bounds nothing (float64 defaults to the table's lowest
+# tabulated gap): no corner, but also no bound on pair separation, so no ``eps``
+# is valid for the tightest pairs.  Treat the ceiling as absent rather than warn
+# on a configuration the user never chose.
+_RFD_CLAMP_ACTIVE_GAP = 1e-6
+
+
+def lubrication_clamp_gap() -> float:
+  """Surface gap (units of ``a``) at the near-field resistance clamp row.
+
+  Resolved once at import from the dtype and the ``JAX_MD_SD_MIN_GAP``
+  environment variable; see :mod:`jax_md.hydro.sd_nearfield_table`.
+  """
+  table = nf_table.load_resistance_table()
+  return float(table.dist[nf_table.REGULARIZATION_INDEX]) - 2.0
+
+
+def rfd_epsilon_bounds(a) -> Tuple[float, Optional[float], float]:
+  """``(floor, ceiling, clamp_gap)`` for the RFD step at sphere radius ``a``.
+
+  ``ceiling`` is ``None`` when no lubrication clamp is active.  ``eps`` is a
+  displacement, so both bounds are lengths and scale with ``a``; ``clamp_gap``
+  is dimensionless (units of ``a``).
+  """
+  clamp_gap = lubrication_clamp_gap()
+  floor = float(a) * (_RFD_FLOOR_F32 if REAL_DTYPE == jnp.float32
+                      else _RFD_FLOOR_F64)
+  if clamp_gap <= _RFD_CLAMP_ACTIVE_GAP:
+    return floor, None, clamp_gap
+  return floor, _RFD_CEILING_FRAC * float(a) * clamp_gap, clamp_gap
+
+
+def _resolve_rfd_epsilon(rfd_epsilon, gmres_tol, a):
+  """Pick (or validate) the RFD step against the ceiling and floor above.
+
+  Returns ``(eps, floor, ceiling, clamp_gap)``.  A user-supplied value is never
+  overridden -- only warned about -- so an explicit choice always wins.
+  """
+  floor, ceiling, clamp_gap = rfd_epsilon_bounds(a)
+  # Historical default: FSD ties eps to the solver tolerance.  Kept as the
+  # starting point so runs already inside the window are unchanged.
+  legacy = max(float(gmres_tol), 1e-4)
+  supplied = rfd_epsilon is not None
+  eps = float(rfd_epsilon) if supplied else legacy
+
+  if ceiling is not None and ceiling < floor:
+    # No valid eps exists -- a clamp problem, not an eps problem.  Name the
+    # clamp's origin: in float32 the default comes from table resolution, so the
+    # user may have chosen nothing.
+    origin = ('the JAX_MD_SD_MIN_GAP setting'
+              if os.environ.get(nf_table._MIN_GAP_ENV)
+              else f'the default {REAL_DTYPE.__name__} table resolution')
+    warnings.warn(
+        f"The lubrication clamp gap is {clamp_gap:.2e} (units of a), from "
+        f"{origin}, which is too tight for {REAL_DTYPE.__name__}: the RFD step "
+        f"must be below {ceiling:.2e} to resolve the clamp corner but above "
+        f"~{floor:.2e} to survive 1/eps amplification of the solve residual. "
+        f"No rfd_epsilon satisfies both, so the Brownian drift is unconverged "
+        f"for pairs within ~{eps / (_RFD_CEILING_FRAC * float(a)):.1e} of "
+        f"contact. Set JAX_MD_SD_MIN_GAP to at least "
+        f"{floor / (_RFD_CEILING_FRAC * float(a)):.1e} (before the first "
+        f"jax_md.hydro import) to open the window, or proceed knowing the "
+        f"near-contact drift is unresolved.",
+        UserWarning, stacklevel=3)
+  elif supplied:
+    if ceiling is not None and eps > ceiling:
+      warnings.warn(
+          f"rfd_epsilon={eps:.2e} exceeds the lubrication-clamp ceiling "
+          f"{ceiling:.2e} (= {_RFD_CEILING_FRAC} * a * clamp gap "
+          f"{clamp_gap:.2e}). The RFD probes will straddle the clamp corner, "
+          f"which biases the Brownian drift for near-contact pairs by factors "
+          f"of 3-40x (over-estimating inside the clamp, under-estimating just "
+          f"outside). Use rfd_epsilon <= {ceiling:.2e}, or raise "
+          f"JAX_MD_SD_MIN_GAP.",
+          UserWarning, stacklevel=3)
+    elif eps < floor:
+      warnings.warn(
+          f"rfd_epsilon={eps:.2e} is below the ~{floor:.2e} floor for "
+          f"{REAL_DTYPE.__name__}: the drift divides by eps, so the solve "
+          f"residual is amplified by 1/eps and can dominate the result "
+          f"(observed in f32 near contact as a drift velocity of the wrong "
+          f"sign). Confirm the drift is eps-independent before relying on it.",
+          UserWarning, stacklevel=3)
+  elif eps > (ceiling if ceiling is not None else eps):
+    # Default above the ceiling: move it in, landing on the geometric centre for
+    # maximum log-margin from both bounds (neither is a sharp edge).
+    eps = float(np.sqrt(floor * ceiling))
+  elif eps < floor:
+    eps = floor
+
+  return eps, floor, ceiling, clamp_gap
 
 
 # ---------------------------------------------------------------------------
@@ -388,13 +513,16 @@ def build_sd_brownian_step(
     a, eta: sphere radius and solvent viscosity.
     dt, kT: timestep and thermal energy.
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
-    rfd_epsilon: RFD finite-difference step.  Default ``None`` resolves to
-      ``max(gmres_tol, 1e-4)`` (= 1e-3 at default settings), matching the
-      original FSD convention ``rfd_epsilon = solver tolerance``
-      ; the drift divides ``U_+ - U_-`` by ``eps``, so a
-      larger ``eps`` relaxes the residual accuracy the displaced solves must
-      reach by the same factor, while the centered-difference bias is only
-      ``O(eps^2)``.  (Confirm drift is ``eps``-independent when overriding.)
+    rfd_epsilon: RFD finite-difference step.  ``None`` (default) takes the FSD
+      convention ``max(gmres_tol, 1e-4)`` clipped into the window from
+      :func:`rfd_epsilon_bounds`, landing on its geometric centre when that
+      value is above the ceiling.  The ceiling is a fixed fraction of
+      ``a * clamp_gap`` (a straddling difference cannot resolve the clamp
+      corner); the floor comes from ``1/eps`` amplification of the achievable
+      solve residual.  An explicit value is warned about, never overridden.  The
+      ``O(eps^2)`` centered-difference bias assumes a smooth resistance, which
+      is what the corner breaks; confirm the drift is ``eps``-independent when
+      overriding.
     rfd_atol: absolute GMRES tolerance for the two RFD displaced solves.  In
       float32 this is clamped up to a reachable floor (~1e-5): with the f32
       residual floor at ~1e-6, an unreachable ``atol`` (e.g. 1e-8) would make
@@ -464,12 +592,10 @@ def build_sd_brownian_step(
   rfd_atol = max(float(rfd_atol), _tol_floor)
   lanczos_tol = max(float(lanczos_tol), _tol_floor)
   gmres_tol = max(float(gmres_tol), _tol_floor)
-  # As in the original FSD code, rfd_epsilon is tied to the solver tolerance:
-  # the 1/eps amplification of solve residuals then matches what the tolerance
-  # delivers.
-  if rfd_epsilon is None:
-    rfd_epsilon = max(gmres_tol, 1e-4)
-  rfd_epsilon = float(rfd_epsilon)
+  # Resolve eps inside [floor, ceiling]; see the block comment above
+  # ``_RFD_CEILING_FRAC``.
+  rfd_epsilon, _rfd_floor, _rfd_ceiling, _rfd_clamp_gap = _resolve_rfd_epsilon(
+      rfd_epsilon, gmres_tol, a)
   # Bound the RFD GMRES budget in BOTH precisions, independently of the main
   # solve's (larger) budget.  restart=50 is the original FSD restart length;
   # two cycles bring a cheb-preconditioned solve to true rel residual ~1e-4,
@@ -670,5 +796,14 @@ def build_sd_brownian_step(
   # between steps instead of calling ``init_fn`` again (which rebuilds the wave
   # ``PjitFunction``s and forces the jitted step to recompile every step).
   step_fn.refresh_state = solve_fn.refresh_state
+  # RFD step provenance for run metadata: resolved from a mix of arguments,
+  # dtype and an import-time environment variable.
+  step_fn.rfd_epsilon = rfd_epsilon
+  step_fn.rfd_epsilon_floor = _rfd_floor
+  step_fn.rfd_epsilon_ceiling = _rfd_ceiling
+  step_fn.lubrication_clamp_gap = _rfd_clamp_gap
+  # Surface gap (units of ``a``) above which the drift is resolved; reported
+  # rather than warned about, since with no clamp it is unavoidable.
+  step_fn.rfd_trust_gap = rfd_epsilon / (_RFD_CEILING_FRAC * float(a))
 
   return init_fn, step_fn

@@ -792,6 +792,12 @@ The displaced solves reuse the neighbor lists built at `q`; therefore
 `rfd_epsilon` must be much smaller than the neighbor-list skin. The builder
 rejects grossly large `rfd_epsilon` values.
 
+That skin bound is far from the binding one. `rfd_epsilon` is constrained much
+more tightly from above by the lubrication clamp and from below by the achievable
+solve residual; the builder resolves it inside that window and warns when a
+supplied value falls outside. See "The RFD step and the lubrication clamp are
+coupled" under Parameters and Tuning.
+
 ### One timestep
 
 `build_sd_brownian_step` returns `(init_fn, step_fn)`.
@@ -1049,6 +1055,46 @@ does not help. `JAX_MD_SD_MIN_GAP` is the lever there.
 For Brownian RFD solves, `rfd_atol` is more important than relative tolerance
 because the drift is a finite difference of two velocities. In float32 the code
 raises very tight tolerances to a reachable floor.
+
+### The RFD step and the lubrication clamp are coupled
+
+`rfd_epsilon` and `JAX_MD_SD_MIN_GAP` are not independent knobs. The RFD drift
+is a centred finite difference of the saddle solve, so its step is bounded on
+both sides, and the two bounds respond differently to the clamp:
+
+- **Ceiling — set by the clamp.** Flattening `R^nf` below a surface gap leaves a
+  corner where the plateau meets the diverging near-contact branch. A centred
+  difference that straddles that corner converges to the average of the two
+  one-sided slopes rather than to either, so shrinking the step does not repair
+  it. The drift then comes out too large for pairs inside the plateau (whose
+  true slope is nearly zero) and too small for pairs just outside it. The step
+  must stay a fixed fraction below `a * clamp_gap`.
+- **Floor — set by the achievable residual.** The drift divides by the step, so
+  residual error in the displaced solves is amplified by `1/eps`. This only
+  bites where the solve stalls: near contact, and in float32.
+
+Because the saddle condition number grows as the clamp gap shrinks while the
+length scale of the response shrinks with it, the clamp cancels out of the floor.
+Raising the clamp lifts the ceiling directly but helps the floor only indirectly.
+**When the window closes, widen the clamp — do not shrink `eps`.**
+
+`build_sd_brownian_step` resolves this automatically. `rfd_epsilon_bounds(a)`
+returns `(floor, ceiling, clamp_gap)`; the default is the historical
+`max(gmres_tol, 1e-4)` clipped into that window, landing on its geometric centre
+when the historical value is too large. An explicitly supplied `rfd_epsilon` is
+never overridden, only warned about. A closed window — the clamp tighter than the
+precision can exploit — warns at build time and names the clamp value that opens
+it. The resolved values are exposed on `step_fn` as `rfd_epsilon`,
+`rfd_epsilon_floor`, `rfd_epsilon_ceiling`, `lubrication_clamp_gap`, and
+`rfd_trust_gap` (the surface gap above which the drift is resolved); record them
+in run metadata, since they come from a mix of arguments, dtype, and an
+import-time environment variable.
+
+To confirm the choice for a given system, sweep the step size at the production
+configuration and look for a plateau in the drift magnitude. Hold the RFD
+direction fixed across the sweep — it is a single-sample estimator, so
+re-drawing per step compares samples rather than step sizes and hides the
+plateau. No plateau means the window is closed.
 
 ### Neighbor-list capacity
 
