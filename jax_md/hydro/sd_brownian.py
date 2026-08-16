@@ -4,7 +4,8 @@ Adds thermal fluctuations to the deterministic Phase-2 saddle solve
 (:mod:`jax_md.hydro.sd_saddle`).  One overdamped Euler--Maruyama timestep
 samples the stochastic displacement from the fluctuation--dissipation
 distribution ``N(0, 2kT dt R_FU^{-1})`` *without* forming ``R_FU^{-1/2}``,
-plus the thermal drift ``kT div R_FU^{-1}`` by random finite differencing.
+plus the thermal drift ``kT div R_FU^{-1}`` by an implicit directional
+derivative (default) or centred random finite differencing (fallback).
 
 The Brownian force splits into a far-field slip velocity and a near-field
 force, both injected on the RHS of the *same* indefinite saddle matrix the
@@ -18,11 +19,12 @@ deterministic solve already inverts (Fiore & Swan 2019):
   the flat-11 moment layout the saddle top block expects.  No new math (Sec. 1).
 * **Near-field force** ``F^B_nf ~ N(0, (2kT/dt) R^nf_FU)`` -- new: a
   preconditioned Krylov square root of the matrix-free ``R^nf_FU`` (Sec. 2).
-* **RFD drift** -- two extra displaced saddle solves with a fixed RHS (Sec. 4).
+* **Thermal drift** -- one random-response solve and one implicit tangent solve
+  at the same configuration; centred RFD remains available (Sec. 4).
 
 Everything is additive and gated behind the SD-Brownian path; the RPY and
 stresslet-RPY Brownian paths are untouched.  The whole step is **device
-resident and jitted**: the deterministic/RFD saddle solves use the on-device
+resident and jitted**: the deterministic/drift saddle solves use the on-device
 Chebyshev-Schur preconditioner (the ``build_saddle_solve`` default) and the
 Brownian square roots use on-device
 samplers (real-space Lanczos + analytic wave-space + Jacobi-preconditioned
@@ -370,8 +372,45 @@ def nearfield_brownian_force(solve_fn, state, positions, kT, dt, key, *,
 
 
 # ---------------------------------------------------------------------------
-# Sec. 4 -- thermal drift via random finite differencing (Delong et al. 2014)
+# Sec. 4 -- thermal drift
 # ---------------------------------------------------------------------------
+def implicit_drift(solve_fn, state, positions, key, *, kT,
+                   step_kwargs=None, prepared_nf=None,
+                   return_stresslet=False, return_residual=False,
+                   return_info=False):
+  """Implicit directional estimate of ``kT div R_FU^{-1}``.
+
+  Draws the same generalized Gaussian direction as :func:`rfd_drift`, but
+  evaluates the local directional derivative by differentiating the saddle
+  equation instead of subtracting two displaced solves.  The response and
+  tangent systems share one fixed operator and preconditioner, and no finite-
+  difference step is required.
+
+  Unlike the RFD fallback -- whose displaced solves are truncated by design and
+  therefore report nothing -- these two solves run at the full solver budget, so
+  a failure is a real one.  ``return_residual=True`` measures the true relative
+  residual of both (one extra saddle matvec each) and warns on non-convergence;
+  ``return_info=True`` appends the tangent info dict to the return tuple so the
+  caller can record it.
+  """
+  step_kwargs = step_kwargs or {}
+  positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+  direction6 = jax.random.normal(
+      key, (positions.shape[0], 6), dtype=REAL_DTYPE)
+  velocity_dot, stresslet_dot, info = solve_fn.mobility_tangent(
+      state, positions, direction6, prepared_nf=prepared_nf,
+      return_stresslet=return_stresslet, return_residual=return_residual,
+      **step_kwargs)
+  velocity_drift = kT * velocity_dot
+  out = (velocity_drift,)
+  if return_stresslet:
+    out = out + (kT * stresslet_dot,)
+  if return_info:
+    out = out + (info,)
+  return out[0] if len(out) == 1 else out
+
+
+# Centered RFD fallback (Delong et al. 2014).
 def rfd_drift(solve_fn, state, positions, key, *, eps, kT, shift_fn,
               atol=1e-8, atol2=None, step_kwargs=None,
               gmres_restart=None, gmres_maxiter=None,
@@ -486,6 +525,7 @@ def build_sd_brownian_step(
     xi: Optional[float] = None,
     n_particles: Optional[int] = None,
     phi: Optional[float] = None,
+    drift_method: str = 'implicit',
     rfd_epsilon: Optional[float] = None,
     rfd_atol: float = 1e-8,
     r_lub: Optional[float] = None,
@@ -501,7 +541,7 @@ def build_sd_brownian_step(
     return_residual: bool = True,
     **rpy_kwargs,
 ) -> Tuple[Callable, Callable]:
-  """Build the overdamped FSD Brownian timestep (Euler--Maruyama + RFD drift).
+  """Build the overdamped FSD Brownian timestep.
 
   Args:
     space_fns: ``(displacement_fn, shift_fn)`` or ``+(box_fn)`` for live
@@ -509,12 +549,20 @@ def build_sd_brownian_step(
       (``gamma_xy``/``gamma_xz``/``gamma_yz`` or ``shear=``) and an ambient
       velocity gradient ``L_inf`` for the affine-flow add-back; the deformed box
       threads through the deterministic solve, the exact wave-space slip noise,
-      the near-field, and the RFD drift.
+      the near-field, and the thermal drift.
     a, eta: sphere radius and solvent viscosity.
     dt, kT: timestep and thermal energy.
     xi, n_particles, phi: Ewald split (estimated from ``tol`` if ``xi`` is None).
-    rfd_epsilon: RFD finite-difference step.  ``None`` (default) takes the FSD
-      convention ``max(gmres_tol, 1e-4)`` clipped into the window from
+    drift_method: ``'implicit'`` (default) differentiates the saddle equation
+      locally and solves one response plus one tangent system at the same
+      configuration.  ``'rfd'`` retains the centred finite-difference fallback.
+      ``'none'`` skips thermal drift entirely for diagnostic comparisons while
+      retaining deterministic motion and both Brownian-noise contributions.
+      Non-default RFD-specific options warn and are ignored on the implicit
+      and no-drift paths.
+    rfd_epsilon: RFD finite-difference step, used only with
+      ``drift_method='rfd'``.  ``None`` takes the FSD convention
+      ``max(gmres_tol, 1e-4)`` clipped into the window from
       :func:`rfd_epsilon_bounds`, landing on its geometric centre when that
       value is above the ceiling.  The ceiling is a fixed fraction of
       ``a * clamp_gap`` (a straddling difference cannot resolve the clamp
@@ -568,11 +616,22 @@ def build_sd_brownian_step(
     fractional coordinates, the changing box basis already carries the affine
     motion, so applying ``U^inf`` to the coordinates would double-count the
     relative affine shear.  ``S5`` is the total stresslet ``(N,5)``, including
-    the drift stresslet ``(kT/eps)(S5_+ - S5_-)`` from the RFD displaced
-    solves -- a single-sample estimator of the mean Brownian stresslet
+    the directional drift stresslet from the implicit tangent (or the centred
+    RFD difference when selected) -- a single-sample estimator of the mean
+    Brownian stresslet
     ``<S^B> = -kT div(R_SU . R_FU^{-1})`` (Foss & Brady 2000, Eq. 10c; also
-    exposed as ``info['S5_drift']``).  Per-step values are noisy; only time
-    averages are physically meaningful (as for the fluctuating stresslet).
+    exposed as ``info['S5_drift']``).  With ``drift_method='none'`` this
+    correction is zero, as is ``info['S5_drift']``.  Per-step values from the
+    physical drift methods are noisy; only time averages are physically
+    meaningful (as for the fluctuating stresslet).
+
+    Under ``drift_method='implicit'`` the tangent solves report on the same
+    policy as the main solve: ``info['drift_response_gmres_info']`` /
+    ``info['drift_tangent_gmres_info']`` always, and with
+    ``return_residual=True`` also ``info['drift_response_rel_residual']``,
+    ``info['drift_tangent_rel_residual']`` and ``info['drift_converged']``
+    (true residuals, plus an in-jit warning on failure).  The RFD branch
+    reports nothing -- its displaced solves are truncated by design.
   """
   # The whole step is jitted end-to-end, so the saddle solve must use an
   # on-device preconditioner.  ``'ic0'`` builds a host RCM + incomplete-Cholesky
@@ -585,34 +644,57 @@ def build_sd_brownian_step(
         "preconditioner needs a pure_callback and cannot run under jit. Use "
         "'cheb' (default), 'diag', or 'jacobi'.")
 
+  if drift_method not in ('implicit', 'rfd', 'none'):
+    raise ValueError(
+        "drift_method must be 'implicit', 'rfd', or 'none', got %r" %
+        (drift_method,))
+
   # Precision-aware tolerance floors: float32 GMRES/Lanczos residuals bottom out
   # around ~1e-6, so a tighter target is unreachable and only burns iterations.
   _f32 = REAL_DTYPE == jnp.float32
   _tol_floor = 1e-5 if _f32 else 0.0
-  rfd_atol = max(float(rfd_atol), _tol_floor)
   lanczos_tol = max(float(lanczos_tol), _tol_floor)
   gmres_tol = max(float(gmres_tol), _tol_floor)
-  # Resolve eps inside [floor, ceiling]; see the block comment above
-  # ``_RFD_CEILING_FRAC``.
-  rfd_epsilon, _rfd_floor, _rfd_ceiling, _rfd_clamp_gap = _resolve_rfd_epsilon(
-      rfd_epsilon, gmres_tol, a)
-  # Bound the RFD GMRES budget in BOTH precisions, independently of the main
-  # solve's (larger) budget.  restart=50 is the original FSD restart length;
-  # two cycles bring a cheb-preconditioned solve to true rel residual ~1e-4,
-  # i.e. drift error ~0.5% via err ~ residual / (|U_+ - U_-|/|U_+| ~ 0.02) at
-  # N <= 4000, phi = 0.45 near contact, in both precisions.  One cycle is NOT
-  # enough (drift error 0.1-0.4); the main solve's budget reaches ~1e-6, three
-  # decades tighter than this single-sample estimator can use, at twice the
-  # iterations.  These solves are truncated by design and therefore pass
-  # ``return_residual=False`` (no convergence warning).
-  if rfd_gmres_restart is None:
-    rfd_gmres_restart = 50
-  if rfd_gmres_maxiter is None:
-    rfd_gmres_maxiter = 2
-  if rfd_gmres_solve_method not in ('batched', 'incremental'):
-    raise ValueError(
-        "rfd_gmres_solve_method must be 'batched' or 'incremental', got %r"
-        % (rfd_gmres_solve_method,))
+
+  if drift_method == 'rfd':
+    rfd_atol = max(float(rfd_atol), _tol_floor)
+    # Resolve eps inside [floor, ceiling]; see the block comment above
+    # ``_RFD_CEILING_FRAC``.
+    (rfd_epsilon, _rfd_floor, _rfd_ceiling,
+     _rfd_clamp_gap) = _resolve_rfd_epsilon(rfd_epsilon, gmres_tol, a)
+    # Bound the RFD GMRES budget in BOTH precisions, independently of the main
+    # solve's (larger) budget.  These solves are truncated by design and
+    # therefore pass ``return_residual=False`` (no convergence warning).
+    if rfd_gmres_restart is None:
+      rfd_gmres_restart = 50
+    if rfd_gmres_maxiter is None:
+      rfd_gmres_maxiter = 2
+    if rfd_gmres_solve_method not in ('batched', 'incremental'):
+      raise ValueError(
+          "rfd_gmres_solve_method must be 'batched' or 'incremental', got %r"
+          % (rfd_gmres_solve_method,))
+  else:
+    ignored_rfd_options = []
+    if rfd_epsilon is not None:
+      ignored_rfd_options.append('rfd_epsilon')
+    if float(rfd_atol) != 1e-8:
+      ignored_rfd_options.append('rfd_atol')
+    if rfd_gmres_restart is not None:
+      ignored_rfd_options.append('rfd_gmres_restart')
+    if rfd_gmres_maxiter is not None:
+      ignored_rfd_options.append('rfd_gmres_maxiter')
+    if rfd_gmres_solve_method != 'batched':
+      ignored_rfd_options.append('rfd_gmres_solve_method')
+    if ignored_rfd_options:
+      warnings.warn(
+          'drift_method=%r ignores RFD-specific option(s): %s. '
+          'Set drift_method="rfd" to use them.' %
+          (drift_method, ', '.join(ignored_rfd_options)),
+          UserWarning, stacklevel=2)
+    rfd_epsilon = None
+    _rfd_floor = None
+    _rfd_ceiling = None
+    _rfd_clamp_gap = lubrication_clamp_gap()
 
   init_fn, solve_fn = build_saddle_solve(
       space_fns, a, eta,
@@ -627,7 +709,8 @@ def build_sd_brownian_step(
   # is ``~rfd_epsilon`` (dq is unit-Gaussian), and the default skin is a fixed
   # fraction (~0.1) of the near-field cutoff ``r_lub``; guard against a gross
   # misconfiguration where ``rfd_epsilon`` is not negligible against that scale.
-  if rfd_epsilon >= 0.01 * solve_fn.r_lub:
+  if (drift_method == 'rfd' and
+      rfd_epsilon >= 0.01 * solve_fn.r_lub):
     raise ValueError(
         "rfd_epsilon=%g is too large relative to the near-field cutoff "
         "r_lub=%g: the RFD displaced solves reuse the neighbor list built at q, "
@@ -672,7 +755,7 @@ def build_sd_brownian_step(
 
     # Clean key tree: the three random inputs must be independent (FD theorem,
     # positive split).  far_field_slip splits k_slip -> (real, wave) internally.
-    k_slip, k_nf, k_rfd = jax.random.split(key, 3)
+    k_slip, k_nf, k_drift = jax.random.split(key, 3)
 
     # (1) far-field slip; (2) near-field Brownian force.  Both samplers are
     # fully on-device (real-space Lanczos + analytic wave-space square root;
@@ -702,35 +785,51 @@ def build_sd_brownian_step(
         **shear_kwargs)
     S5_main = S5
 
-    # (4) RFD thermal drift (reuses state at q; absolute-tol displaced solves).
-    # With return_stresslet, the SAME two displaced solves also return the
-    # drift stresslet S5_drift = (kT/eps)(S5+ - S5-): a single-sample estimator
-    # of the full mean Brownian stresslet <S^B> = -kT div(R_SU . R_FU^{-1})
-    # (Foss & Brady 2000, Eq. 10c).  The product rule splits Eq. 10c into the
-    # far-field response divergence, R^nf_SU . div(R_FU^{-1}), and
-    # (grad R^nf_SU) : R_FU^{-1}; the last two diverge like 1/gap near contact
-    # and cancel, and the +/- subtraction performs that cancellation exactly.
-    # This deliberately deviates from the original FSD code, which keeps only
-    # the coupling term -R^nf_SU U_drift and so leaves the un-cancelled 1/gap
-    # piece in near-contact pair stress.  S5_drift already CONTAINS that
-    # coupling term: no -R^nf_SU U_drift add-back may ever be applied on top
-    # of it (double counting).
-    if return_stresslet:
-      U_drift6, S5_drift = rfd_drift(
-          solve_fn, state, q, k_rfd,
-          eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
-          step_kwargs=shear_kwargs,
-          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter,
-          gmres_solve_method=rfd_gmres_solve_method,
-          return_stresslet=True)
-      S5 = S5 + S5_drift
-    else:
-      U_drift6 = rfd_drift(
-          solve_fn, state, q, k_rfd,
-          eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
-          step_kwargs=shear_kwargs,
-          gmres_restart=rfd_gmres_restart, gmres_maxiter=rfd_gmres_maxiter,
-          gmres_solve_method=rfd_gmres_solve_method)
+    # (4) Thermal drift.  The two physical methods estimate the full velocity and
+    # stresslet divergence with one generalized Gaussian direction.  The
+    # implicit default differentiates the saddle equation at q; the RFD
+    # fallback evaluates two displaced solves.  ``'none'`` skips both for
+    # diagnostic comparisons.  In either physical method S5_drift
+    # already contains the coupling term -R^nf_SU U_drift, so it must never be
+    # added separately (that would double count it).
+    drift_info = None
+    U_drift6 = jnp.zeros((q.shape[0], 6), dtype=REAL_DTYPE)
+    S5_drift = jnp.zeros((q.shape[0], 5), dtype=REAL_DTYPE)
+    if drift_method == 'implicit':
+      # The two tangent solves run at the main solve's full budget, so their
+      # convergence is reported on the same policy as the main solve's (and
+      # warns from inside the jit); the RFD branch stays silent by design.
+      if return_stresslet:
+        U_drift6, S5_drift, drift_info = implicit_drift(
+            solve_fn, state, q, k_drift, kT=kT,
+            step_kwargs=shear_kwargs, prepared_nf=prepared_nf,
+            return_stresslet=True, return_residual=return_residual,
+            return_info=True)
+        S5 = S5 + S5_drift
+      else:
+        U_drift6, drift_info = implicit_drift(
+            solve_fn, state, q, k_drift, kT=kT,
+            step_kwargs=shear_kwargs, prepared_nf=prepared_nf,
+            return_residual=return_residual, return_info=True)
+    elif drift_method == 'rfd':
+      if return_stresslet:
+        U_drift6, S5_drift = rfd_drift(
+            solve_fn, state, q, k_drift,
+            eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+            step_kwargs=shear_kwargs,
+            gmres_restart=rfd_gmres_restart,
+            gmres_maxiter=rfd_gmres_maxiter,
+            gmres_solve_method=rfd_gmres_solve_method,
+            return_stresslet=True)
+        S5 = S5 + S5_drift
+      else:
+        U_drift6 = rfd_drift(
+            solve_fn, state, q, k_drift,
+            eps=rfd_epsilon, kT=kT, shift_fn=shift_fn, atol=rfd_atol,
+            step_kwargs=shear_kwargs,
+            gmres_restart=rfd_gmres_restart,
+            gmres_maxiter=rfd_gmres_maxiter,
+            gmres_solve_method=rfd_gmres_solve_method)
 
     # Advance with the deterministic+Brownian relative velocity.  In a live
     # fractional sheared box, H(t) already carries the affine translational
@@ -749,6 +848,10 @@ def build_sd_brownian_step(
 
     out_info = dict(info)
     out_info['U_drift'] = U_drift6
+    if drift_info is not None:
+      # Namespaced so the main solve's own residual/convergence keys survive.
+      for name, value in drift_info.items():
+        out_info['drift_' + name] = value
     if return_stresslet:
       out_info['S5_main'] = S5_main
       out_info['S5_drift'] = S5_drift
@@ -796,6 +899,7 @@ def build_sd_brownian_step(
   # between steps instead of calling ``init_fn`` again (which rebuilds the wave
   # ``PjitFunction``s and forces the jitted step to recompile every step).
   step_fn.refresh_state = solve_fn.refresh_state
+  step_fn.drift_method = drift_method
   # RFD step provenance for run metadata: resolved from a mix of arguments,
   # dtype and an import-time environment variable.
   step_fn.rfd_epsilon = rfd_epsilon
@@ -804,6 +908,8 @@ def build_sd_brownian_step(
   step_fn.lubrication_clamp_gap = _rfd_clamp_gap
   # Surface gap (units of ``a``) above which the drift is resolved; reported
   # rather than warned about, since with no clamp it is unavoidable.
-  step_fn.rfd_trust_gap = rfd_epsilon / (_RFD_CEILING_FRAC * float(a))
+  step_fn.rfd_trust_gap = (
+      None if rfd_epsilon is None else
+      rfd_epsilon / (_RFD_CEILING_FRAC * float(a)))
 
   return init_fn, step_fn

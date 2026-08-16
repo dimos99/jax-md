@@ -12,8 +12,10 @@ The implementation follows the Fiore and Swan FSD structure:
 2. Add the short-ranged lubrication resistance missing from that far-field
    approximation.
 3. Solve the resulting resistance problem as a matrix-free saddle-point system.
-4. For Brownian dynamics, inject far-field slip noise, near-field Brownian force,
-   and random finite difference (RFD) drift into the same resistance solve.
+4. For Brownian dynamics, inject far-field slip noise and near-field Brownian
+   force, then compute thermal drift by differentiating the fixed-configuration
+   saddle solve. Centred random finite difference (RFD) remains available as a
+   fallback.
 
 The most relevant files are:
 
@@ -28,7 +30,7 @@ The most relevant files are:
 | `sd_nearfield_table.py` | Loads and interpolates the FSD lubrication table. |
 | `sd_nearfield.py` | Matrix-free near-field lubrication resistance `R^nf`. |
 | `sd_saddle.py` | Deterministic FSD saddle-point solve. |
-| `sd_brownian.py` | Brownian FSD step: split noise plus RFD drift. |
+| `sd_brownian.py` | Brownian FSD step: split noise plus implicit tangent drift (RFD fallback). |
 | `simulate.py` | User-facing `simulate.sd` and `simulate.sd_with_shear` wrappers. |
 
 The original FSD code (Fiore & Swan, C++/CUDA) is the reference
@@ -67,10 +69,10 @@ functions unless noted; each carries a docstring with its conventions.
 | --- | --- |
 | `B` / `B^T` projectors | `rot_embed`, `b_apply`, `bt_apply`, `stresslet_from_moment` |
 | Input normalization | `_resolve_e_inf`, `_normalize_solve_inputs` |
-| Operator factories | `_make_grand_mv` (far field), `_make_rnf` (near field, one `prepare` pass) |
+| Operator factories | `_make_real_grand_mv`, `_make_wave_grand_mv`, `_make_grand_mv` (far field), `_make_rnf` (near field, one `prepare` pass) |
 | Saddle matvec / RHS / add-back | `_saddle_operator`, `_saddle_rhs`, `_ambient_addback` |
 | Preconditioners | `_block_ldl_pinv` (one shared block-LDL apply) + the Schur solves: jacobi inline, diagonal inline, `_make_cheb_schur_solve` (+ `_cheb_bounds`), `_make_ic0_schur_solve` |
-| Builder | `build_saddle_solve` (jitted `_body_impl`/`_device_body`, `solve_fn`, eager `count_iterations`) |
+| Builder | `build_saddle_solve` (jitted `_body_impl`/`_device_body`, `solve_fn`, attached `mobility_tangent`, eager `count_iterations`) |
 | Host IC(0) machinery | `assemble_stilde`, `_ic0`, `Ic0Preconditioner`, `build_ic0_from_state` |
 
 `sd_brownian.py`:
@@ -79,7 +81,8 @@ functions unless noted; each carries a docstring with its conventions.
 | --- | --- |
 | Far-field slip sampler | `make_far_field_slip_sampler` (+ `far_field_slip` single draw) |
 | Near-field force sampler | `make_nearfield_brownian_sampler` (+ `nearfield_brownian_force`) |
-| RFD drift | `rfd_drift` |
+| Implicit tangent drift | `implicit_drift` (+ `solve_fn.mobility_tangent`) |
+| RFD drift fallback | `rfd_drift` |
 | Advection frame helper | `_sd_coordinate_velocity` |
 | Timestep builder | `build_sd_brownian_step` (jitted `_step_core` + eager `step_fn` wrapper) |
 
@@ -214,14 +217,9 @@ In code:
 - `b_apply(u6)` implements `B`.
 - `bt_apply(q11)` implements `B^T`.
 
-The tests in `tests/sd_saddle_test.py` explicitly check
-
-```text
-<B u, q> = <u, B^T q>
-```
-
-and that `rot_embed` decomposes back to zero strain plus the original angular
-velocity.
+`tests/sd_test.py` validates these conventions through the reciprocal grand
+resistance blocks, the exact constrained-RPY reduction, and an improper
+reflection where angular velocity must transform as a pseudovector.
 
 ## Far-Field Grand Mobility
 
@@ -578,19 +576,22 @@ by ~15x at gap `1e-2 a` and ~35x at `1e-3 a`, growing ~11x per gap decade
 (the 1/gap singularity) versus ~5x for the true term (comparable to the drift
 velocity's own near-contact growth).
 
-The Brownian step samples the full divergence with the drift stresslet
+The default Brownian step samples the full divergence with the directional
+stresslet derivative
 
 ```text
-S5_drift = (kT / eps) (S5_plus - S5_minus)
+S5_drift = kT D_q[S(q; R_FU(q)^{-1} dq)][dq_position].
 ```
 
-read from the *same* two displaced solves that produce the RFD drift velocity
-(see below). Because each displaced solve assembles its stresslet from
-near-field blocks prepared at the displaced positions, the estimator carries
-all three product-rule terms, and the near-contact `1/gap` cancellation
-happens inside the `+/-` subtraction where it is exact. Like the fluctuating
-stresslet, `S5_drift` is a noisy single-sample estimate per step: only time
-averages are physically meaningful.
+It is obtained from the same fixed-configuration response and tangent equations
+that produce the implicit drift velocity. Differentiating the complete
+stresslet assembly carries all three product-rule terms, including derivatives
+of the near-field blocks, so the near-contact `1/gap` cancellation occurs in
+the differentiated expression. With `drift_method='rfd'`, the equivalent
+centred estimator `(kT / eps) (S5_plus - S5_minus)` is read from the same two
+displaced solves as the RFD velocity. Like the fluctuating stresslet,
+`S5_drift` is a noisy single-sample estimate per step: only time averages are
+physically meaningful.
 
 ### Public API
 
@@ -623,7 +624,7 @@ The solve function also accepts:
 - `zero_nearfield=True`: diagnostic reduction to far-field stresslet-constrained
   mobility.
 - `preconditioner`: one of `'cheb'`, `'diag'`, `'ic0'`, or `'jacobi'`.
-- `slip_top` and `extra_force`: Brownian/RFD injections used by
+- `slip_top` and `extra_force`: Brownian-noise injections used by
   `sd_brownian.py`.
 - `prepared_nf`: near-field blocks already built by
   `solve_fn.nf_apply.prepare(state.nf, positions)`, letting several consumers
@@ -693,7 +694,10 @@ split:
 3. Solve the same saddle system with `slip_top=U_B^ff` and
    `extra_force=F_B^nf`, plus deterministic applied forces.
 
-4. Add the thermal drift `kT div R_FU^{-1}` using random finite differencing.
+4. Add the thermal drift `kT div R_FU^{-1}` using an implicit directional
+   derivative by default, or centred RFD when explicitly requested. The
+   diagnostic-only `drift_method='none'` path omits this term while retaining
+   both Brownian-noise contributions.
 
 ### Far-field slip sampler
 
@@ -741,11 +745,50 @@ c = 2 kT / dt.
 ```
 
 The projector annihilates the artificial shift exactly. This separation is
-checked in `tests/sd_brownian_test.py`, including torque rows.
+checked in `tests/sd_test.py`, including all six force/torque rows.
 
-### RFD thermal drift
+### Implicit thermal drift
 
-`rfd_drift` estimates
+For a standalone derivation from the overdamped Langevin equation through the
+FSD tangent solve, including solver, stochastic, discretization, timestep, and
+floating-point errors, see
+[`IMPLICIT_THERMAL_DRIFT.md`](IMPLICIT_THERMAL_DRIFT.md).
+
+The default `implicit_drift` estimates `kT div R_FU^{-1}` without a finite-
+difference step.  For a Gaussian generalized direction `dq6`, let `dq_pos` be
+its translational part and solve the random response
+
+```text
+A(q) x = (0, -dq6).
+```
+
+Differentiating this equation along `dq_pos` gives
+
+```text
+A(q) x_dot = -D_q[A(q) x][dq_pos].
+```
+
+The response and tangent right-hand sides are solved with the same fixed saddle
+operator and preconditioner.  `kT * x_dot.U6` is a single-sample estimator of
+the mobility divergence.  The stresslet tangent includes both the response
+through `x_dot` and the explicit directional derivative of `R^nf_SU(q) U6`, so
+the near-contact product-rule cancellation is retained.
+
+JAX-MD's real/near-field displacement functions interpret position tangents as
+physical vectors even when positions are stored fractionally.  Spectral-Ewald
+stencils consume fractional positions directly, so their tangent is converted
+with `box^{-1} dq_pos`.  The box, neighbor indices, and preconditioner remain
+fixed during the derivative.
+
+The discretized resistance table, clamp, and spectral stencil are piecewise
+differentiable.  At an exact interpolation or stencil boundary the implicit
+method returns the active branch derivative, whereas centred RFD returns an
+average of the two one-sided derivatives.  Generic configurations are away from
+these measure-zero boundaries.
+
+### RFD thermal drift fallback
+
+With `drift_method='rfd'`, `rfd_drift` estimates
 
 ```text
 kT div R_FU^{-1}
@@ -786,7 +829,7 @@ the difference is divided by a small `eps`, so asymmetric residual errors from
 warm-starting can dominate the drift if the solves are not controlled in an
 absolute sense. The `1/eps` amplification acts on the stresslet difference
 equally, so `S5_drift` is covered by the same discipline (pinned by the
-eps-independence and dense-divergence tests).
+velocity and stresslet directional-derivative oracle in `tests/sd_test.py`).
 
 The displaced solves reuse the neighbor lists built at `q`; therefore
 `rfd_epsilon` must be much smaller than the neighbor-list skin. The builder
@@ -806,19 +849,19 @@ Each `step_fn` call:
 
 1. Refreshes live shear state if needed.
 2. Precomputes the near-field pair blocks once (`nf_apply.prepare`) and shares
-   them across the near-field sampler and the main solve. The two RFD solves
-   displace the positions and correctly re-prepare internally — which is what
-   lets the drift stresslet estimator see the near-field resistance gradients.
-3. Splits the PRNG key into independent far-field, near-field, and RFD keys.
+   them across the near-field sampler, main solve, and fixed implicit operator.
+   The RFD fallback re-prepares at each displaced configuration.
+3. Splits the PRNG key into independent far-field, near-field, and drift keys.
 4. Draws far-field slip and near-field Brownian force.
 5. Runs one combined deterministic plus Brownian saddle solve, warm-started
    from the previous step's solution when the caller threads `info["x0"]`
    back in (the `simulate.py` wrappers do; matches the persistent solution
    buffer of the original FSD code). Convergence-only: the converged solution
    is unchanged.
-6. Computes the RFD drift velocity *and* drift stresslet from two additional
-   saddle solves, and adds `S5_drift = (kT/eps)(S5_plus - S5_minus)` to the
-   reported stresslet (also exposed as `info["S5_drift"]`).
+6. Computes the implicit drift velocity *and* drift stresslet from a random-
+   response solve and a same-operator tangent solve.  With the RFD fallback it
+   instead uses two displaced saddle solves.  Both expose the complete result
+   as `info["S5_drift"]`.
 
    **Deviation from the original FSD code.** That implementation keeps only
    the coupling term `-R^nf_SU U_drift` (it feeds the drift-inclusive velocity
@@ -828,9 +871,10 @@ Each `step_fn` call:
    and drops the far-field response divergence entirely — at `phi = 0.45`,
    `Pe = 1` the Brownian stress it corrupts is roughly half of `sigma_xy`
    (Foss & Brady 2000, Fig. 2). This implementation deviates deliberately: the
-   full estimator costs only the stresslet assembly of two solves that already
-   run. The coupling term must never be re-added on top of `S5_drift` (double
-   counting); `tests/sd_brownian_test.py` pins this.
+   full estimator costs only the stresslet assembly of solves that already run.
+   The coupling term must never be re-added on top of `S5_drift` (double
+   counting); `tests/sd_test.py` pins both the implicit and RFD velocity and
+   stresslet directional derivatives.
 7. Advances positions by an Euler-Maruyama update.
 8. Refreshes neighbor lists for the new positions and returns the next state in
    `info["next_state"]`.
@@ -917,7 +961,8 @@ Both implementations perform:
    terms.
 5. Solve the saddle system with GMRES.
 6. Reconstruct stresslets from far-field and near-field contributions.
-7. Use RFD for Brownian drift.
+7. Use an implicit fixed-operator tangent for Brownian drift (centred RFD in the
+   original FSD code and as an explicit fallback here).
 
 In FSD this sequence is spread across `Stokes.cu`, `Integrator.cu`,
 `Saddle.cu`, `Lubrication.cu`, `Precondition.cu`, and the Brownian source files.
@@ -950,43 +995,36 @@ symmetric `(U, Omega, E) -> (F, L, S)` convention. In this convention:
 - the saddle bottom RHS uses `-(F^P + R^nf_FE E_inf)`;
 - total stresslet uses `S^ff - R^nf_SU u + R^nf_SE E_inf`.
 
-The tests compare these tensor forms against literal NumPy replicas of the FSD
-kernel forms and then pin the end-to-end physical sign with a compressive-strain
-pair test.
+The tests compare these tensor forms against a fixed non-unit FSD golden and
+then pin all four end-to-end two-sphere grand-resistance blocks against literal
+Townsend/Wilson references.
 
 ## Validation Tests
 
-The SD-specific tests are:
+The SD-specific algorithm tests are consolidated in one file:
 
 ```bash
-pytest tests/sd_nearfield_test.py
-pytest tests/sd_saddle_test.py
-pytest tests/sd_brownian_test.py
-pytest tests/sd_shear_test.py
+pytest tests/sd_test.py
 ```
-
-Some checks are marked slow because they sample Brownian covariance or compare
-larger preconditioned systems.
 
 The validation layers include:
 
-- Orthonormal stresslet basis checks.
-- Near-field table interpolation and cutoff behavior.
-- Per-pair near-field symmetry, PSD behavior near contact, and parity under
-  `rhat -> -rhat`.
-- Matrix-free near-field apply compared to explicit dense assembly.
-- Literal FSD-kernel transcription checks for the lubrication tensors.
-- `B`/`B^T` adjointness.
-- Degenerate reduction to stresslet-constrained RPY when `R^nf = 0`.
-- Single-sphere Einstein stresslet under imposed strain.
-- End-to-end near-field sign pins under compressive/extensional strain.
-- Preconditioner convergence ordering and scaling.
-- Near-field Brownian force covariance.
-- Full stochastic velocity covariance against dense deterministic probes.
-- RFD drift epsilon-independence and a negative control for mismatched GMRES
-  tolerances.
-- Live-shear consistency against a static solve at the literal deformed box.
-- Ambient add-back and affine-motion double-counting checks.
+- Analytic deep-gap limits, retained legacy FSD rows, cutoff behavior, a fixed
+  tensor golden, the squeeze coefficient, and dimensional scaling.
+- All four exact two-sphere grand-resistance blocks at near-contact and
+  mid-range separation.
+- Single-sphere translation, rotation and Einstein stresslet laws.
+- Degenerate reduction to constrained RPY when `R^nf = 0`.
+- Many-body reciprocity, positive definiteness and improper-reflection parity.
+- Velocity and stresslet implicit and RFD directional derivatives, a deterministic
+  near-field square-root check, and the neighborless projector.
+- Live-shear consistency, both public integrators, near-field implementation
+  equivalence, and truthful GMRES convergence reporting.
+
+A strict expected-failure test records the known near-field Lanczos truncation
+at production settings when `6N > nf_iters`. Detailed far-field PSE covariance
+is tested in the lower-level `rpy_*` suites; noisy SD-level Monte-Carlo sweeps
+and iteration-count benchmarks are intentionally not duplicated here.
 
 ## Parameters and Tuning
 
@@ -1052,13 +1090,16 @@ saddle conditioning rather than an exhausted budget: with no small-gap clamp
 the lubrication resistance diverges as `1/gap`, and raising the iteration cap
 does not help. `JAX_MD_SD_MIN_GAP` is the lever there.
 
-For Brownian RFD solves, `rfd_atol` is more important than relative tolerance
-because the drift is a finite difference of two velocities. In float32 the code
-raises very tight tolerances to a reachable floor.
+The default implicit response and tangent use the main saddle tolerance and
+iteration budget.  There is no `1/eps` amplification or separate drift
+tolerance.  For the RFD fallback, `rfd_atol` is more important than relative
+tolerance because the drift is a finite difference of two velocities. In
+float32 the code raises very tight tolerances to a reachable floor.
 
 ### The RFD step and the lubrication clamp are coupled
 
-`rfd_epsilon` and `JAX_MD_SD_MIN_GAP` are not independent knobs. The RFD drift
+This section applies only to `drift_method='rfd'`.  `rfd_epsilon` and
+`JAX_MD_SD_MIN_GAP` are not independent knobs. The RFD drift
 is a centred finite difference of the saddle solve, so its step is bounded on
 both sides, and the two bounds respond differently to the clamp:
 
@@ -1078,7 +1119,8 @@ length scale of the response shrinks with it, the clamp cancels out of the floor
 Raising the clamp lifts the ceiling directly but helps the floor only indirectly.
 **When the window closes, widen the clamp — do not shrink `eps`.**
 
-`build_sd_brownian_step` resolves this automatically. `rfd_epsilon_bounds(a)`
+`build_sd_brownian_step` resolves this automatically on the RFD path.
+`rfd_epsilon_bounds(a)`
 returns `(floor, ceiling, clamp_gap)`; the default is the historical
 `max(gmres_tol, 1e-4)` clipped into that window, landing on its geometric centre
 when the historical value is too large. An explicitly supplied `rfd_epsilon` is
@@ -1089,6 +1131,14 @@ it. The resolved values are exposed on `step_fn` as `rfd_epsilon`,
 `rfd_trust_gap` (the surface gap above which the drift is resolved); record them
 in run metadata, since they come from a mix of arguments, dtype, and an
 import-time environment variable.
+
+With the implicit default, `step_fn.drift_method == 'implicit'` and the RFD
+epsilon/floor/ceiling/trust-gap metadata are `None`. Non-default RFD-specific
+arguments are warned about and ignored unless `drift_method='rfd'` is explicit.
+`drift_method='none'` also leaves this metadata at `None` and returns exactly
+zero `info['U_drift']` and `info['S5_drift']`. It is intended only for checking
+the effect of the Itô drift; at nonzero temperature it generally does not
+sample the correct equilibrium distribution.
 
 To confirm the choice for a given system, sweep the step size at the production
 configuration and look for a plateau in the drift magnitude. Hold the RFD

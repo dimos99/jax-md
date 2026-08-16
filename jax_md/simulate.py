@@ -2543,7 +2543,7 @@ class ShearedSDState:
   positions is applied each step before the Brownian stepper advances them, and
   `omega_inf` carries the ambient angular velocity `1/2 curl u^inf` (the affine
   spin) for downstream orientation tracking. `stresslet_main` is the main
-  saddle-solve stresslet before the RFD correction;
+  saddle-solve stresslet before the thermal-drift correction;
   `stresslet_brownian_drift` is that correction, and their sum is `stresslet`.
   """
   real_position: Array
@@ -2615,14 +2615,17 @@ def sd(space_fns: Tuple[Callable, ...],
        Mgrid: Optional[int] = None,
        theta: Optional[float] = None,
        lattice_extent: Optional[int] = None,
+       drift_method: str = 'implicit',
        **sd_kwargs) -> Simulator:
   """Free Fast Stokesian Dynamics Brownian dynamics (no shear).
 
   Overdamped Euler--Maruyama with the full SD resistance
   ``R_FU = Bᵀ M⁻¹ B + R^nf_FU`` (near-field lubrication + far-field grand
   mobility), thermal noise from the positively-split fluctuation--dissipation
-  square root, and the RFD thermal drift (Fiore & Swan 2019).  Free-diffusion
-  counterpart of `sd_with_shear`.
+  square root, and an implicit directional thermal drift (centred RFD remains
+  available via ``drift_method='rfd'``).  Set ``drift_method='none'`` to omit
+  thermal drift for diagnostic comparisons while retaining Brownian noise.
+  Free-diffusion counterpart of `sd_with_shear`.
 
   `energy_or_force` supplies the conservative interactions.  As in
   `constrained_rpy`, leaving `xi is None` triggers automatic Ewald-parameter
@@ -2648,7 +2651,8 @@ def sd(space_fns: Tuple[Callable, ...],
   sd_init, step_fn = hydro_sd.build_sd_brownian_step(
       space_fns, a, eta, dt, kT, xi=xi, rcut=rcut, P=P, Mgrid=Mgrid,
       theta=theta, lattice_extent=lattice_extent,
-      fractional_coordinates=fractional_coordinates, **sd_kwargs)
+      fractional_coordinates=fractional_coordinates,
+      drift_method=drift_method, **sd_kwargs)
 
   def init_fn(key, R, **kwargs):
     q = jnp.asarray(R, dtype=hydro_sd.REAL_DTYPE)
@@ -2707,6 +2711,7 @@ def sd_with_shear(
     Mgrid: Optional[int] = None,
     theta: Optional[float] = None,
     lattice_extent: Optional[int] = None,
+    drift_method: str = 'implicit',
     **sd_kwargs) -> Simulator:
   """Fast Stokesian Dynamics Brownian dynamics with the shearing utilities.
 
@@ -2728,6 +2733,8 @@ def sd_with_shear(
   leaving `xi is None` triggers automatic Ewald-parameter estimation at `tol`
   (the schedule is passed to the estimator so the quadrature support accounts
   for the box deformation; with `remap=True`, `shear_t_bounds` may be omitted).
+  Set ``drift_method='none'`` to retain deterministic motion, shear, and
+  Brownian noise while omitting thermal drift for diagnostic comparisons.
   Extra solver knobs pass through `sd_kwargs` to `hydro.build_sd_brownian_step`.
 
   Returns `(init_fn, apply_fn)`; `apply_fn(state)` advances one step.  The
@@ -2759,7 +2766,8 @@ def sd_with_shear(
   sd_init, step_fn = hydro_sd.build_sd_brownian_step(
       space_fns, a, eta, dt, kT, xi=xi, rcut=rcut, P=P, Mgrid=Mgrid,
       theta=theta, lattice_extent=lattice_extent,
-      fractional_coordinates=fractional_coordinates, **sd_kwargs)
+      fractional_coordinates=fractional_coordinates,
+      drift_method=drift_method, **sd_kwargs)
 
   def init_fn(key, R, **kwargs):
     shear_kwargs = dict(kwargs)

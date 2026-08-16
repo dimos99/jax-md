@@ -30,7 +30,8 @@ Public API (re-exported below):
   rpy_brownian_constrained : Constrained Brownian midpoint SDAE integrator
   sd_nearfield       : Near-field lubrication resistance R^nf (matrix-free)
   sd_saddle          : SD saddle-point solve R_FU = B^T M^-1 B + R^nf_FU
-  sd_brownian        : Brownian SD step (split noise + RFD thermal drift)
+  sd_brownian        : Brownian SD step (split noise + implicit tangent drift,
+                       with an RFD fallback)
 
 Implementation modules (import directly when modifying):
 

@@ -28,7 +28,9 @@ the physics you need — each level costs more than the one above it.
 The RPY levels are documented below. For full SD, see
 **[`STOKESIAN_DYNAMICS.md`](STOKESIAN_DYNAMICS.md)** — a self-contained
 walkthrough of the method, the code map, the sign conventions, and the tuning
-knobs, written for someone who does not already know Stokesian Dynamics.
+knobs, written for someone who does not already know Stokesian Dynamics. For a
+beginner-oriented derivation and error analysis of the default thermal-drift
+method, see **[`IMPLICIT_THERMAL_DRIFT.md`](IMPLICIT_THERMAL_DRIFT.md)**.
 
 ## Modules
 
@@ -66,7 +68,7 @@ listed so you know where to look when modifying.
 | `sd_nearfield_table.py` | Loads/interpolates the 22 tabulated lubrication scalars |
 | `sd_nearfield.py` | Matrix-free near-field resistance `R^nf` |
 | `sd_saddle.py` | Deterministic saddle-point solve `R_FU = Bᵀ M⁻¹ B + R^nf_FU` |
-| `sd_brownian.py` | Brownian SD step: split noise + RFD thermal drift |
+| `sd_brownian.py` | Brownian SD step: split noise + implicit tangent drift (RFD fallback) |
 
 ### Key functions in the RPY modules
 
@@ -373,16 +375,14 @@ The test suite lives under `tests/`. Fast (`not slow`) coverage:
 - `tests/rpy_constrained_integrator_test.py` — `simulate.py` integrator wiring.
 
 Full Stokesian Dynamics:
-- `tests/sd_nearfield_test.py` — near-field resistance `R^nf`: pair tensor
-  construction, table interpolation, symmetry (`R_FE = +R_SU^T`), far-field
-  reduction near `r = 4a`.
-- `tests/sd_saddle_test.py` — saddle-point solve: degenerate reduction to
-  stresslet-constrained RPY at `zero_nearfield=True`, adjoint `B`/`Bᵀ` pair,
-  preconditioner iteration counts.
-- `tests/sd_brownian_test.py` — Brownian SD step: fluctuation-dissipation
-  covariance of the split samplers, RFD drift, key-stream independence.
-- `tests/sd_shear_test.py`, `tests/sd_stress_average_test.py` — sheared SD and
-  stress accumulation.
+- `tests/sd_test.py` — one focused suite covering independent near-field
+  references, pair and many-body resistance, analytic sphere limits,
+  constrained-RPY reduction, implicit/RFD drift contracts, live shear, both public
+  integrators, near-field fast paths and solver reporting. A strict `xfail`
+  records the known production-setting near-field Lanczos truncation.
+- `tests/gel_oscillatory_quench_example_test.py` and
+  `tests/stress_average_example_test.py` — pure example/I/O helper tests, kept
+  separate from the SD algorithm suite.
 
 Shared diagnostics live in `tests/rpy_test_utils.py`. Slow physical-validation
 tests are marked `@pytest.mark.slow`; run them with, e.g.:
@@ -398,6 +398,6 @@ pytest tests/rpy_test.py -m "slow" -v
 > tolerance failures. Each group passes on its own:
 >
 > ```bash
-> pytest tests/sd_nearfield_test.py tests/sd_saddle_test.py tests/sd_brownian_test.py
+> pytest tests/sd_test.py
 > JAX_ENABLE_X64=1 pytest tests/rpy_test.py tests/rpy_constrained_test.py
 > ```

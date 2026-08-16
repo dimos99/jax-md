@@ -57,9 +57,10 @@ Module layout (top to bottom):
 * **Input normalization** -- ``_resolve_e_inf`` (strain conventions) and
   ``_normalize_solve_inputs`` (all optional ``solve_fn`` inputs -> concrete
   arrays; zeros mean "absent").
-* **Fixed-configuration operator factories** -- ``_make_grand_mv`` (far-field
-  grand matvec, real prepared blocks + wave) and ``_make_rnf`` (near-field
-  block applies from one ``prepare`` pass).
+* **Fixed-configuration operator factories** -- ``_make_real_grand_mv`` and
+  ``_make_wave_grand_mv`` (separately differentiable far-field pieces),
+  ``_make_grand_mv`` (their sum), and ``_make_rnf`` (near-field block applies
+  from one ``prepare`` pass).
 * **Saddle system** -- ``_saddle_operator`` (the matrix ``A``),
   ``_saddle_rhs`` (``b1``/``b2``), ``_ambient_addback`` (``U_inf``/
   ``Omega_inf`` convenience outputs).
@@ -71,8 +72,9 @@ Module layout (top to bottom):
   set and returns ``(init_fn, solve_fn)``; nests only what must close over the
   builder state: ``init_fn``/``refresh_state``, the jitted ``_body_impl`` /
   ``_device_body`` (jit cache keyed on the static GMRES configuration),
-  ``solve_fn``, and the eager ``count_iterations`` validation harness (scipy
-  GMRES over the SAME operator/RHS helpers).
+  ``solve_fn``, its attached ``mobility_tangent`` implicit derivative, and the
+  eager ``count_iterations`` validation harness (scipy GMRES over the SAME
+  operator/RHS helpers).
 * **Host IC(0) machinery** -- ``assemble_stilde`` / ``_ic0`` /
   ``Ic0Preconditioner`` / ``build_ic0_from_state`` (validation-oriented;
   everything else runs on device).
@@ -247,6 +249,37 @@ def _normalize_solve_inputs(positions_frac, force, torque, E_inf, L_inf,
 # ---------------------------------------------------------------------------
 # Fixed-configuration operator factories
 # ---------------------------------------------------------------------------
+def _make_real_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
+                        current_box=None):
+  """Prepared real-space grand matvec on flat-11 at fixed positions."""
+  prepared_real = mr_grand_prepare(
+      rpy_state.real, positions, box_matrix=current_box)
+
+  def real_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
+    force, couplet = flat_to_grand(q11)
+    velocity, gradient = mr_grand_apply_blocks(
+        prepared_real, force, couplet)
+    return grand_to_flat(velocity, traceless(gradient))
+  return real_mv_flat
+
+
+def _make_wave_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
+                        current_box=None, *, wave_static, a, xi, eta):
+  """Wave-space grand matvec on flat-11 at fixed positions and box."""
+  def wave_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
+    force, couplet = flat_to_grand(q11)
+    if current_box is None:
+      velocity, gradient = rpy_state.wave.apply_fn(
+          positions, force, couplet)
+    else:
+      velocity, gradient = _apply_wave_exact_grand(
+          static=wave_static, current_box=current_box,
+          positions_frac=positions, forces=force, couplets=couplet,
+          a=a, xi=xi, eta=eta)
+    return grand_to_flat(velocity, traceless(gradient))
+  return wave_mv_flat
+
+
 def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
                    current_box=None, *, wave_static, a, xi, eta):
   """Far-field grand matvec on flat-11 (real + wave, fixed state).
@@ -258,26 +291,13 @@ def _make_grand_mv(rpy_state: RpyState, positions: jnp.ndarray,
   base-box modes and is wrong under shear).  ``current_box=None`` is the
   static-box path (bit-for-bit the Phase-2 behavior).
   """
-  # Per-pair real-space blocks precomputed ONCE per solve (positions and
-  # box fixed): every GMRES matvec's M^r apply is then gather -> block
-  # multiply -> segment_sum instead of re-evaluating ~36 transcendentals
-  # per edge per lattice image (equality with the matrix-free path pinned
-  # by test_mr_grand_prepared_blocks_match_matvec).  ``box_matrix=None``
-  # resolves to the stored box, so one call covers both branches.
-  prepared_real = mr_grand_prepare(
-      rpy_state.real, positions, box_matrix=current_box)
+  real_mv_flat = _make_real_grand_mv(rpy_state, positions, current_box)
+  wave_mv_flat = _make_wave_grand_mv(
+      rpy_state, positions, current_box,
+      wave_static=wave_static, a=a, xi=xi, eta=eta)
 
   def grand_mv_flat(q11: jnp.ndarray) -> jnp.ndarray:
-    F, C = flat_to_grand(q11)
-    Ur, Dr = mr_grand_apply_blocks(prepared_real, F, C)
-    if current_box is None:
-      Uw, Dw = rpy_state.wave.apply_fn(positions, F, C)
-    else:
-      Uw, Dw = _apply_wave_exact_grand(
-          static=wave_static, current_box=current_box,
-          positions_frac=positions, forces=F, couplets=C,
-          a=a, xi=xi, eta=eta)
-    return grand_to_flat(Ur + Uw, traceless(Dr + Dw))
+    return real_mv_flat(q11) + wave_mv_flat(q11)
   return grand_mv_flat
 
 
@@ -716,7 +736,9 @@ def build_saddle_solve(
       ``rcut``, ``capacity_multiplier``, ``extra_capacity``).
 
   Returns:
-    ``(init_fn, solve_fn)``.
+    ``(init_fn, solve_fn)``.  The solve function exposes
+    ``solve_fn.mobility_tangent`` for a random-response directional derivative
+    of the configuration-dependent mobility and stresslet.
   """
   if preconditioner not in ('cheb', 'diag', 'ic0', 'jacobi'):
     raise ValueError(
@@ -862,6 +884,45 @@ def build_saddle_solve(
   # :func:`_block_ldl_pinv` for the LDL derivation and the zeta/sign pitfalls.
   jacobi_pinv = _block_ldl_pinv(zeta, lambda t2: -t2 / zeta)
 
+  def _build_fixed_system(state, positions, current_box, pc, zero_nf,
+                          ic0_obj=None, prepared_nf=None):
+    """Build one fixed-configuration saddle operator and preconditioner.
+
+    The returned objects may be reused for several right-hand sides.  This is
+    essential for the implicit Brownian drift: its response and tangent solves
+    must see exactly the same operator and solver preconditioner.
+    """
+    grand_mv_flat = make_grand_mv(state.rpy, positions, current_box)
+    nf_state = (state.nf if current_box is None else
+                dataclasses.replace(state.nf, box_matrix=current_box))
+    rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU = make_rnf(
+        nf_state, positions, zero_nf, prepared=prepared_nf)
+    apply_A = _saddle_operator(grand_mv_flat, rnf_FU)
+
+    if pc == 'ic0' and not zero_nf:
+      preconditioner_fn = _block_ldl_pinv(
+          zeta, _make_ic0_schur_solve(ic0_obj))
+    elif pc in ('cheb', 'diag') and not zero_nf:
+      diag_S = zeta + diag_FU()
+      if pc == 'cheb':
+        def stil(v):
+          return zeta * v + rnf_FU(v)
+        lo, hi = _cheb_bounds(stil, diag_S, zeta=zeta,
+                              power_iters=cheb_power_iters,
+                              safety=cheb_safety)
+        cheb_solve = _make_cheb_schur_solve(
+            diag_S, stil, lo, hi, cheb_degree)
+        preconditioner_fn = _block_ldl_pinv(
+            zeta, lambda t2: -cheb_solve(t2))
+      else:
+        preconditioner_fn = _block_ldl_pinv(
+            zeta, lambda t2: -t2 / diag_S)
+    else:
+      preconditioner_fn = jacobi_pinv
+
+    return (apply_A, preconditioner_fn, nf_state,
+            rnf_FU, rnf_FE, rnf_SU, rnf_SE)
+
   # -- Numeric body (shared by the eager IC(0) path and the jitted device path).
   # ``pc``/``zero_nf``/``ret_s``/``ret_r``/``tol_``/``atol_`` are static; for the
   # on-device preconditioners (``'diag'``/``'jacobi'``) ``ic0_obj`` is None and
@@ -875,42 +936,11 @@ def build_saddle_solve(
     # None), deliberately after the static block so _STATIC_ARGNUMS is stable.
     N = positions_frac.shape[0]
     dtype = REAL_DTYPE
-    grand_mv_flat = make_grand_mv(state.rpy, positions_frac, current_box)
-    # Live-box consistency: the far field above takes ``current_box`` as an
-    # explicit override, so the near-field minimum-image geometry must follow
-    # the same box -- re-bind it here (the stored candidate neighbor list is
-    # reused, exactly like the real-space ``box_matrix=`` override).  With a
-    # refreshed state this is a no-op; on a stale state it prevents a silent
-    # far-field/near-field box mix.
-    nf_state = (state.nf if current_box is None else
-                dataclasses.replace(state.nf, box_matrix=current_box))
-    rnf_FU, rnf_FE, rnf_SU, rnf_SE, diag_FU = make_rnf(
-        nf_state, positions_frac, zero_nf, prepared=prepared_nf)
-
-    # Saddle matvec + RHS (shared, by construction, with count_iterations).
-    apply_A = _saddle_operator(grand_mv_flat, rnf_FU)
+    (apply_A, M_op, _nf_state, _rnf_FU, rnf_FE, rnf_SU,
+     rnf_SE) = _build_fixed_system(
+         state, positions_frac, current_box, pc, zero_nf,
+         ic0_obj=ic0_obj, prepared_nf=prepared_nf)
     b1, b2 = _saddle_rhs(fp6, e5, rnf_FE, slip_top=slip_top, extra=extra)
-
-    if pc == 'ic0' and not zero_nf:
-      M_op = _block_ldl_pinv(zeta, _make_ic0_schur_solve(ic0_obj))
-    elif pc in ('cheb', 'diag') and not zero_nf:
-      # Schur approx S~ = zeta I + (diag of) R^nf_FU; the diagonal is read off
-      # the same prepared blocks (no extra geometry pass).
-      diag_S = zeta + diag_FU()                                      # (N,6)
-      if pc == 'cheb':
-        def stil(v):              # S~ v = zeta v + R^nf_FU v (prepared blocks)
-          return zeta * v + rnf_FU(v)
-        lo, hi = _cheb_bounds(stil, diag_S, zeta=zeta,
-                              power_iters=cheb_power_iters,
-                              safety=cheb_safety)
-        cheb_solve = _make_cheb_schur_solve(diag_S, stil, lo, hi, cheb_degree)
-        M_op = _block_ldl_pinv(zeta, lambda t2: -cheb_solve(t2))
-      else:
-        # Pure elementwise Schur solve (jittable -- no callback); neighborless
-        # rows have diag 0 -> S~ = zeta I there.
-        M_op = _block_ldl_pinv(zeta, lambda t2: -t2 / diag_S)
-    else:
-      M_op = jacobi_pinv
 
     x, conv_info = sparse_linalg.gmres(
         apply_A, (b1, b2), x0=x0, tol=tol_, atol=atol_,
@@ -1107,6 +1137,163 @@ def build_saddle_solve(
         pc, zero_nearfield, return_stresslet, return_residual, _tol, _atol,
         _restart, _maxiter, _solve_method, prepared_nf)
 
+  def mobility_tangent(
+      state: SaddleState,
+      positions: jnp.ndarray,
+      direction6: jnp.ndarray,
+      *,
+      preconditioner: Optional[str] = None,
+      prepared_nf: Optional[PreparedNearField] = None,
+      tol: Optional[float] = None,
+      atol: Optional[float] = None,
+      gmres_restart: Optional[int] = None,
+      gmres_maxiter: Optional[int] = None,
+      gmres_solve_method: Optional[str] = None,
+      return_stresslet: bool = True,
+      return_residual: bool = False,
+      **shear_kwargs,
+  ):
+    """Directional derivative of ``R_FU(q)^-1 direction6``.
+
+    This is the implicit-function counterpart of a centred mobility RFD.  For
+    ``A(q) x(q) = (0, -direction6)``, it solves the response problem once,
+    forms ``dA = D_q[A(q) x][direction6[..., :3]]`` with ``x`` held fixed,
+    and solves ``A x_dot = -dA`` with the same operator and preconditioner.
+
+    Position tangents in JAX-MD's real/near-field displacement functions are
+    physical vectors even when stored positions are fractional.  The spectral
+    Ewald stencil consumes fractional coordinates directly, so only its JVP
+    receives ``box^-1 direction``.  The box and neighbor-list topology remain
+    fixed during the derivative.
+
+    Returns ``(u6_dot, s5_dot, info)``.  ``s5_dot`` is the complete stresslet
+    derivative, including the explicit position derivative of ``R^nf_SU``.
+    """
+    positions = jnp.asarray(positions, dtype=REAL_DTYPE)
+    direction6 = jnp.asarray(direction6, dtype=REAL_DTYPE)
+    N = positions.shape[0]
+    if direction6.shape != (N, 6):
+      raise ValueError(
+          'direction6 must have shape (N, 6), got %r' %
+          (direction6.shape,))
+
+    pc = preconditioner if preconditioner is not None else default_preconditioner
+    if pc not in ('cheb', 'diag', 'jacobi'):
+      raise ValueError(
+          "implicit mobility tangent requires an on-device preconditioner "
+          "('cheb', 'diag', or 'jacobi'), got %r" % (pc,))
+    _tol = gmres_tol if tol is None else float(tol)
+    _atol = 0.0 if atol is None else float(atol)
+    _restart = (_default_gmres_restart if gmres_restart is None
+                else int(gmres_restart))
+    _maxiter = (_default_gmres_maxiter if gmres_maxiter is None
+                else int(gmres_maxiter))
+    _solve_method = (default_gmres_solve_method if gmres_solve_method is None
+                     else gmres_solve_method)
+    if _solve_method not in ('batched', 'incremental'):
+      raise ValueError(
+          "gmres_solve_method must be 'batched' or 'incremental', got %r"
+          % (_solve_method,))
+
+    current_box = _resolve_current_box(positions, **shear_kwargs)
+    (apply_A, M_op, nf_state, _rnf_FU, _rnf_FE, rnf_SU,
+     _rnf_SE) = _build_fixed_system(
+         state, positions, current_box, pc, False,
+         prepared_nf=prepared_nf)
+
+    zeros11 = jnp.zeros((N, 11), dtype=REAL_DTYPE)
+    zeros6 = jnp.zeros((N, 6), dtype=REAL_DTYPE)
+    zero_x = (zeros11, zeros6)
+    rhs = (zeros11, -direction6)
+
+    def solve_rhs(linear_rhs):
+      return sparse_linalg.gmres(
+          apply_A, linear_rhs, x0=zero_x, tol=_tol, atol=_atol,
+          restart=_restart, maxiter=_maxiter, M=M_op,
+          solve_method=_solve_method)
+
+    response, response_info = solve_rhs(rhs)
+    q11, u6 = response
+    direction_physical = direction6[..., :3]
+    box = state.rpy.real.box_matrix if current_box is None else current_box
+    if fractional_coordinates:
+      direction_wave = jnp.einsum(
+          'ij,...j->...i', jnp.linalg.inv(box), direction_physical)
+    else:
+      direction_wave = direction_physical
+
+    def real_part(pos):
+      top = _make_real_grand_mv(state.rpy, pos, current_box)(q11)
+      return top, zeros6
+
+    def wave_part(pos):
+      top = _make_wave_grand_mv(
+          state.rpy, pos, current_box,
+          wave_static=wave_static, a=a, xi=xi, eta=eta)(q11)
+      return top, zeros6
+
+    def near_part(pos):
+      rnf_FU, _fe, _su, _se, _diag = make_rnf(
+          nf_state, pos, False)
+      return zeros11, -rnf_FU(u6)
+
+    _, real_dot = jax.jvp(
+        real_part, (positions,), (direction_physical,))
+    _, wave_dot = jax.jvp(
+        wave_part, (positions,), (direction_wave,))
+    _, near_dot = jax.jvp(
+        near_part, (positions,), (direction_physical,))
+    operator_dot = jax.tree.map(
+        lambda r, w, n: r + w + n, real_dot, wave_dot, near_dot)
+    tangent_rhs = jax.tree.map(lambda value: -value, operator_dot)
+    tangent, tangent_info = solve_rhs(tangent_rhs)
+    q11_dot, u6_dot = tangent
+
+    if return_stresslet:
+      stresslet_dot = stresslet_from_moment(q11_dot) - rnf_SU(u6_dot)
+
+      def explicit_stresslet(pos):
+        _fu, _fe, su, _se, _diag = make_rnf(nf_state, pos, False)
+        return -su(u6)
+
+      _, explicit_dot = jax.jvp(
+          explicit_stresslet, (positions,), (direction_physical,))
+      stresslet_dot = stresslet_dot + explicit_dot
+    else:
+      stresslet_dot = jnp.zeros((N, 5), dtype=REAL_DTYPE)
+
+    info = {
+        'response_gmres_info': response_info,
+        'tangent_gmres_info': tangent_info,
+    }
+    if return_residual:
+      def residual_verdict(solution, linear_rhs):
+        """``(rel_residual, converged)`` on the TRUE residual.
+
+        Same criterion as the deterministic body: jax's ``gmres_info`` is 0
+        unless the solution went NaN, and its internal test is on the
+        *preconditioned* residual, so neither is a convergence signal.
+        """
+        residual = jax.tree.map(
+            lambda actual, target: actual - target,
+            apply_A(solution), linear_rhs)
+        norm = jnp.sqrt(_pytree_dot(residual, residual))
+        rhs_norm = jnp.sqrt(_pytree_dot(linear_rhs, linear_rhs))
+        rel = norm / jnp.maximum(rhs_norm, 1e-300)
+        return rel, norm <= jnp.maximum(_tol * rhs_norm, _atol)
+
+      response_rel, response_ok = residual_verdict(response, rhs)
+      tangent_rel, tangent_ok = residual_verdict(tangent, tangent_rhs)
+      info['response_rel_residual'] = response_rel
+      info['tangent_rel_residual'] = tangent_rel
+      info['converged'] = jnp.logical_and(response_ok, tangent_ok)
+      # Unlike the RFD displaced solves (truncated by design), these two run at
+      # the full budget, so a failure here is a real one -- warn as the
+      # deterministic solve does.
+      _warn_nonconvergence(response_ok, response_rel, _tol, _atol)
+      _warn_nonconvergence(tangent_ok, tangent_rel, _tol, _atol)
+    return u6_dot, stresslet_dot, info
+
   # -- Eager iteration-count harness (check 3; runs outside JIT) -----------
   def count_iterations(
       state: SaddleState,
@@ -1207,6 +1394,7 @@ def build_saddle_solve(
     return count[0], rel, diag
 
   solve_fn.count_iterations = count_iterations
+  solve_fn.mobility_tangent = mobility_tangent
   solve_fn.refresh_state = refresh_state
   solve_fn.zeta = zeta
   solve_fn.r_p = r_p
